@@ -220,6 +220,7 @@ class AgyDashboardTests(unittest.TestCase):
                 self.assertIn("range=user|x_#{window_index}", conf_txt)
                 self.assertIn("close-tab", conf_txt)
                 self.assertIn("{ run-shell", conf_txt)
+                self.assertIn("#[bg=#{?#{m:*DASH*,#{window_name}},#50fa7b,#e94560}", conf_txt)
             finally:
                 ad.BRAIN_DIR = orig_brain
                 ad.TMUX_CONF = orig_conf
