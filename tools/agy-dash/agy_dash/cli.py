@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 from . import accounts as _accounts
+from . import autocompact as _autocompact
 from . import compact as _compact
 from . import mirror as _mirror
 from . import paths as _paths
@@ -645,6 +646,14 @@ def cmd_heartbeat_hook(args: argparse.Namespace) -> int:
             payload = json.loads(raw)
         except Exception:
             payload = {}
+
+    # Machine-side compaction (off unless AGY_DASH_MACHINE_COMPACT=1): stops the turn before the
+    # model reads the context and compacts with NVIDIA in the background. Fail-closed to {}.
+    if payload and not getattr(args, "status", False):
+        auto = _autocompact.decide(payload)
+        if auto:
+            print(json.dumps(auto, ensure_ascii=False))
+            return 0
 
     conv_id = str(payload.get("conversationId") or getattr(args, "conv_id", "") or "").strip()
     if not conv_id:

@@ -28,7 +28,7 @@ class AutoCompactTests(unittest.TestCase):
             "conversationId": "conv-123",
             "transcriptPath": str(self.transcript),
             "modelName": "gemini-test",
-            "invocationNum": 1,
+            "invocationNum": 0,
         }
         self.spawn = mock.Mock()
         self.measure = mock.Mock(return_value={"used_tokens": 250000})
@@ -92,7 +92,7 @@ class AutoCompactTests(unittest.TestCase):
 
     def test_invocation_three_does_not_fire(self) -> None:
         self.write_transcript({"type": "USER_INPUT", "content": "/compactnvidia"})
-        self.payload["invocationNum"] = 3
+        self.payload["invocationNum"] = 1  # after a tool call, mid-turn (verified 2026-11-18)
         self.assertEqual(self.decide(used_tokens=500000), {})
         self.measure.assert_not_called()
         self.spawn.assert_not_called()
@@ -135,3 +135,48 @@ class AutoCompactTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HeartbeatHookWiringTests(unittest.TestCase):
+    """cmd_heartbeat_hook must defer to autocompact.decide and print its verdict."""
+
+    def _run(self, decision: dict) -> str:
+        import argparse
+        import io
+        import agy_dash.cli as cli
+        payload = json.dumps({"conversationId": "c1", "hookEventName": "PreInvocation"})
+        out = io.StringIO()
+        with mock.patch.object(cli._autocompact, "decide", return_value=decision) as dec, \
+             mock.patch("sys.stdin", io.StringIO(payload)), \
+             mock.patch.object(cli._compact, "evaluate_context_heartbeat", return_value={"should_notify": False}), \
+             mock.patch("sys.stdout", out):
+            rc = cli.cmd_heartbeat_hook(argparse.Namespace(status=False, force=False))
+        self.assertEqual(rc, 0)
+        dec.assert_called_once()
+        return out.getvalue().strip()
+
+    def test_terminate_verdict_is_printed(self) -> None:
+        verdict = {"injectSteps": [{"errorMessage": {"userMessage": "x"}}], "terminationBehavior": "terminate"}
+        self.assertEqual(json.loads(self._run(verdict)), verdict)
+
+    def test_empty_verdict_falls_through_to_heartbeat(self) -> None:
+        self.assertEqual(self._run({}), "{}")
+
+
+class LastUserInputPayloadTests(unittest.TestCase):
+    def test_payload_last_user_input_wins_over_transcript(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            hb = Path(td) / "hb"
+            spawned = []
+            with mock.patch.object(ac._paths, "HEARTBEATS_DIR", hb):
+                out = ac.decide(
+                    {"conversationId": "c9", "invocationNum": 0, "lastUserInput": "/compactnvidia sigue con X",
+                     "transcriptPath": str(Path(td) / "missing.jsonl")},
+                    env={"AGY_DASH_MACHINE_COMPACT": "1"},
+                    measure=lambda *a, **k: {"used_tokens": 10},
+                    spawn=spawned.append,
+                    now=1000.0,
+                )
+            self.assertEqual(out.get("terminationBehavior"), "terminate")
+            self.assertEqual(spawned[0][-1], "sigue con X")
+            self.assertIn("/compactnvidia", out["injectSteps"][0]["errorMessage"]["userMessage"])

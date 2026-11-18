@@ -1,8 +1,11 @@
 """Compactación automática previa a la invocación del modelo de AGY.
 
-El hook PreInvocation de AGY entrega invocationNum, pero su semántica exacta
-por turno no está verificada. Por eso este prototipo solo actúa cuando falta
-ese campo o su valor es menor o igual a uno.
+Verificado con agy 1.5.11 (2026-11-18, workspace desechable con .agents/hooks.json):
+``invocationNum`` es 0 en la primera llamada al modelo de un turno y 1, 2… tras cada
+herramienta; el payload trae ``lastUserInput`` (texto del prompt) aunque la doc embebida
+no lo liste; ``terminationBehavior: "terminate"`` + ``errorMessage`` corta el turno sin
+llamar al modelo (``agy -p`` sale con código 3). Solo se actúa en ``invocationNum == 0``
+para no cortar nunca un turno a medias.
 """
 from __future__ import annotations
 
@@ -82,8 +85,8 @@ def decide(
 ) -> dict:
     """Decide si el hook debe terminar el turno y comenzar una compactación.
 
-    ``invocationNum`` se interpreta como la primera invocación si falta o es
-    menor o igual a uno; su semántica exacta por turno no está verificada.
+    Solo dispara en la primera invocación del turno (``invocationNum`` 0 o ausente).
+    El texto del usuario sale de ``lastUserInput``; el transcript es respaldo.
     Las excepciones se convierten en ``{}`` para que un fallo del hook no
     interrumpa AGY.
     """
@@ -92,8 +95,8 @@ def decide(
         if active_env.get("AGY_DASH_MACHINE_COMPACT") != "1":
             return {}
 
-        invocation_num = payload.get("invocationNum", 1)
-        if int(invocation_num) > 1:
+        invocation_num = payload.get("invocationNum", 0)
+        if int(invocation_num) != 0:
             return {}
 
         conv_id = str(payload.get("conversationId") or "").strip()
@@ -102,7 +105,9 @@ def decide(
 
         transcript_value = payload.get("transcriptPath")
         transcript_path = Path(transcript_value) if transcript_value else None
-        user_input = last_user_input(transcript_path) if transcript_path else ""
+        user_input = str(payload.get("lastUserInput") or "")
+        if not user_input and transcript_path:
+            user_input = last_user_input(transcript_path)
         command_input = user_input.lstrip()
         forced = command_input.startswith(_COMPACT_COMMAND)
 
@@ -148,8 +153,13 @@ def decide(
                 pass
             raise
 
+        reason = (
+            f"/compactnvidia (contexto {used_tokens} tokens)"
+            if forced and used_tokens < threshold
+            else f"contexto {used_tokens} tokens ≥ {threshold}"
+        )
         message = (
-            f"contexto {used_tokens} tokens ≥ {threshold}: compactando con NVIDIA sin pasar por el modelo; "
+            f"{reason}: compactando con NVIDIA sin pasar por el modelo; "
             "esta pestaña se relanza sola ya compactada y tu mensaje va como siguiente paso."
         )
         return {
