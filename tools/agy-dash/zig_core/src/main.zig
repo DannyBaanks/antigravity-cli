@@ -39,6 +39,10 @@ fn readSmallIntFile(path: [*:0]const u8) u64 {
     return std.fmt.parseInt(u64, trimmed, 10) catch 0;
 }
 
+fn isAgyExeBase(base: []const u8) bool {
+    return std.mem.eql(u8, base, "agy") or std.mem.startsWith(u8, base, "agy.");
+}
+
 fn isAllDigits(s: []const u8) bool {
     if (s.len == 0) return false;
     for (s) |ch| {
@@ -162,6 +166,14 @@ fn findConvLockAndTty(pid: i32, conv_buf: []u8, tty_buf: []u8) struct { conv_len
                     break;
                 }
             }
+            if (conv_len == 0 and std.mem.indexOf(u8, target, "/conversations/") != null and std.mem.endsWith(u8, target, ".db")) {
+                const base = std.fs.path.basename(target);
+                if (base.len > 3) {
+                    const id_slice = base[0 .. base.len - 3];
+                    conv_len = @min(id_slice.len, conv_buf.len);
+                    @memcpy(conv_buf[0..conv_len], id_slice[0..conv_len]);
+                }
+            }
         }
     }
 
@@ -234,7 +246,7 @@ fn runScan(gpa: std.mem.Allocator, statusbar_only: bool) !void {
         if (ln <= 0) continue;
         const target = lbuf[0..@as(usize, @intCast(ln))];
         const base = std.fs.path.basename(target);
-        if (std.mem.eql(u8, base, "agy")) {
+        if (isAgyExeBase(base)) {
             try agy_pids.append(gpa, pid);
         }
     }
@@ -464,4 +476,11 @@ test "collectTailLines extracts valid JSONL tail lines" {
     defer out.deinit(gpa);
     try collectTailLines(gpa, tmp_path, 2, &out);
     try std.testing.expectEqualStrings("{\"a\":2}\n{\"a\":3}\n", out.items);
+}
+
+test "isAgyExeBase matches live and auto-updated deleted agy binaries" {
+    try std.testing.expect(isAgyExeBase("agy"));
+    try std.testing.expect(isAgyExeBase("agy.1794988820083056132.old (deleted)"));
+    try std.testing.expect(!isAgyExeBase("python3"));
+    try std.testing.expect(!isAgyExeBase("agy-fast-core"));
 }

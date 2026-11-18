@@ -417,6 +417,26 @@ def _get_window_map_for_session(tmux_session: str) -> dict[str, tuple[str, str]]
     return out
 
 
+def _get_dash_tty_map() -> dict[str, tuple[str, str]]:
+    """Return mapping tty ('pts/10') -> (window_index, window_name) for untagged tabs."""
+    out: dict[str, tuple[str, str]] = {}
+    cp = tmux_cmd(
+        "list-windows",
+        "-t",
+        TMUX_SESSION,
+        "-F",
+        "#{window_index}|#{window_name}|#{pane_tty}",
+        capture=True,
+    )
+    if cp.returncode == 0 and cp.stdout:
+        for line in cp.stdout.splitlines():
+            parts = line.split("|", 2)
+            if len(parts) == 3 and parts[2].strip():
+                tty_short = parts[2].strip().removeprefix("/dev/")
+                out[tty_short] = (parts[0].strip(), parts[1].strip())
+    return out
+
+
 def _get_dash_window_map() -> dict[str, tuple[str, str]]:
     """Return mapping conv_id -> (window_index, window_name) inside tmux -L agy-dash."""
     return _get_window_map_for_session(TMUX_SESSION)
@@ -459,6 +479,7 @@ def parse_workspace_uri(raw_uris: str) -> str:
 def load_sessions(limit: int = 40) -> tuple[int, dict[str, int], list[AgySession]]:
     scan_us, ksm_stats, live_by_conv = zig_scan()
     win_map = _get_dash_window_map()
+    tty_map = _get_dash_tty_map()
     bg_map = _get_bg_window_map()
     hib_reg = load_hibernated_registry()
 
@@ -505,6 +526,10 @@ def load_sessions(limit: int = 40) -> tuple[int, dict[str, int], list[AgySession
 
                 hib_info = hib_reg.get(cid)
                 win_idx, win_name = win_map.get(cid, (None, ""))
+                if win_idx is None and primary and primary.tty in tty_map:
+                    win_idx, win_name = tty_map[primary.tty]
+                    if "DASH" not in win_name:
+                        tmux_cmd("set-window-option", "-t", f"{TMUX_SESSION}:{win_idx}", "@agy_conv_id", cid)
                 bg_idx, _ = bg_map.get(cid, (None, ""))
                 clean_title = (title or "").strip() or f"Sesión {cid[:8]}"
                 clean_prev = re.sub(r"\s+", " ", (preview or "").strip())[:100]
@@ -2732,7 +2757,7 @@ def run_curses_tui(stdscr) -> None:
         curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_CYAN)     # Selected row
         curses.init_pair(7, curses.COLOR_WHITE, curses.COLOR_BLUE)     # Button surface
 
-    stdscr.timeout(500)
+    stdscr.timeout(250)
     cursor = 0
     saved_session_cursor = 0
     mode = "sessions"
@@ -2747,7 +2772,7 @@ def run_curses_tui(stdscr) -> None:
     scan_us = 0
     ksm: dict[str, int] = {"run": 1, "pages_shared": 0, "pages_sharing": 0, "pages_scanned": 0}
     sessions: list[AgySession] = []
-    last_db_sig = (0, 0)
+    last_db_sig = (0, 0, 0)
     force_scan = True
 
     led_tick = 0
@@ -2803,14 +2828,15 @@ def run_curses_tui(stdscr) -> None:
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def db_wal_sig() -> tuple[int, int]:
+    def db_wal_sig() -> tuple[int, int, int]:
         try:
             s1 = SUMMARIES_DB.stat().st_mtime_ns if SUMMARIES_DB.is_file() else 0
             wal = Path(str(SUMMARIES_DB) + "-wal")
             s2 = wal.stat().st_mtime_ns if wal.is_file() else 0
-            return (s1, s2)
+            s3 = PRESENCE_DIR.stat().st_mtime_ns if PRESENCE_DIR.is_dir() else 0
+            return (s1, s2, s3)
         except OSError:
-            return (0, 0)
+            return (0, 0, 0)
 
     def execute_action(action: str) -> str:
         nonlocal mode, cursor, saved_session_cursor, force_scan, cached_preview_sig
@@ -2911,7 +2937,7 @@ def run_curses_tui(stdscr) -> None:
         now = time.time()
         trigger_quota_poll(force=False)
         cur_db_sig = db_wal_sig()
-        if force_scan or cur_db_sig != last_db_sig or (now - last_scan_ts) >= 1.2:
+        if force_scan or cur_db_sig != last_db_sig or (now - last_scan_ts) >= 0.6:
             last_db_sig = cur_db_sig
             last_scan_ts = now
             force_scan = False
