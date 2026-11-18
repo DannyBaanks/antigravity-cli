@@ -38,7 +38,15 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
-HOME = Path(os.environ.get("AGY_REAL_HOME") or str(Path.home()))
+def _resolve_real_home() -> Path:
+    raw = os.environ.get("AGY_REAL_HOME") or str(Path.home())
+    marker = "/.gemini/antigravity-cli/accounts/"
+    if marker in raw:
+        raw = raw.split(marker, 1)[0]
+    return Path(raw)
+
+
+HOME = _resolve_real_home()
 SCRIPT_DIR = Path(__file__).resolve().parent
 ZIG_CORE_DIR = SCRIPT_DIR / "zig_core"
 ZIG_CORE_BIN = SCRIPT_DIR / "agy-fast-core"
