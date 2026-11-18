@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse
 import curses
 import os
+import shlex
+import shutil
 import threading
 import time
 from dataclasses import dataclass
@@ -51,7 +53,29 @@ def build_command_buttons(panel_w: int) -> list[CommandButton]:
         CommandButton("vault", "V", "[V] 🗄️ Abrir Baúl", 6, 2 + half + 1, half),
         CommandButton("nvapi_key", "K", "[K] 🔑 Key NVIDIA", 7, 2, half),
         CommandButton("memory", "m", "[m] 🧠 Memoria", 7, 2 + half + 1, half),
+        CommandButton("ranking", "M", "[M] 🏆 Ranking Modelos", 8, 2, half),
     ]
+
+
+# swarm-ext (ISyCo tools/swarm_models): ping + bench + ranking of every swarm model, shared with claude-dash
+BOARD_PROVIDERS = "agy,nvapi,codex,opencode,freellm,qwen"
+
+
+def model_board_command(exe: str | None = None) -> list[str] | None:
+    exe = exe or shutil.which("swarm-ext")
+    return [exe, "board", "--providers", BOARD_PROVIDERS] if exe else None
+
+
+def open_model_board() -> str:
+    """Open the interactive model ranking board in a tmux popup without blocking the TUI."""
+    cmd = model_board_command()
+    if not cmd:
+        return "swarm-ext no está en el PATH (ISyCo tools/swarm_models): sin ranking de modelos"
+    line = " ".join(shlex.quote(c) for c in cmd)
+    threading.Thread(target=_tmuxctl.tmux_cmd, daemon=True,
+                     args=("display-popup", "-E", "-w", "96%", "-h", "90%",
+                           "-T", " 🏆 Ranking de modelos · ping / bench ", line)).start()
+    return "🏆 Ranking de modelos abierto (popup: ping/bench por modelo, Esc/q cierra)"
 
 
 def hit_test_button(
@@ -358,7 +382,7 @@ class Dashboard:
             return (0, 0, 0)
 
     def execute_action(self, action: str) -> str:
-        if action in ("refresh", "refresh_quota", "memory", "accounts", "vault", "nvapi_key"):
+        if action in ("refresh", "refresh_quota", "memory", "accounts", "vault", "nvapi_key", "ranking"):
             return self._execute_global_action(action)
         sel = self.sessions[self.saved_session_cursor if self.mode != "sessions" else self.cursor] if self.sessions else None
         if action == "baton" and sel:
@@ -383,6 +407,8 @@ class Dashboard:
         if action == "refresh_quota":
             self.trigger_quota_poll(force=True)
             return "Consultando cuotas (/usage) de todas las cuentas en segundo plano..."
+        if action == "ranking":
+            return open_model_board()
         if action == "memory":
             if self.mode == "sessions":
                 self.saved_session_cursor = self.cursor
@@ -1028,7 +1054,7 @@ class Dashboard:
         else:
             keys_help = (
                 " [Enter] Abrir  [c] Compactar+Ir  [C] Guardar Baúl  [V] Baúl  [t] Renombrar  "
-                "[K] Key NV  [B] Baton  [u] Cuentas  [h/H] Hibernar  [m] Memoria "
+                "[K] Key NV  [B] Baton  [u] Cuentas  [h/H] Hibernar  [m] Memoria  [M] Ranking "
             )
         self.stdscr.addstr(self.max_y - 1, 0, keys_help[: self.max_x - 1], curses.A_REVERSE)
 
@@ -1305,6 +1331,8 @@ class Dashboard:
             self.status_banner = self.execute_action("hib_all")
         elif self.mode == "sessions" and ch == ord("x"):
             self.status_banner = self.execute_action("dedup")
+        elif self.mode == "sessions" and ch == ord("M"):
+            self.status_banner = self.execute_action("ranking")
         elif self.mode == "sessions" and ch in (ord("b"), ord("B")):
             self.status_banner = self.execute_action("baton")
 

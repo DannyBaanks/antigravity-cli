@@ -107,6 +107,7 @@ OWNER: dict[str, str] = {
 "cmd_rename": "cli",
 "cmd_self_compact": "cli",
 "cmd_show_dash": "cli",
+"cmd_isymcp_tab": "cli",
 "cmd_status": "cli",
 "cmd_statusbar": "cli",
 "cmd_tui": "cli",

@@ -728,6 +728,69 @@ class SafetyFixesTests(unittest.TestCase):
         src = Path(ad.__file__).read_text()
         self.assertNotIn("_LED_SPINNER_FRAMES", src)
 
+    def test_isymcp_tab_keybinding_and_status_button_in_config(self) -> None:
+        """Generated tmux config contains M-i binding and isymcp status range."""
+        with tempfile.TemporaryDirectory() as td:
+            orig_conf = ad.TMUX_CONF
+            try:
+                ad.TMUX_CONF = Path(td) / "agy-dash.tmux.conf"
+                ad.write_tmux_config(Path(__file__).resolve())
+                conf_txt = ad.TMUX_CONF.read_text(encoding="utf-8")
+                # Alt+I binding for isymcp-tab
+                self.assertIn('bind -n M-i run-shell', conf_txt)
+                self.assertIn('isymcp-tab', conf_txt)
+                # status-right contains isymcp range button
+                self.assertIn('range=user|isymcp', conf_txt)
+                self.assertIn('🔌 ISyMCP', conf_txt)
+                # MouseDown1Status handles isymcp range (checks for == isymcp)
+                self.assertIn('#{==:#{mouse_status_range},isymcp}', conf_txt)
+                # status-right-length increased
+                self.assertIn('status-right-length 96', conf_txt)
+            finally:
+                ad.TMUX_CONF = orig_conf
+
+    def test_isymcp_tab_creates_window_if_missing_selects_if_exists(self) -> None:
+        """isymcp-tab creates the window if it doesn't exist, selects it if it exists."""
+        with mock.patch.object(ad, "tmux_cmd") as mock_tmux:
+            # First call: list-windows returns no 🔌ISyMCP window
+            mock_tmux.side_effect = [
+                # list-windows -F "#{window_index}|#{window_name}"
+                mock.Mock(returncode=0, stdout="0|⚡DASH\n1|●Sesion1\n"),
+                # new-window -d -P -F "#{window_index}" -t agy -n "🔌ISyMCP" sh -c ...
+                mock.Mock(returncode=0, stdout="2\n"),
+                # select-window -t agy:2
+                mock.Mock(returncode=0, stdout=""),
+            ]
+            rc = ad.cmd_isymcp_tab(mock.Mock())
+            self.assertEqual(rc, 0)
+            # Should have been called 3 times
+            self.assertEqual(mock_tmux.call_count, 3)
+            # Check the new-window call has the right command
+            new_win_call = mock_tmux.call_args_list[1]
+            # tmux_cmd receives args as tuple at call[0]; join the whole tuple
+            called_args = " ".join(new_win_call[0])
+            self.assertIn("new-window", called_args)
+            self.assertIn("ISyMCP", called_args)  # window name
+            self.assertIn("isymcp dash", called_args)
+
+        with mock.patch.object(ad, "tmux_cmd") as mock_tmux:
+            # First call: list-windows returns existing 🔌ISyMCP window at index 3
+            mock_tmux.side_effect = [
+                # list-windows -F "#{window_index}|#{window_name}"
+                mock.Mock(returncode=0, stdout="0|⚡DASH\n3|🔌ISyMCP\n"),
+                # select-window -t agy:3
+                mock.Mock(returncode=0, stdout=""),
+            ]
+            rc = ad.cmd_isymcp_tab(mock.Mock())
+            self.assertEqual(rc, 0)
+            # Should have been called 2 times (list-windows + select-window)
+            self.assertEqual(mock_tmux.call_count, 2)
+            select_call = mock_tmux.call_args_list[1]
+            called_args = " ".join(select_call[0])
+            self.assertIn("select-window", called_args)
+            self.assertIn("agy:3", called_args)
+
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -135,6 +135,7 @@ El panel `0:⚡DASH` muestra la lista de sesiones a la izquierda, la **Vista en 
 | `t` (`[t] ✏️ Renombrar`) | `0:⚡DASH` o `Ctrl+B ,` | Renombra permanentemente la conversación en el dashboard, pestañas LED y bases de datos |
 | `K` (`[K] 🔑 Key NVIDIA`) | `0:⚡DASH` o pestaña `💤` | Guarda tu NVIDIA API Key (`nvapi-...`, permisos `0600`) para compactación externa |
 | `m` (`[m] 🧠 Memoria Shared`) | `0:⚡DASH` | Alterna el visor de Memoria Compartida Multi-Harness (`MEMORY.md`) |
+| `Alt+I` / Botón `🔌 ISyMCP` | Cualquier pestaña | Abre (o selecciona si ya existe) la pestaña `🔌ISyMCP` con `isymcp dash` |
 | `Alt+0` / `Alt+D` / Clic en `⚡ AGY DASH` | Cualquier pestaña | Alterna entre el Command Center (`0:⚡DASH`) y tu pestaña activa |
 | `Alt+1` .. `Alt+9` / `Alt+Left`/`Right` | Cualquier pestaña | Cambiar entre pestañas en la misma ventana |
 
@@ -163,6 +164,16 @@ El panel `0:⚡DASH` muestra la lista de sesiones a la izquierda, la **Vista en 
    - `self-compact` espera a que el turno termine de verdad (`--wait`, 900 s por defecto) antes de reemplazar la pestaña. Si sigue ocupada, deja el handoff en el Baúl sin cortar nada. `self` se resuelve por la pestaña del propio agente (`$TMUX_PANE`), no por la que estás mirando, y si hay ambigüedad pide el `conv_id`.
    - Eliminar una cuenta aislada: si AGY reemplazó un symlink compartido por un archivo real (pasa con `conversation_summaries.db`), ese archivo se **mueve** a `accounts/.rescued/<cuenta>-<fecha>/` antes de purgar; nunca se borra.
    - El escaneo de sesiones (~50 ms) corre en su propio hilo: las teclas ya no esperan. El spinner de pestañas va cada 0.9 s (`AGY_LED_TICK_SEC`).
+
+## Pestaña ISyMCP
+
+`Alt+I` (o clic en el botón ` 🔌 ISyMCP ` de la barra superior) abre la pestaña `🔌ISyMCP`, que ejecuta `isymcp dash`: el panel de administración de ISyMCP dentro de la misma ventana. Si la pestaña ya existe, solo la selecciona.
+
+- **Qué muestra:** servicios del bridge (server `:8791`, túnel, panel `:8798`, monitor `:8799`, MCP, último canario, tareas), permisos (`shell`, `agents`, taint), sesiones y los MCP del hub (`isymcp-hub`) con su estado, herramientas e instancias.
+- **Teclas dentro del panel:** `u`/`d` subir/bajar server+túnel, `t`/`T` túnel, `p`/`P` panel, `m`/`M` monitor, `c` canario, `D` doctor, `s`/`a` permitir shell/agents una vez, `S`/`A` cerrarlos, `x` limpiar taint, `r` recargar el hub, `R` reiniciar el hub, `l` log, `?` ayuda, `q` salir.
+- **Confirmación:** `d`, `r`, `s`, `a`, `x` y `R` piden pulsar `y`. `r` y `R` reinician los MCP de **todas** las TUIs.
+- **Sin `isymcp dash`:** si el ISyMCP instalado es anterior al panel, la pestaña muestra un aviso y se cierra con cualquier tecla.
+- **Cierre:** `q` dentro del panel o `×` en la pestaña. Cerrarla solo cierra el panel: el bridge y el hub siguen como estaban.
 
 ## Trampas
 

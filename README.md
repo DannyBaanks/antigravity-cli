@@ -106,6 +106,11 @@ Powered by a **Zig 0.16 (`ReleaseFast`) core** (`agy-fast-core`) + Python `curse
   - Left session table (`RUNNING` / `BG-TASK` / `IDLE` / `HIBERNATED` / `SAVED`), clickable right Command Center (`[r] Actualizar`, `[↵] Abrir/Ir`, `[v] Espejo Vivo`, `[R] Recargar Tab`, `[n] Nueva`, `[h/H] Hibernar 0MB`, `[x] Deduplicar`, `[B] Baton Pass`, `[u] Cuentas`, `[m] Memoria`, `[c] Compactar NV`, `[t] Renombrar`, `[K] Key NVIDIA`), and bottom real-time transcript tail.
 - **Streaming-Safe Freeze Selection (`copy-pipe-no-clear`)**:
   - Mouse dragging or scrolling up (`WheelUpPane` / `Alt+C`; `Alt+S` is left to AGY for the swarm board) inside any `agy` chat tab enters tmux `copy-mode` to freeze the viewport while the model streams output, keeping the highlight visible and copying automatically to the system clipboard (`wl-copy` / `xclip` / `xsel`).
+  - Wheel/drag enter a **passive** copy-mode: `↑ ↓ ← → Enter Tab` leave the scroll and reach AGY (so a long inline `ask_question` menu stays usable), and `Esc` only leaves the scroll without cancelling AGY's menu. `Alt+C` is the active copy-mode, where those keys keep their copy-mode meaning.
+- **`⌨ Atajos` Button**: the yellow button in the top bar (or `agy-dash keys`) opens a popup listing every shortcut of the dash, the Command Center and AGY itself; any key closes it.
+- **`🔌 ISyMCP` Tab (`Alt+I`)**: `Alt+I`, the ` 🔌 ISyMCP ` button in the top bar, or `agy-dash isymcp-tab` selects the `🔌ISyMCP` tab, creating it if needed, running `isymcp dash`: the ISyMCP admin panel (bridge services, ChatGPT sessions, shell/agents permissions and taint, and every MCP served by `isymcp-hub`). Keys inside the panel are listed with `?`; actions that stop services, open permissions or restart the hub ask for `y` first. If the installed ISyMCP has no `dash`, the tab says so and closes on any key.
+- **`🏆 Ranking` Model Board (`M`)**: `M` or the `[M] 🏆 Ranking Modelos` button opens the `swarm-ext board` in a popup (ping / bench / ranking per model across AGY, NVIDIA NIM, Codex, OpenCode free models, FreeLLMAPI Auto and Qwen Desktop), the same ranking `claude-dash` uses for its `/swarm` picker.
+- **Machine-Side Autocompact (opt-in, `AGY_DASH_MACHINE_COMPACT=1`)**: a `PreInvocation` hook stops a turn before the model is called when the context reaches `AGY_DASH_AUTO_COMPACT_TOKENS` (default 250k) or the prompt starts with `/compactnvidia`, only on the first model call of a turn (never after a tool call), and hands it to the Nemotron compactor.
 - **Multi-Account Google Pro Vault, Preflight & 1-Click Baton Pass (`[u]` / `[B]`)**:
   - Keep `primary` on the OS keyring while adding isolated virtual `HOME` slots (`pro2`, `pro3`, ...) with separate OAuth/config storage (`0700`) and automatic symlinks for `conversations/`, `brain/`, `conversation_summaries.db`, `settings.json`, `mcp/`, `.ssh`, `.gitconfig`, and `.config/gh`.
   - Background `/usage --output-format json` quota polling with `AGY_NO_BROWSER=1` (never opens stray browser tabs) and critical/low banners per model family (`Argon`, `Gemini`, `Claude/GPT`); interactive login restores real D-Bus via an `xdg-open` wrapper and copies the unbroken OAuth URL to the clipboard.
@@ -134,5 +139,7 @@ agy-dash nvapi set-key <nvapi-...>               # Save NVIDIA NIM API key (0600
 agy-dash compact <conv-or-title> --open          # Compact heavy conversation via Nemotron & open lightweight tab
 agy-dash rename <conv-or-title> "<new-title>"    # Permanently rename session across dashboard and LED tabs
 agy-dash hibernate all-idle                      # Freeze 100% idle sessions to 0 MB RAM
+agy-dash keys                                    # Every shortcut (what the ⌨ Atajos button shows)
+agy-dash isymcp-tab                              # Open/select the 🔌ISyMCP admin tab (isymcp dash)
 isymem doctor                                    # Verify cross-harness shared memory links
 ```
