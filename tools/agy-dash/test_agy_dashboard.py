@@ -508,12 +508,12 @@ class AgyDashboardTests(unittest.TestCase):
             hb_dir = root / "heartbeats"
 
             tfile.write_text(
-                '{"step_index":1,"type":"PLANNER_RESPONSE","input_tokens":1500,"cache_read_tokens":245000,"output_tokens":400,"model":"gemini-4-hydrogen-high"}\n',
+                '{"step_index":1,"type":"PLANNER_RESPONSE","input_tokens":1500,"cache_read_tokens":165000,"output_tokens":400,"model":"gemini-4-hydrogen-high"}\n',
                 encoding="utf-8",
             )
             m = ad.measure_session_context("cid-hb-1", transcript_path=tfile)
             self.assertEqual(m["source"], "transcript_usage")
-            self.assertEqual(m["used_tokens"], 246900)
+            self.assertEqual(m["used_tokens"], 166900)
             self.assertEqual(m["level"], "COMPACT_RECOMMENDED")
 
             # First heartbeat fires immediately
@@ -527,7 +527,7 @@ class AgyDashboardTests(unittest.TestCase):
             )
             self.assertTrue(hb1["should_notify"])
             self.assertIn("handoff.self_compact", hb1["notice"])
-            self.assertIn("246,900", hb1["notice"])
+            self.assertIn("166,900", hb1["notice"])
 
             # Within 5 minutes (at +120s) at same level -> suppressed (0 noise)
             hb2 = ad.evaluate_context_heartbeat(
