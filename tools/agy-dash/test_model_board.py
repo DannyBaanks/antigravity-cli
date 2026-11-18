@@ -21,7 +21,7 @@ class ModelBoardTests(unittest.TestCase):
 
     def test_board_command(self) -> None:
         self.assertEqual(tui.model_board_command("/x/swarm-ext"),
-                         ["/x/swarm-ext", "board", "--providers", "agy,nvapi,codex,opencode"])
+                         ["/x/swarm-ext", "board", "--providers", "agy,nvapi,codex,opencode,freellm"])
         with mock.patch.object(tui.shutil, "which", return_value=None):
             self.assertIsNone(tui.model_board_command())
             self.assertIn("swarm-ext", tui.open_model_board())
@@ -36,7 +36,7 @@ class ModelBoardTests(unittest.TestCase):
         self.assertIn("Ranking", msg)
         args = tmux_cmd.call_args.args
         self.assertEqual(args[0], "display-popup")
-        self.assertIn("/x/swarm-ext board --providers agy,nvapi,codex,opencode", args[-1])
+        self.assertIn("/x/swarm-ext board --providers agy,nvapi,codex,opencode,freellm", args[-1])
 
     def test_key_M_in_dashboard(self) -> None:
         dash = tui.Dashboard(mock.Mock())
