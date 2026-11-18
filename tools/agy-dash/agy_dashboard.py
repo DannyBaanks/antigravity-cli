@@ -740,6 +740,9 @@ def ensure_isolated_home(
     xdg_shim = slot_bin / "xdg-open"
     shim_code = f"""#!/usr/bin/env bash
 set -u
+if [ "${{AGY_NO_BROWSER:-0}}" = "1" ]; then
+  exit 0
+fi
 url="${{1:-}}"
 if [ -n "$url" ]; then
   printf '%s' "$url" > "{slot_dir / 'last_oauth.url'}" 2>/dev/null || true
@@ -976,10 +979,18 @@ def build_agy_env(account_slot: str | None = None, *, registry_path: Path | None
     if mode == "isolated":
         slot_home = ensure_isolated_home(slot)
         slot_bin = slot_home.parent / "bin"
-        env["AGY_REAL_DBUS"] = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
+        cur_dbus = os.environ.get("AGY_REAL_DBUS") or os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
+        if not cur_dbus or "nonexistent" in cur_dbus:
+            candidate_bus = Path(f"/run/user/{os.getuid()}/bus")
+            cur_dbus = f"unix:path={candidate_bus}" if candidate_bus.exists() else ""
+        env["AGY_REAL_DBUS"] = cur_dbus
         env["AGY_REAL_HOME"] = str(HOME)
-        if "XDG_CONFIG_HOME" in os.environ:
+        if "AGY_REAL_XDG_CONFIG" in os.environ:
+            env["AGY_REAL_XDG_CONFIG"] = os.environ["AGY_REAL_XDG_CONFIG"]
+        elif "XDG_CONFIG_HOME" in os.environ and "/accounts/" not in os.environ["XDG_CONFIG_HOME"]:
             env["AGY_REAL_XDG_CONFIG"] = os.environ["XDG_CONFIG_HOME"]
+        else:
+            env["AGY_REAL_XDG_CONFIG"] = str(HOME / ".config")
         env["PATH"] = f"{slot_bin}:{env.get('PATH', '')}"
         env["HOME"] = str(slot_home)
         env["XDG_CONFIG_HOME"] = str(slot_home / ".config")
@@ -990,13 +1001,27 @@ def build_agy_env(account_slot: str | None = None, *, registry_path: Path | None
     return env
 
 
-def refresh_account_quota(slot: str, timeout_sec: float = 15.0) -> tuple[bool, str]:
-    """Query `/usage --output-format json` for one account slot without prompting interactively."""
+def refresh_account_quota(slot: str, timeout_sec: float = 15.0, *, allow_unauthenticated: bool = False) -> tuple[bool, str]:
+    """Query `/usage --output-format json` for one account slot without ever opening a browser."""
     reg = load_accounts_registry()
     if slot not in reg["accounts"]:
         return False, f"Cuenta '{slot}' no existe en el registro."
+    acct_info = reg["accounts"][slot]
+    if acct_info.get("mode") == "isolated" and not acct_info.get("authenticated", False) and not allow_unauthenticated:
+        return False, f"[{slot}] Pendiente de login OAuth (sin abrir navegador)."
 
     env = build_agy_env(slot)
+    # Never trigger interactive browser tabs during background /usage checks
+    env["AGY_NO_BROWSER"] = "1"
+    env["BROWSER"] = "/bin/true"
+    no_browser_bin = ensure_isolated_home(slot).parent / "bin" if acct_info.get("mode") == "isolated" else (ACCOUNTS_DIR / "_nobrowser_bin")
+    if acct_info.get("mode") != "isolated":
+        no_browser_bin.mkdir(parents=True, exist_ok=True)
+        xo = no_browser_bin / "xdg-open"
+        if not xo.exists():
+            xo.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            os.chmod(xo, 0o755)
+        env["PATH"] = f"{no_browser_bin}:{env.get('PATH', '')}"
     home_for_log = Path(env.get("HOME", str(HOME)))
     try:
         proc = subprocess.Popen(
@@ -1260,8 +1285,8 @@ set -g status-right "#[fg=#414650]│ #[fg=#8be9fd]#({status_cmd}) #[fg=#414650]
 setw -g window-status-format "#[fg=#6272a4] #I:#W{close_btn} "
 setw -g window-status-current-format "#[bg=#282a36,fg=#50fa7b,bold] ▸ #I:#W{close_btn} #[default]"
 
-bind -n M-0 select-window -t :0
-bind -n M-d select-window -t :0
+bind -n M-0 run-shell {tmux_dquote(py_self + " show-dash")}
+bind -n M-d run-shell {tmux_dquote(py_self + " show-dash")}
 bind -n M-1 select-window -t :1
 bind -n M-2 select-window -t :2
 bind -n M-3 select-window -t :3
@@ -2091,6 +2116,13 @@ def close_tab_safely(win_idx: str) -> str:
 def cmd_close_tab(args: argparse.Namespace) -> int:
     msg = close_tab_safely(str(args.window_index))
     tmux_cmd("display-message", "-d", "2500", msg)
+    return 0
+
+
+def cmd_show_dash(_args: argparse.Namespace) -> int:
+    """Ensure ⚡DASH exists at window 0 and focus it (used by Alt+D / Alt+0)."""
+    ensure_dash_window_zero()
+    _select_dash_window()
     return 0
 
 
@@ -3045,6 +3077,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_ct = sub.add_parser("close-tab", help="Safely close tab `×` (parks active RUNNING/BG-TASK tabs in agy-bg)")
     p_ct.add_argument("window_index")
     p_ct.set_defaults(fn=cmd_close_tab)
+
+    p_sd = sub.add_parser("show-dash", help="Ensure ⚡DASH exists and switch focus to it (Alt+D / Alt+0)")
+    p_sd.set_defaults(fn=cmd_show_dash)
 
     for cname in ("accounts", "account"):
         p_ac = sub.add_parser(cname, help="Manage multi-account Google Pro slots (list|add|use|remove)")
