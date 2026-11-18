@@ -1220,9 +1220,9 @@ def tmux_dquote(s: str) -> str:
 def write_tmux_config(self_path: Path) -> None:
     TMUX_CONF.parent.mkdir(parents=True, exist_ok=True)
     if ensure_zig_core():
-        status_cmd = f'"{ZIG_CORE_BIN}" statusbar'
+        status_cmd = f"'{ZIG_CORE_BIN}' statusbar"
     else:
-        status_cmd = f'python3 "{self_path}" statusbar'
+        status_cmd = f"python3 '{self_path}' statusbar"
 
     if shutil.which("wl-copy"):
         clip_cmd = "wl-copy"
