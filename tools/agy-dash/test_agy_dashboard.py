@@ -226,26 +226,150 @@ class AgyDashboardTests(unittest.TestCase):
 
     def test_remove_account_slot_cleans_refs_and_protects_primary(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            reg_path = Path(td) / "registry.json"
+            root = Path(td)
+            base_home = root / "real_home"
+            agy_data = base_home / ".gemini" / "antigravity-cli"
+            shared_conv = agy_data / "conversations"
+            shared_conv.mkdir(parents=True)
+            sentinel = shared_conv / "keep_me.pb"
+            sentinel.write_text("SHARED_STATE", encoding="utf-8")
+            (agy_data / "brain").mkdir(parents=True)
+            (base_home / ".gitconfig").write_text("[user]\n\tname = Safe\n", encoding="utf-8")
+
+            accounts_dir = agy_data / "accounts"
+            reg_path = accounts_dir / "registry.json"
+            p3_home = ad.ensure_isolated_home("pro3", base_home=base_home, agy_data_dir=agy_data, accounts_dir=accounts_dir)
+            p4_home = ad.ensure_isolated_home("pro4", base_home=base_home, agy_data_dir=agy_data, accounts_dir=accounts_dir)
+            (p4_home / ".config" / "antigravity" / "local_only.txt").write_text("PRO4_ONLY", encoding="utf-8")
+
             reg_data = {
                 "active_slot": "pro4",
                 "conv_accounts": {"cid-1": "pro4", "cid-2": "pro3"},
                 "accounts": {
-                    "primary": {"slot": "primary", "mode": "system", "authenticated": True},
-                    "pro3": {"slot": "pro3", "mode": "isolated", "authenticated": True},
-                    "pro4": {"slot": "pro4", "mode": "isolated", "authenticated": True},
+                    "primary": {"slot": "primary", "mode": "system", "email": "a@example.com", "authenticated": True},
+                    "pro3": {"slot": "pro3", "mode": "isolated", "email": "b@example.com", "authenticated": True},
+                    "pro4": {"slot": "pro4", "mode": "isolated", "email": "b@example.com", "authenticated": True},
                 },
             }
             ad.save_accounts_registry(reg_data, registry_path=reg_path)
-            ok_pri, _ = ad.remove_account_slot("primary", registry_path=reg_path)
+
+            info = ad.inspect_account_removal("pro4", registry_path=reg_path, accounts_dir=accounts_dir, base_home=base_home)
+            self.assertEqual(info["duplicate_of"], ["pro3"])
+            self.assertEqual(len(info["associated_sessions"]), 1)
+            self.assertEqual(info["blocked_reason"], "")
+
+            ok_unconf, _ = ad.remove_account_slot("pro4", confirmed=False, registry_path=reg_path, accounts_dir=accounts_dir, base_home=base_home)
+            self.assertFalse(ok_unconf)
+            ok_pri, _ = ad.remove_account_slot("primary", confirmed=True, registry_path=reg_path, accounts_dir=accounts_dir, base_home=base_home)
             self.assertFalse(ok_pri)
-            ok_p4, _ = ad.remove_account_slot("pro4", registry_path=reg_path)
+
+            ok_p4, _ = ad.remove_account_slot("pro4", confirmed=True, registry_path=reg_path, accounts_dir=accounts_dir, base_home=base_home)
             self.assertTrue(ok_p4)
-            after = ad.load_accounts_registry(registry_path=reg_path)
+            after = ad.load_accounts_registry(registry_path=reg_path, base_home=base_home)
             self.assertNotIn("pro4", after["accounts"])
-            self.assertEqual(after["active_slot"], "primary")
-            self.assertEqual(after["conv_accounts"]["cid-1"], "primary")
-            self.assertEqual(after["conv_accounts"]["cid-2"], "pro3")
+            self.assertEqual(after["active_slot"], "pro3")
+            self.assertEqual(after["conv_accounts"]["cid-1"], "pro3")
+            self.assertFalse((accounts_dir / "pro4").exists())
+            self.assertTrue(sentinel.is_file())
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "SHARED_STATE")
+            self.assertTrue((p3_home / ".config" / "antigravity").is_dir())
+
+    def test_baton_preflight_verifies_isolation_quota_and_no_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            base_home = root / "real_home"
+            agy_data = base_home / ".gemini" / "antigravity-cli"
+            (agy_data / "conversations").mkdir(parents=True)
+            (agy_data / "brain").mkdir(parents=True)
+            (agy_data / "conversations" / "cid-hyd.pb").write_text("pb", encoding="utf-8")
+            (agy_data / "settings.json").write_text('{"model":"Gemini 4 Hydrogen (High)"}', encoding="utf-8")
+            accounts_dir = agy_data / "accounts"
+            reg_path = accounts_dir / "registry.json"
+            ad.ensure_isolated_home("pro3", base_home=base_home, agy_data_dir=agy_data, accounts_dir=accounts_dir)
+            ad.ensure_isolated_home("pro_dup", base_home=base_home, agy_data_dir=agy_data, accounts_dir=accounts_dir)
+
+            reg = {
+                "active_slot": "primary",
+                "conv_accounts": {"cid-hyd": "primary"},
+                "accounts": {
+                    "primary": {
+                        "slot": "primary",
+                        "mode": "system",
+                        "email": "a@example.com",
+                        "authenticated": True,
+                        "quota": {"ok": True, "families": {"gemini": 2.0, "argon": 1.0}, "min_pct": 1.0, "buckets": []},
+                    },
+                    "pro3": {
+                        "slot": "pro3",
+                        "mode": "isolated",
+                        "email": "b@example.com",
+                        "authenticated": True,
+                        "quota": {"ok": True, "families": {"gemini": 98.0, "argon": 61.0}, "min_pct": 61.0, "buckets": []},
+                    },
+                    "pro_dup": {
+                        "slot": "pro_dup",
+                        "mode": "isolated",
+                        "email": "a@example.com",
+                        "authenticated": True,
+                        "quota": {"ok": True, "families": {"gemini": 99.0}, "min_pct": 99.0, "buckets": []},
+                    },
+                },
+            }
+            ad.save_accounts_registry(reg, registry_path=reg_path)
+
+            idle_sess = ad.AgySession(
+                conversation_id="cid-hyd",
+                title="Hydrogen Task",
+                preview="",
+                step_count=42,
+                last_modified="ahora",
+                workspace=str(root),
+                db_status="CASCADE_RUN_STATUS_IDLE",
+                not_fully_idle=False,
+                proc=ad.ProcMemInfo(pid=999999, tty="pts/2", in_dash=True),
+            )
+            pf_ok = ad.baton_preflight(
+                idle_sess,
+                registry_path=reg_path,
+                accounts_dir=accounts_dir,
+                agy_data_dir=agy_data,
+                base_home=base_home,
+            )
+            self.assertTrue(pf_ok["ok"], pf_ok["blockers"])
+            self.assertEqual(pf_ok["target_slot"], "pro3")
+            self.assertTrue(all(pf_ok["checks"].values()))
+
+            pf_same = ad.baton_preflight(
+                idle_sess,
+                target_slot="pro_dup",
+                registry_path=reg_path,
+                accounts_dir=accounts_dir,
+                agy_data_dir=agy_data,
+                base_home=base_home,
+            )
+            self.assertFalse(pf_same["ok"])
+            self.assertFalse(pf_same["checks"]["distinct_identity"])
+
+            busy_sess = ad.AgySession(
+                conversation_id="cid-hyd",
+                title="Hydrogen Busy",
+                preview="",
+                step_count=42,
+                last_modified="ahora",
+                workspace=str(root),
+                db_status="CASCADE_RUN_STATUS_RUNNING",
+                not_fully_idle=True,
+                proc=ad.ProcMemInfo(pid=999999, tty="pts/2", in_dash=True),
+            )
+            pf_busy = ad.baton_preflight(
+                busy_sess,
+                registry_path=reg_path,
+                accounts_dir=accounts_dir,
+                agy_data_dir=agy_data,
+                base_home=base_home,
+            )
+            self.assertFalse(pf_busy["ok"])
+            self.assertFalse(pf_busy["checks"]["no_duplicate_operation"])
 
 
 if __name__ == "__main__":

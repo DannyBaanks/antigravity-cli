@@ -1120,11 +1120,15 @@ def compute_quota_alert(
         return None
 
     check_fam = str(worst.get("family", target_family or "gemini"))
+    cur_email = str(cur.get("email", "")).strip().lower()
     best_target = ""
     best_target_email = ""
     best_target_pct = -1.0
     for sname, sdata in accounts.items():
-        if sname == slot or not sdata.get("authenticated", True):
+        if sname == slot or not sdata.get("authenticated", False):
+            continue
+        other_email = str(sdata.get("email", "")).strip().lower()
+        if cur_email and other_email and other_email == cur_email:
             continue
         q = sdata.get("quota", {})
         if not q.get("ok"):
@@ -1153,14 +1157,19 @@ def compute_quota_alert(
 
 
 def choose_baton_target(reg: dict, current_slot: str, model_name: str = "") -> str:
-    """Pick the best authenticated account slot different from current_slot for Baton Pass."""
+    """Pick the best authenticated account slot (preferring distinct Google identity) for Baton Pass."""
     fam = model_to_quota_family(model_name) if model_name else "gemini"
+    accounts = reg.get("accounts", {})
+    cur_email = str(accounts.get(current_slot, {}).get("email", "")).strip().lower()
     best_slot = ""
     best_score = -2.0
-    for sname, sdata in reg.get("accounts", {}).items():
+    for sname, sdata in accounts.items():
         if sname == current_slot:
             continue
         if not sdata.get("authenticated", False):
+            continue
+        other_email = str(sdata.get("email", "")).strip().lower()
+        if cur_email and other_email and other_email == cur_email:
             continue
         q = sdata.get("quota", {})
         if q.get("ok"):
@@ -1171,6 +1180,113 @@ def choose_baton_target(reg: dict, current_slot: str, model_name: str = "") -> s
             best_score = score
             best_slot = sname
     return best_slot
+
+
+def _profile_cred_domain(slot: str, reg: dict, *, accounts_dir: Path | None = None, base_home: Path | None = None) -> Path:
+    acct = reg.get("accounts", {}).get(slot, {})
+    mode = acct.get("mode", "system" if slot == "primary" else "isolated")
+    if mode != "isolated":
+        return (base_home or HOME) / ".config" / "antigravity"
+    return (accounts_dir or ACCOUNTS_DIR) / slot / "home" / ".config" / "antigravity"
+
+
+def baton_preflight(
+    session: AgySession,
+    *,
+    target_slot: str = "",
+    model: str = "",
+    min_target_pct: float = QUOTA_WARN_PCT,
+    registry_path: Path | None = None,
+    accounts_dir: Path | None = None,
+    agy_data_dir: Path | None = None,
+    base_home: Path | None = None,
+) -> dict:
+    """Verify whether Baton Pass can safely continue `session` on another account without duplicates or data loss."""
+    reg = load_accounts_registry(registry_path=registry_path, base_home=base_home)
+    accounts = reg.get("accounts", {})
+    source_slot = reg.get("conv_accounts", {}).get(session.conversation_id) or reg.get("active_slot", "primary")
+    source_acct = accounts.get(source_slot, {})
+    model_disp, model_slug = resolve_model_arg(model, agy_data_dir=agy_data_dir)
+    fam = model_to_quota_family(model_disp or model_slug or "gemini")
+
+    chosen_slot = target_slot or choose_baton_target(reg, source_slot, model_disp or model_slug)
+    target_acct = accounts.get(chosen_slot, {}) if chosen_slot else {}
+
+    source_email = str(source_acct.get("email", "")).strip()
+    target_email = str(target_acct.get("email", "")).strip()
+    src_fams = source_acct.get("quota", {}).get("families", {})
+    tgt_fams = target_acct.get("quota", {}).get("families", {})
+    source_pct = float(src_fams[fam]) if fam in src_fams else None
+    target_pct = float(tgt_fams[fam]) if fam in tgt_fams else None
+
+    blockers: list[str] = []
+    if not chosen_slot or chosen_slot not in accounts:
+        blockers.append("No hay otra cuenta autorizada con identidad distinta.")
+    else:
+        if chosen_slot == source_slot:
+            blockers.append(f"La cuenta destino [{chosen_slot}] es igual a la actual.")
+        if not target_acct.get("authenticated", False):
+            blockers.append(f"La cuenta [{chosen_slot}] no completó login OAuth.")
+        if source_email and target_email and source_email.lower() == target_email.lower():
+            blockers.append(f"[{chosen_slot}] usa el mismo correo ({target_email}) que [{source_slot}].")
+        if target_pct is not None and target_pct <= min_target_pct:
+            blockers.append(f"Cuota {fam} de [{chosen_slot}] demasiado baja ({target_pct:.0f}% <= {min_target_pct:.0f}%).")
+
+    # Verify disjoint credential isolation (no shared .config/antigravity symlink)
+    creds_isolated = False
+    if chosen_slot and chosen_slot in accounts:
+        src_dom = _profile_cred_domain(source_slot, reg, accounts_dir=accounts_dir, base_home=base_home)
+        tgt_dom = _profile_cred_domain(chosen_slot, reg, accounts_dir=accounts_dir, base_home=base_home)
+        creds_isolated = (
+            src_dom.resolve(strict=False) != tgt_dom.resolve(strict=False)
+            and not tgt_dom.is_symlink()
+        )
+        if not creds_isolated:
+            blockers.append("Dominio de credenciales no está aislado entre perfiles.")
+
+    # Verify single-execution / zero-duplicate safety
+    is_busy = session.external_busy or session.state_label in ("RUNNING", "BG-TASK")
+    is_anc = bool(session.proc and is_ancestor_pid(session.proc.pid))
+    no_dup_ok = (not is_busy) and (not is_anc)
+    if is_busy:
+        blockers.append(f"Sesión en estado {session.state_label} (turno/subtarea activa): espera a IDLE.")
+    elif is_anc:
+        blockers.append("Proceso actual es ancestro directo del dashboard.")
+
+    # Verify preserved conversation state on disk and symlinked into target isolated home
+    data_dir = agy_data_dir or AGY_DATA_DIR
+    has_conv_pb = (data_dir / "conversations" / f"{session.conversation_id}.pb").is_file()
+    has_brain = (data_dir / "brain" / session.conversation_id).is_dir()
+    state_ok = has_conv_pb or has_brain or session.step_count > 0
+    if chosen_slot and accounts.get(chosen_slot, {}).get("mode", "system") == "isolated":
+        t_agy = (accounts_dir or ACCOUNTS_DIR) / chosen_slot / "home" / ".gemini" / "antigravity-cli"
+        if t_agy.exists():
+            state_ok = state_ok and ((t_agy / "conversations").is_symlink() or (t_agy / "conversation_summaries.db").is_symlink())
+    if not state_ok:
+        blockers.append("No se verificó estado/historial de conversación compartido en disco.")
+
+    return {
+        "ok": len(blockers) == 0,
+        "source_slot": source_slot,
+        "source_email": source_email,
+        "source_pct": source_pct,
+        "target_slot": chosen_slot,
+        "target_email": target_email,
+        "target_pct": target_pct,
+        "model_display": model_disp,
+        "model_slug": model_slug,
+        "quota_family": fam,
+        "step_count": session.step_count,
+        "checks": {
+            "target_authorized": bool(chosen_slot and target_acct.get("authenticated", False)),
+            "distinct_identity": not (source_email and target_email and source_email.lower() == target_email.lower()),
+            "credentials_isolated": creds_isolated,
+            "target_has_quota": target_pct is None or target_pct > min_target_pct,
+            "no_duplicate_operation": no_dup_ok,
+            "state_preserved": state_ok,
+        },
+        "blockers": blockers,
+    }
 
 
 def exec_agy_optimized(
@@ -1497,29 +1613,29 @@ def baton_pass_session(
     model: str = "",
     switch_to: bool = True,
 ) -> tuple[bool, str]:
-    """Hand off an IDLE/disk conversation to another account slot while keeping conversation + model."""
-    if session.external_busy:
-        return False, "⚠️ Turno o tarea activa en ejecución; espera a IDLE antes de pasar la estafeta."
-    if session.proc and is_ancestor_pid(session.proc.pid):
-        return False, "⚠️ No se puede reemplazar el proceso AGY ancestro directo del dashboard."
+    """Hand off an IDLE/disk conversation to another authorized account keeping exact state & model."""
+    pf = baton_preflight(session, target_slot=target_slot, model=model)
+    if not pf["ok"]:
+        return False, "⚠️ Preflight Baton Pass bloqueado: " + " | ".join(pf["blockers"])
 
-    reg = load_accounts_registry()
-    cur_slot = reg.get("conv_accounts", {}).get(session.conversation_id) or reg.get("active_slot", "primary")
-    model_disp, model_slug = resolve_model_arg(model)
+    chosen_slot = pf["target_slot"]
+    model_disp = pf["model_display"]
+    model_slug = pf["model_slug"]
 
-    chosen_slot = target_slot
-    if not chosen_slot:
-        chosen_slot = choose_baton_target(reg, cur_slot, model_disp or model_slug)
-    if not chosen_slot or chosen_slot not in reg.get("accounts", {}):
-        return False, "⚠️ No hay otra cuenta Pro autenticada. Pulsa [u] Cuentas -> [+] para agregar tu 2ª cuenta."
-    if not reg["accounts"][chosen_slot].get("authenticated", False):
-        return False, f"⚠️ La cuenta [{chosen_slot}] no ha completado login OAuth. Pulsa [u] para autenticarla."
-
-    if session.proc and not session.proc.in_dash:
-        try:
-            os.kill(session.proc.pid, signal.SIGTERM)
-        except OSError:
-            pass
+    # Ensure zero duplicate operations: terminate any live IDLE/duplicate procs and wait for clean exit
+    pids_to_stop: list[int] = []
+    for p in ([session.proc] if session.proc else []) + list(session.extra_procs):
+        if p and not p.in_dash and not is_ancestor_pid(p.pid):
+            pids_to_stop.append(p.pid)
+            try:
+                os.kill(p.pid, signal.SIGTERM)
+            except OSError:
+                pass
+    if pids_to_stop:
+        for _ in range(40):
+            if all(not Path(f"/proc/{pid}").exists() for pid in pids_to_stop):
+                break
+            time.sleep(0.1)
 
     hib_reg = load_hibernated_registry()
     if session.conversation_id in hib_reg:
@@ -2166,23 +2282,196 @@ def _print_accounts_table(reg: dict) -> None:
         print(f"\n  🚨 ALERTA [{alert['level']}]: {alert['active_slot']} {alert['bucket_name']}={alert['pct']:.0f}%{target_msg}")
 
 
-def remove_account_slot(slot: str, *, registry_path: Path | None = None) -> tuple[bool, str]:
-    """Unregister an account slot safely (preserving primary keyring account) and re-point refs."""
+def _active_pids_for_slot(slot: str) -> list[int]:
+    """Scan /proc/*/environ cautiously to detect live agy processes pinned to `slot`."""
+    pids: list[int] = []
+    needle = f"AGY_ACCOUNT_SLOT={slot}".encode()
+    try:
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                comm = (entry / "comm").read_text(errors="ignore").strip()
+                if comm != "agy":
+                    continue
+                env_bytes = (entry / "environ").read_bytes()
+                if needle in env_bytes.split(b"\x00"):
+                    pids.append(int(entry.name))
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return pids
+
+
+def inspect_account_removal(
+    slot: str,
+    *,
+    sessions: list[AgySession] | None = None,
+    registry_path: Path | None = None,
+    accounts_dir: Path | None = None,
+    base_home: Path | None = None,
+) -> dict:
+    """Inspect identity, duplicate siblings, associated sessions, live PIDs, and local-only files before deletion."""
+    safe = validate_slot_name(slot)
+    reg = load_accounts_registry(registry_path=registry_path, base_home=base_home)
+    accounts = reg.get("accounts", {})
+    acct = accounts.get(safe)
+    acct_root = (accounts_dir or ACCOUNTS_DIR).resolve()
+    slot_dir = (acct_root / safe).resolve(strict=False)
+
+    email = str(acct.get("email", "")).strip() if acct else ""
+    duplicate_of = [
+        sname
+        for sname, sdata in accounts.items()
+        if sname != safe and email and str(sdata.get("email", "")).strip().lower() == email.lower()
+    ]
+    sess_titles = {s.conversation_id: s.title for s in (sessions or [])}
+    associated_convs = [
+        {"conversation_id": cid, "title": sess_titles.get(cid, cid[:8])}
+        for cid, cslot in reg.get("conv_accounts", {}).items()
+        if cslot == safe
+    ]
+    active_pids = _active_pids_for_slot(safe) if safe != "primary" else []
+
+    local_files = 0
+    symlinks = 0
+    if safe != "primary" and slot_dir.is_dir() and slot_dir.is_relative_to(acct_root):
+        for root_str, dirnames, filenames in os.walk(slot_dir, topdown=True, followlinks=False):
+            rp = Path(root_str)
+            keep_dirs = []
+            for dname in dirnames:
+                dp = rp / dname
+                if dp.is_symlink():
+                    symlinks += 1
+                else:
+                    keep_dirs.append(dname)
+            dirnames[:] = keep_dirs
+            for fname in filenames:
+                fp = rp / fname
+                if fp.is_symlink():
+                    symlinks += 1
+                else:
+                    local_files += 1
+
+    blocked = ""
+    if safe == "primary":
+        blocked = "No se elimina `primary` (usa el keyring del sistema)."
+    elif acct is None:
+        blocked = f"La cuenta [{safe}] no está registrada."
+    elif active_pids:
+        blocked = f"Hay {len(active_pids)} proceso(s) AGY vivos usando [{safe}] (PIDs: {', '.join(map(str, active_pids))})."
+
+    return {
+        "slot": safe,
+        "exists": acct is not None,
+        "mode": acct.get("mode", "isolated") if acct else "",
+        "email": email,
+        "is_active_default": reg.get("active_slot") == safe,
+        "duplicate_of": duplicate_of,
+        "associated_sessions": associated_convs,
+        "active_pids": active_pids,
+        "slot_dir": str(slot_dir),
+        "local_files": local_files,
+        "shared_symlinks": symlinks,
+        "blocked_reason": blocked,
+    }
+
+
+def purge_isolated_slot_dir(slot: str, *, accounts_dir: Path | None = None) -> tuple[int, int]:
+    """Delete ONLY local regular files inside `accounts/<slot>/`; unlink symlinks without ever descending into targets."""
     safe = validate_slot_name(slot)
     if safe == "primary":
-        return False, "No se elimina `primary` (usa el keyring del sistema)."
-    reg = load_accounts_registry(registry_path=registry_path)
-    if safe not in reg.get("accounts", {}):
-        return False, f"La cuenta [{safe}] no está registrada."
+        raise ValueError("Refusing to purge primary account.")
+    acct_root = (accounts_dir or ACCOUNTS_DIR).resolve()
+    slot_dir = (acct_root / safe).resolve(strict=False)
+    if not slot_dir.is_relative_to(acct_root) or slot_dir == acct_root:
+        raise ValueError(f"Unsafe slot path outside vault: {slot_dir}")
+    if not slot_dir.exists():
+        return (0, 0)
+    if slot_dir.is_symlink():
+        slot_dir.unlink()
+        return (0, 1)
+
+    files_deleted = 0
+    symlinks_unlinked = 0
+    for root_str, dirnames, filenames in os.walk(slot_dir, topdown=False, followlinks=False):
+        rp = Path(root_str).resolve(strict=False)
+        if not rp.is_relative_to(slot_dir):
+            continue
+        for fname in filenames:
+            fp = rp / fname
+            if fp.is_symlink():
+                fp.unlink()
+                symlinks_unlinked += 1
+            elif fp.parent.resolve(strict=False).is_relative_to(slot_dir):
+                fp.unlink()
+                files_deleted += 1
+        for dname in dirnames:
+            dp = rp / dname
+            if dp.is_symlink():
+                dp.unlink()
+                symlinks_unlinked += 1
+            elif dp.is_dir() and dp.resolve(strict=False).is_relative_to(slot_dir):
+                try:
+                    dp.rmdir()
+                except OSError:
+                    pass
+    try:
+        slot_dir.rmdir()
+    except OSError:
+        pass
+    return (files_deleted, symlinks_unlinked)
+
+
+def remove_account_slot(
+    slot: str,
+    *,
+    confirmed: bool = False,
+    purge_local: bool = True,
+    sessions: list[AgySession] | None = None,
+    registry_path: Path | None = None,
+    accounts_dir: Path | None = None,
+    base_home: Path | None = None,
+) -> tuple[bool, str]:
+    """Safely remove ONLY the selected isolated profile after confirming identity and associated sessions."""
+    info = inspect_account_removal(
+        slot,
+        sessions=sessions,
+        registry_path=registry_path,
+        accounts_dir=accounts_dir,
+        base_home=base_home,
+    )
+    if info["blocked_reason"]:
+        return False, f"⚠️ {info['blocked_reason']}"
+    if not confirmed:
+        return (
+            False,
+            f"⚠️ Confirmación requerida para eliminar [{info['slot']}] ({info['email'] or 'sin email'}, "
+            f"{len(info['associated_sessions'])} sesiones asociadas).",
+        )
+
+    safe = info["slot"]
+    repoint_to = info["duplicate_of"][0] if info["duplicate_of"] else "primary"
+    files_del = 0
+    links_del = 0
+    if purge_local and info["mode"] == "isolated":
+        files_del, links_del = purge_isolated_slot_dir(safe, accounts_dir=accounts_dir)
+
+    reg = load_accounts_registry(registry_path=registry_path, base_home=base_home)
     reg["accounts"].pop(safe, None)
     if reg.get("active_slot") == safe:
-        reg["active_slot"] = "primary"
+        reg["active_slot"] = repoint_to
     conv_map = reg.get("conv_accounts", {})
     for cid, cslot in list(conv_map.items()):
         if cslot == safe:
-            conv_map[cid] = "primary"
+            conv_map[cid] = repoint_to
     save_accounts_registry(reg, registry_path=registry_path)
-    return True, f"🗑 Cuenta [{safe}] eliminada del registro."
+    return (
+        True,
+        f"🗑 Perfil local [{safe}] ({info['email'] or 'sin email'}) eliminado "
+        f"({files_del} locales borrados, {links_del} symlinks desligados, compartido intacto).",
+    )
 
 
 def cmd_accounts(args: argparse.Namespace) -> int:
@@ -2220,9 +2509,27 @@ def cmd_accounts(args: argparse.Namespace) -> int:
         return cmd_account_login(argparse.Namespace(slot=safe))
     if action == "remove":
         if not slot_arg:
-            print("Uso: agy-dash account remove <slot>", file=sys.stderr)
+            print("Uso: agy-dash account remove <slot> [--yes]", file=sys.stderr)
             return 1
-        ok, msg = remove_account_slot(slot_arg)
+        _, _, sessions = load_sessions(limit=50)
+        info = inspect_account_removal(slot_arg, sessions=sessions)
+        if info["blocked_reason"]:
+            print(f"⚠️ {info['blocked_reason']}", file=sys.stderr)
+            return 1
+        confirmed = bool(getattr(args, "yes", False))
+        if not confirmed:
+            print(f"  Perfil      : [{info['slot']}] ({info['mode']})")
+            print(f"  Identidad   : {info['email'] or '(sin email)'}")
+            if info["duplicate_of"]:
+                print(f"  Duplicada de: {', '.join(info['duplicate_of'])}")
+            print(f"  Sesiones    : {len(info['associated_sessions'])} asociadas")
+            print(f"  Alcance     : SOLO {info['slot_dir']} ({info['local_files']} archivos locales; compartido intacto)")
+            if not sys.stdin.isatty():
+                print("Usa `--yes` en modo no interactivo tras revisar el alcance.", file=sys.stderr)
+                return 1
+            ans = input(f"  ¿Confirmas eliminar el perfil local [{info['slot']}]? [y/N]: ").strip().lower()
+            confirmed = ans in ("y", "yes", "s", "si", "sí")
+        ok, msg = remove_account_slot(slot_arg, confirmed=confirmed, sessions=sessions)
         print(msg, file=sys.stdout if ok else sys.stderr)
         return 0 if ok else 1
     print(f"Subcomando desconocido: {action}", file=sys.stderr)
@@ -2257,10 +2564,10 @@ def cmd_account_login(args: argparse.Namespace) -> int:
     print("╔════════════════════════════════════════════════════════════════════════════╗")
     print(f"║  🔑 LOGIN AISLADO PARA CUENTA [{safe_slot:<12}] (SIN CERRAR TU PRINCIPAL)       ║")
     print("╚════════════════════════════════════════════════════════════════════════════╝")
-    print("  1. Completa el inicio de sesión de Google en el navegador que se abrirá.")
+    print("  1. Se abrirá el navegador automáticamente y la URL completa se copiará al portapapeles.")
     print("  2. Cuando veas el prompt de AGY listo, escribe `/exit` (o Ctrl+D) para guardar y volver.\n")
     subprocess.run([AGY_BIN], env=env)
-    ok, msg = refresh_account_quota(safe_slot)
+    ok, msg = refresh_account_quota(safe_slot, allow_unauthenticated=True)
     print(f"\n  Resultado: {msg}")
     if sys.stdin.isatty():
         _select_dash_window()
@@ -2292,10 +2599,32 @@ def cmd_baton(args: argparse.Namespace) -> int:
         print(f"No se encontró sesión coincidente con '{target}'.", file=sys.stderr)
         return 1
     sel = matches[0]
+    target_slot = getattr(args, "to", "") or ""
+    model = getattr(args, "model", "") or ""
+
+    if getattr(args, "check", False):
+        pf = baton_preflight(sel, target_slot=target_slot, model=model)
+        if getattr(args, "json", False):
+            print(json.dumps(pf, indent=2, ensure_ascii=False))
+        else:
+            verdict = "LISTO (READY)" if pf["ok"] else "BLOQUEADO"
+            print(f"  Baton Preflight : {verdict}")
+            print(f"  Conversación    : {sel.title} ({sel.conversation_id[:8]}) · {pf['step_count']} pasos")
+            print(f"  Modelo          : {pf['model_display'] or pf['model_slug'] or 'default'} (grupo: {pf['quota_family']})")
+            src_pct_s = f"{pf['source_pct']:.0f}%" if pf["source_pct"] is not None else "?"
+            tgt_pct_s = f"{pf['target_pct']:.0f}%" if pf["target_pct"] is not None else "?"
+            print(f"  Origen          : [{pf['source_slot']}] {pf['source_email']} ({src_pct_s} libre)")
+            print(f"  Destino         : [{pf['target_slot'] or '-'}] {pf['target_email']} ({tgt_pct_s} libre)")
+            for k, v in pf["checks"].items():
+                print(f"    [{'OK' if v else 'FAIL'}] {k}")
+            if pf["blockers"]:
+                print("  Bloqueos        : " + " | ".join(pf["blockers"]))
+        return 0 if pf["ok"] else 1
+
     ok, msg = baton_pass_session(
         sel,
-        target_slot=getattr(args, "to", "") or "",
-        model=getattr(args, "model", "") or "",
+        target_slot=target_slot,
+        model=model,
         switch_to=not getattr(args, "no_switch", False),
     )
     print(msg)
@@ -2443,6 +2772,7 @@ def run_curses_tui(stdscr) -> None:
 
     quota_lock = threading.Lock()
     quota_worker_state = {"running": False, "last_poll": 0.0, "msg": ""}
+    pending_delete_info: dict | None = None
 
     def trigger_quota_poll(force: bool = False) -> None:
         with quota_lock:
@@ -2645,9 +2975,13 @@ def run_curses_tui(stdscr) -> None:
             polling_now = quota_worker_state["running"]
 
         if quota_alert:
+            pf_badge = ""
+            if sel_for_alert:
+                pf = baton_preflight(sel_for_alert, target_slot=quota_alert.get("target_slot", ""), model=model_disp)
+                pf_badge = " [Preflight OK · 0 dup]" if pf["ok"] else " [Esperando IDLE]"
             if quota_alert["target_slot"]:
                 tpct = f" ({quota_alert['target_pct']:.0f}%)" if quota_alert["target_pct"] >= 0 else ""
-                act_hint = f"Pulsa [B] Baton Pass -> [{quota_alert['target_slot']}]{tpct} (mismo chat + modelo)"
+                act_hint = f"Pulsa [B] Baton Pass -> [{quota_alert['target_slot']}]{tpct}{pf_badge}"
             else:
                 act_hint = "Pulsa [u] Cuentas -> [+] para añadir 2ª Cuenta Pro"
             alert_txt = (
@@ -2794,6 +3128,11 @@ def run_curses_tui(stdscr) -> None:
                             stdscr.addstr(ry, 0, txt[: max_x - 1], curses.color_pair(3))
         elif mode == "accounts":
             acct_list = list(reg.get("accounts", {}).items())
+            email_counts: dict[str, int] = {}
+            for _, ad_row in acct_list:
+                em = str(ad_row.get("email", "")).strip().lower()
+                if em:
+                    email_counts[em] = email_counts.get(em, 0) + 1
             sel_s_title = sel_for_alert.title[:28] if sel_for_alert else "-"
             ahdr = (
                 f" 💳 CUENTAS GOOGLE PRO & BATON PASS (Sesión objetivo: {sel_s_title} · Modelo: {model_disp or 'default'})"
@@ -2810,18 +3149,45 @@ def run_curses_tui(stdscr) -> None:
                 fams = q.get("families", {}) if q.get("ok") else {}
                 def _fp(k: str) -> str:
                     return f"{fams[k]:.0f}%" if k in fams else "-"
-                mail = adata.get("email", "") or ("(sin login OAuth)" if not adata.get("authenticated") else "(pendiente)")
-                st_txt = "LISTA" if adata.get("authenticated") else "FALTA LOGIN [+]"
+                raw_mail = str(adata.get("email", "")).strip()
+                mail = raw_mail or ("(sin login OAuth)" if not adata.get("authenticated") else "(pendiente)")
+                is_dup = bool(raw_mail and email_counts.get(raw_mail.lower(), 0) > 1 and sname != "primary")
+                if not adata.get("authenticated"):
+                    st_txt = "FALTA LOGIN [+]"
+                elif is_dup:
+                    st_txt = "LISTA (DUPLICADA -> [x])"
+                else:
+                    st_txt = "LISTA"
                 row_txt = (
                     f" {sname:<12} {mark:<4} {adata.get('mode', '?'):<9} {mail[:28]:<28} "
                     f"{_fp('argon'):>7} {_fp('gemini'):>7} {_fp('claude_gpt'):>10}  {st_txt}"
                 )
                 attr = (curses.color_pair(6) | curses.A_BOLD) if idx == cursor else (
-                    curses.color_pair(3) if adata.get("authenticated") else curses.color_pair(4)
+                    curses.color_pair(4) if (not adata.get("authenticated") or is_dup) else curses.color_pair(3)
                 )
                 stdscr.addstr(ry, 0, row_txt[: max_x - 1].ljust(max_x - 1), attr)
 
-            if acct_list and 0 <= cursor < len(acct_list) and max_y >= 15:
+            if pending_delete_info is not None:
+                det_y = min(max_y - 8, 7 + len(acct_list))
+                pdi = pending_delete_info
+                dup_s = f" ⚠️ Duplicada de [{', '.join(pdi['duplicate_of'])}]" if pdi["duplicate_of"] else ""
+                conf_lines = [
+                    (f" 🗑 CONFIRMAR ELIMINACIÓN DE PERFIL LOCAL [{pdi['slot']}] — NADA DE OTRAS CUENTAS", curses.color_pair(1) | curses.A_BOLD),
+                    (f"   Identidad : {pdi['email'] or '(sin login OAuth)'}{dup_s}", curses.color_pair(4) | curses.A_BOLD),
+                    (f"   Sesiones  : {len(pdi['associated_sessions'])} asociadas  |  PIDs vivos en [{pdi['slot']}]: {len(pdi['active_pids'])}", curses.A_NORMAL),
+                    (f"   Alcance   : SOLO {pdi['slot_dir']} ({pdi['local_files']} archivos locales; {pdi['shared_symlinks']} symlinks compartidos intactos)", curses.A_NORMAL),
+                    (
+                        f"   ❌ BLOQUEADO: {pdi['blocked_reason']}  (Esc para volver)"
+                        if pdi["blocked_reason"]
+                        else f"   👉 Pulsa [S] o [Y] para confirmar borrar SOLO [{pdi['slot']}]  |  [N / Esc] Cancelar",
+                        curses.color_pair(1 if pdi["blocked_reason"] else 4) | curses.A_BOLD,
+                    ),
+                ]
+                for ci, (cl, ca) in enumerate(conf_lines):
+                    cy = det_y + ci
+                    if cy < max_y - 3:
+                        stdscr.addstr(cy, 0, cl[: max_x - 1].ljust(max_x - 1), ca)
+            elif acct_list and 0 <= cursor < len(acct_list) and max_y >= 15:
                 sname, adata = acct_list[cursor]
                 buckets = adata.get("quota", {}).get("buckets", [])
                 det_y = min(max_y - 6, 7 + len(acct_list))
@@ -2928,6 +3294,20 @@ def run_curses_tui(stdscr) -> None:
 
         if mode == "accounts":
             acct_list = list(reg.get("accounts", {}).items())
+            if pending_delete_info is not None:
+                if ch in (ord("y"), ord("Y"), ord("s"), ord("S")) and not pending_delete_info.get("blocked_reason"):
+                    ok, status_banner = remove_account_slot(
+                        pending_delete_info["slot"],
+                        confirmed=True,
+                        sessions=sessions,
+                    )
+                    pending_delete_info = None
+                    if ok and cursor > 0:
+                        cursor -= 1
+                elif ch in (ord("n"), ord("N"), 27, ord("u"), ord("q")):
+                    pending_delete_info = None
+                    status_banner = "Eliminación de perfil cancelada."
+                continue
             if ch in (ord("u"), ord("m"), 27):
                 mode = "sessions"
                 cursor = saved_session_cursor
@@ -2951,9 +3331,12 @@ def run_curses_tui(stdscr) -> None:
                     status_banner = f"Nombre inválido: {ve}"
             elif ch in (ord("x"), curses.KEY_DC, 127) and acct_list and 0 <= cursor < len(acct_list):
                 del_slot = acct_list[cursor][0]
-                ok, status_banner = remove_account_slot(del_slot)
-                if ok and cursor > 0:
-                    cursor -= 1
+                info = inspect_account_removal(del_slot, sessions=sessions)
+                if info["blocked_reason"]:
+                    status_banner = f"⚠️ {info['blocked_reason']}"
+                else:
+                    pending_delete_info = info
+                    status_banner = f"Revisa identidad/alcance de [{del_slot}] arriba: [S/Y] Confirmar | [N/Esc] Cancelar"
             elif ch in (10, 13, curses.KEY_ENTER, ord("s")) and acct_list and 0 <= cursor < len(acct_list):
                 chosen_slot = acct_list[cursor][0]
                 reg["active_slot"] = chosen_slot
@@ -3099,6 +3482,7 @@ def build_parser() -> argparse.ArgumentParser:
         p_ac.add_argument("account_cmd", nargs="?", default="list", choices=["list", "add", "use", "remove"])
         p_ac.add_argument("slot", nargs="?", default="")
         p_ac.add_argument("--tab", action="store_true", help="Open interactive login in a new dashboard tmux tab")
+        p_ac.add_argument("--yes", action="store_true", help="Confirm local profile removal non-interactively")
         p_ac.set_defaults(fn=cmd_accounts)
 
     p_al = sub.add_parser("account-login", help="Interactive isolated OAuth login for an extra account slot")
@@ -3114,6 +3498,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_bt.add_argument("--to", default="", help="Target account slot (defaults to highest-quota alternate)")
     p_bt.add_argument("--model", default="", help="Explicit model display name or slug")
     p_bt.add_argument("--no-switch", action="store_true", help="Do not switch tmux focus to the baton tab")
+    p_bt.add_argument("--check", action="store_true", help="Run Baton Pass preflight checks only (no changes)")
+    p_bt.add_argument("--json", action="store_true", help="Emit JSON output for `--check`")
     p_bt.set_defaults(fn=cmd_baton)
 
     return ap
