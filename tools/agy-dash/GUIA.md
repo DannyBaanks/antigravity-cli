@@ -170,3 +170,7 @@ El panel `0:⚡DASH` muestra la lista de sesiones a la izquierda, la **Vista en 
 2. **Codex ignora `@imports` en `AGENTS.md`:** por eso `isymem setup` escribe la regla **inline** en `~/.codex/AGENTS.md` y `~/.gemini/GEMINI.md`, y usa `@~/.config/isyco-memory/agents.md` en `~/.claude/CLAUDE.md`. Si editas la regla base, vuelve a correr `isymem setup`.
 3. **Capturar stdout al lanzar `tmux new-session -d`** desde Python cuelga si no se redirige `stdout/stderr` a `DEVNULL`, porque el daemon del servidor `tmux` hereda el descriptor del pipe (`tmux_cmd` en `agy_dashboard.py` ya lo aísla con `DEVNULL`).
 4. **Dos copias del dash:** `~/.local/bin/agy-dash` y el hook de AGY apuntan al fork (`ISyCo Git/antigravity-cli/tools/agy-dash`), pero `tools/agy_limits/` del monorepo es una copia. Si el panel se arrancó desde la copia, corre ese código: arráncalo siempre con `agy-dash`.
+
+### ⌨ Atajos
+
+Arriba a la derecha de la barra hay un botón amarillo **⌨ Atajos**: clic y sale un popup con todas las combinaciones (dash, Command Center y AGY). Cualquier tecla lo cierra. Por terminal: `agy-dash keys`.

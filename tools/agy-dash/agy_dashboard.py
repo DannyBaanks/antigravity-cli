@@ -1583,6 +1583,99 @@ def tmux_dquote(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+KEYS_SHEET = [
+    ("AGY DASH (cualquier pestaña)", [
+        ("Alt+D  /  Alt+0", "ir al Dashboard (clic en ⚡: ir y volver)"),
+        ("Alt+1 … Alt+9", "ir a la pestaña N"),
+        ("Alt+←  /  Alt+→", "pestaña anterior / siguiente"),
+        ("Alt+N", "nueva sesión AGY"),
+        ("Alt+H", "hibernar todas las sesiones idle (0 MB)"),
+        ("Alt+C", "modo copia (q/Esc sale · Enter/y copia)"),
+        ("clic en ×", "cerrar pestaña (si trabaja, va a agy-bg)"),
+        ("clic medio en pestaña", "cerrar esa pestaña"),
+        ("clic derecho", "menú de tmux (mover, renombrar…)"),
+        ("arrastrar/doble/triple", "copiar selección / palabra / línea"),
+        ("rueda arriba", "scroll del historial"),
+    ]),
+    ("COMMAND CENTER (pestaña ⚡ DASH)", [
+        ("↑↓  /  j k", "mover cursor"),
+        ("Enter", "abrir la sesión"),
+        ("n", "nueva sesión"),
+        ("t", "renombrar"),
+        ("c  /  C", "compactar NVIDIA e ir / al Baúl"),
+        ("V", "Baúl de compactadas"),
+        ("v", "espejo en vivo de la sesión"),
+        ("h  /  H", "hibernar la seleccionada / todas las idle"),
+        ("B", "Baton pass a otra cuenta"),
+        ("u  /  U", "cuentas / refrescar cuota"),
+        ("K", "key de NVIDIA"),
+        ("m", "memoria"),
+        ("r  /  R", "refrescar / recargar"),
+        ("x", "limpiar duplicados"),
+        ("q / Esc / Tab", "volver a la pestaña siguiente"),
+        ("D", "desconectar (las sesiones siguen vivas)"),
+    ]),
+    ("AGY (dentro de una sesión)", [
+        ("Alt+S  /  Alt+X", "board del swarm / ocultar aviso del swarm"),
+        ("Ctrl+O", "expandir / colapsar herramientas"),
+        ("Shift+Tab", "cambiar modo (plan, accept-edits, auto…)"),
+        ("Shift+Enter  /  Ctrl+J", "nueva línea en el prompt"),
+        ("Ctrl+G", "editar el prompt en $EDITOR"),
+        ("Ctrl+R", "revisar artifacts pendientes"),
+        ("Ctrl+B", "shell a segundo plano"),
+        ("Ctrl+L", "limpiar pantalla"),
+        ("Ctrl+Z", "deshacer en el prompt"),
+        ("Alt+F / Alt+B · Ctrl+W", "palabra adelante / atrás · borrar palabra"),
+        ("Ctrl+C", "interrumpir (2 veces: salir)"),
+        ("?", "atajos propios de AGY"),
+    ]),
+]
+
+
+def _keys_block(title: str, rows: list, kw: int) -> list[tuple[str, int]]:
+    """Lines as (ansi_text, visible_len)."""
+    bold, yel, rst = "\033[1m", "\033[33m", "\033[0m"
+    out = [(f"{bold}{title}{rst}", len(title))]
+    for k, desc in rows:
+        out.append((f"  {yel}{k:<{kw}}{rst} {desc}", 3 + max(kw, len(k)) + len(desc)))
+    out.append(("", 0))
+    return out
+
+
+def cmd_keys(args) -> int:
+    """Print the cheat sheet (two columns if it fits); in a popup wait for one key."""
+    import shutil as _sh
+    cols = _sh.get_terminal_size((100, 40)).columns
+    kw = 22
+    blocks = [_keys_block(t, r, kw) for t, r in KEYS_SHEET]
+    left_w = max(n for b in (blocks[0], blocks[2]) for _, n in b)
+    right_w = max(n for _, n in blocks[1])
+    if cols >= left_w + 3 + right_w:
+        left, right = blocks[0] + blocks[2], blocks[1]
+        lines = []
+        for k in range(max(len(left), len(right))):
+            lt, ln = left[k] if k < len(left) else ("", 0)
+            rt, _ = right[k] if k < len(right) else ("", 0)
+            lines.append(lt + " " * (left_w - ln + 3) + rt if rt else lt)
+    else:
+        lines = [t for b in blocks for t, _ in b]
+    while lines and not lines[-1]:
+        lines.pop()
+    lines.append("\033[2mEl Alt+D del prompt de AGY (borrar palabra) lo usa el dash.   Cualquier tecla cierra.\033[0m")
+    sys.stdout.write("\n".join(lines) + "\n")
+    sys.stdout.flush()
+    if sys.stdin.isatty():
+        import termios, tty
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            os.read(fd, 16)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    return 0
+
+
 def write_tmux_config(self_path: Path) -> None:
     TMUX_CONF.parent.mkdir(parents=True, exist_ok=True)
     if ensure_zig_core():
@@ -1647,7 +1740,7 @@ bind -n M-c copy-mode
 
 # Red ⚡ AGY DASH button (top-left) toggles Command Center; × closes tabs keeping busy agents alive
 bind -T root MouseDown1StatusLeft run-shell {tmux_dquote(py_self + " show-dash --toggle")}
-bind -T root MouseDown1Status if -F '#{{m:x_*,#{{mouse_status_range}}}}' {{ run-shell {tmux_dquote(py_self + " close-tab #{s/x_//:#{mouse_status_range}}")} }} {{ select-window -t = }}
+bind -T root MouseDown1Status if -F '#{{m:x_*,#{{mouse_status_range}}}}' {{ run-shell {tmux_dquote(py_self + " close-tab #{s/x_//:#{mouse_status_range}}")} }} {{ if -F '#{{==:#{{mouse_status_range}},keys}}' {{ display-popup -E -w 96% -h 33 -T " ⌨ Atajos " {tmux_dquote(py_self + " keys")} }} {{ select-window -t = }} }}
 bind -T root MouseDown2Status run-shell {tmux_dquote(py_self + " close-tab #{window_index}")}
 
 # Top dashboard bar powered by Zig `agy-fast-core statusbar` (<7ms)
@@ -1657,7 +1750,7 @@ set -g status-style "bg=#14171f,fg=#d8dee9"
 set -g status-left-length 32
 set -g status-right-length 78
 set -g status-left "{dash_btn_fmt}"
-set -g status-right "#[fg=#414650]│ #[fg=#8be9fd]#({status_cmd}) #[fg=#414650]│ #[fg=#f1fa8c]Alt+D:Dash Alt+1..9:Tab Alt+C:Copy Alt+N:New "
+set -g status-right "#[fg=#414650]│ #[fg=#8be9fd]#({status_cmd}) #[fg=#414650]│ #[range=user|keys]#[fg=#282a36,bg=#f1fa8c,bold] ⌨ Atajos #[norange]#[default] "
 
 setw -g window-status-format "{win_fmt}"
 setw -g window-status-current-format "{win_cur_fmt}"
@@ -5227,6 +5320,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_ct = sub.add_parser("close-tab", help="Safely close tab `×` (parks active RUNNING/BG-TASK tabs in agy-bg)")
     p_ct.add_argument("window_index")
     p_ct.set_defaults(fn=cmd_close_tab)
+
+    p_keys = sub.add_parser("keys", help="Cheat sheet of every shortcut (the ⌨ Atajos button opens it in a popup)")
+    p_keys.set_defaults(fn=cmd_keys)
 
     p_sd = sub.add_parser("show-dash", help="Ensure ⚡DASH exists and switch focus to it (Alt+D / ⚡AGY DASH button)")
     p_sd.add_argument("--toggle", action="store_true", help="Return to previous tab when already viewing DASH")
