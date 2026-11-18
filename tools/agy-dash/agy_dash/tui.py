@@ -58,7 +58,7 @@ def build_command_buttons(panel_w: int) -> list[CommandButton]:
 
 
 # swarm-ext (ISyCo tools/swarm_models): ping + bench + ranking of every swarm model, shared with claude-dash
-BOARD_PROVIDERS = "agy,nvapi,codex,opencode,freellm"
+BOARD_PROVIDERS = "agy,nvapi,codex,opencode,freellm,qwen"
 
 
 def model_board_command(exe: str | None = None) -> list[str] | None:
