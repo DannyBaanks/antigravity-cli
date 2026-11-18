@@ -49,6 +49,7 @@ KEYS_SHEET = [
         ("u  /  U", "cuentas / refrescar cuota"),
         ("K", "key de NVIDIA"),
         ("m", "memoria"),
+        ("M", "ranking de modelos (ping/bench, swarm-ext board)"),
         ("r  /  R", "refrescar / recargar"),
         ("x", "limpiar duplicados"),
         ("q / Esc / Tab", "volver a la pestaña siguiente"),
