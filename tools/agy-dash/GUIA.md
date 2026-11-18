@@ -155,9 +155,18 @@ El panel `0:⚡DASH` muestra la lista de sesiones a la izquierda, la **Vista en 
    - Hacer clic en **`×`** (o clic central) sobre una pestaña cierra **solo el tab visual**: si esa sesión sigue en `RUNNING` o `BG-TASK`, se estaciona viva en la sesión oculta `agy-bg` sin matar el proceso (puedes traerla de vuelta al frente en cualquier momento desde `0:⚡DASH` con `Enter`).
    - Arrastrar con el mouse o usar la rueda arriba en cualquier pestaña `agy` entra automáticamente en `copy-mode` (congela el scroll mientras el modelo escribe para que **nunca se corte ni deseleccione lo subrayado**) y `MouseDragEnd1Pane` copia al portapapeles sin limpiar la selección (`Alt+S` activa el mismo modo por teclado).
    - Al abrir login aislado (`u -> +`), un wrapper `xdg-open` restaura tu `DBUS_SESSION_BUS_ADDRESS` real para abrir el navegador automáticamente y copia la URL OAuth completa en 1 línea al portapapeles (`Ctrl+V`).
+8. **Seguridad al cerrar procesos (auditoría 2026-11-18):**
+   - Hibernar, deduplicar, migrar o hacer Baton Pass **vuelve a leer el estado justo antes de cerrar** (la lista de la TUI puede tener segundos): si en ese momento hay un turno o tarea activa, no se toca.
+   - Solo se manda `SIGTERM` si el PID sigue siendo el mismo `agy` del escaneo (misma hora de arranque del kernel; un PID reciclado nunca se toca) y nunca se escala a `SIGKILL`. La sesión solo se marca hibernada si el proceso de verdad terminó.
+   - Las copias duplicadas **ya no se cierran solas**: el panel avisa ("está abierta N veces") y tú decides con `[x]`. Antes se cerraba cada 10 s cualquier copia externa sin hijos, aunque fuera la terminal donde estabas escribiendo.
+   - Abrir en el panel una sesión que corre en otra terminal: si esa copia está ocupada, o no se cierra, se abre el espejo (`👁`) en vez de un segundo `agy` escribiendo la misma conversación.
+   - `self-compact` espera a que el turno termine de verdad (`--wait`, 900 s por defecto) antes de reemplazar la pestaña. Si sigue ocupada, deja el handoff en el Baúl sin cortar nada. `self` se resuelve por la pestaña del propio agente (`$TMUX_PANE`), no por la que estás mirando, y si hay ambigüedad pide el `conv_id`.
+   - Eliminar una cuenta aislada: si AGY reemplazó un symlink compartido por un archivo real (pasa con `conversation_summaries.db`), ese archivo se **mueve** a `accounts/.rescued/<cuenta>-<fecha>/` antes de purgar; nunca se borra.
+   - El escaneo de sesiones (~50 ms) corre en su propio hilo: las teclas ya no esperan. El spinner de pestañas va cada 0.9 s (`AGY_LED_TICK_SEC`).
 
 ## Trampas
 
 1. **`agy` lanzado fuera de `agy-dash` / `agy-limited`** no lleva `PR_SET_MEMORY_MERGE=1` ni `GOMEMLIMIT=180MiB`. Usa `agy-dash` (o pon `alias agy=agy-limited` en `~/.bashrc`).
 2. **Codex ignora `@imports` en `AGENTS.md`:** por eso `isymem setup` escribe la regla **inline** en `~/.codex/AGENTS.md` y `~/.gemini/GEMINI.md`, y usa `@~/.config/isyco-memory/agents.md` en `~/.claude/CLAUDE.md`. Si editas la regla base, vuelve a correr `isymem setup`.
 3. **Capturar stdout al lanzar `tmux new-session -d`** desde Python cuelga si no se redirige `stdout/stderr` a `DEVNULL`, porque el daemon del servidor `tmux` hereda el descriptor del pipe (`tmux_cmd` en `agy_dashboard.py` ya lo aísla con `DEVNULL`).
+4. **Dos copias del dash:** `~/.local/bin/agy-dash` y el hook de AGY apuntan al fork (`ISyCo Git/antigravity-cli/tools/agy-dash`), pero `tools/agy_limits/` del monorepo es una copia. Si el panel se arrancó desde la copia, corre ese código: arráncalo siempre con `agy-dash`.

@@ -20,7 +20,6 @@ import argparse
 import ctypes
 import curses
 import datetime as dt
-import glob
 import json
 import os
 import re
@@ -76,6 +75,7 @@ QUOTA_CRIT_PCT = float(os.environ.get("AGY_QUOTA_CRIT_PCT", "5"))
 QUOTA_POLL_INTERVAL_SEC = float(os.environ.get("AGY_QUOTA_POLL_SEC", "120"))
 DEFAULT_NVAPI_BASE_URL = os.environ.get("AGY_NVAPI_BASE_URL", "https://integrate.api.nvidia.com/v1")
 DEFAULT_NVAPI_MODEL = os.environ.get("AGY_NVAPI_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
+LED_TICK_SEC = float(os.environ.get("AGY_LED_TICK_SEC", "0.9"))  # tab spinner cadence (each tick = tmux redraw)
 HEARTBEAT_INTERVAL_SEC = float(os.environ.get("AGY_HB_INTERVAL_SEC", "300"))
 HEARTBEAT_WARN_TOKENS = int(os.environ.get("AGY_HB_WARN_TOKENS", "100000"))
 HEARTBEAT_RECOMMEND_TOKENS = int(os.environ.get("AGY_HB_RECOMMEND_TOKENS", "150000"))
@@ -155,6 +155,7 @@ class ProcMemInfo:
     swap_kb: int = 0
     active_children: list[str] = field(default_factory=list)
     in_dash: bool = False
+    start_ticks: int = 0  # /proc/<pid>/stat starttime at scan time: a recycled PID never matches
 
 
 @dataclass
@@ -243,6 +244,57 @@ def is_ancestor_pid(target_pid: int) -> bool:
         except Exception:
             break
     return False
+
+
+def proc_start_ticks(pid: int) -> int:
+    """Kernel start time of `pid` (field 22 of /proc/<pid>/stat); 0 if it does not exist or already exited
+    (a zombie keeps its /proc entry until reaped, but it is dead)."""
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return 0 if fields[0] in ("Z", "X") else int(fields[19])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def _proc_is_agy(pid: int) -> bool:
+    try:
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except OSError:
+        return False
+    return any(Path(a.decode("utf-8", "replace")).name.startswith("agy") for a in argv[:2] if a)
+
+
+def terminate_verified(proc: "ProcMemInfo", *, timeout_s: float = 8.0) -> tuple[bool, str]:
+    """SIGTERM `proc` only if it is still the same `agy` process the scan saw, then wait until it is gone.
+
+    Never kills an ancestor of this process, a recycled PID (start time changed) or a non-agy binary,
+    and never escalates to SIGKILL: an agy that ignores SIGTERM is reported, not destroyed."""
+    pid = proc.pid
+    if pid <= 1 or is_ancestor_pid(pid):
+        return False, f"PID {pid} es esta misma sesión"
+    cur = proc_start_ticks(pid)
+    if cur == 0:
+        return True, f"PID {pid} ya no existía"
+    if proc.start_ticks and cur != proc.start_ticks:
+        return False, f"PID {pid} fue reutilizado por otro proceso; no se toca"
+    if not _proc_is_agy(pid):
+        return False, f"PID {pid} ya no es agy; no se toca"
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as e:
+        return False, f"PID {pid}: {e}"
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if proc_start_ticks(pid) != cur:
+            return True, f"PID {pid} cerrado"
+        time.sleep(0.1)
+    return False, f"PID {pid} no terminó en {timeout_s:.0f}s (sigue vivo)"
+
+
+def refresh_session(conv_id: str) -> "AgySession | None":
+    """Fresh state of one conversation right before a destructive action (snapshots go stale in seconds)."""
+    _, _, sessions = load_sessions(limit=80)
+    return next((s for s in sessions if s.conversation_id == conv_id), None)
 
 
 def transcript_path_for(conv_id: str) -> Path:
@@ -353,6 +405,7 @@ def zig_scan() -> tuple[int, dict[str, int], dict[str, list[ProcMemInfo]]]:
                         swap_kb=int(p.get("swap_kb", 0)),
                         active_children=kids,
                         in_dash=(ppid in dash_server_pids),
+                        start_ticks=proc_start_ticks(int(p["pid"])),
                     )
                     by_conv.setdefault(cid, []).append(pinfo)
                 return scan_us, ksm, by_conv
@@ -468,15 +521,14 @@ def print_instant_zig_preview(conv_id: str, title: str, workspace: str) -> None:
 
 
 def _get_tmux_dash_server_pids() -> set[int]:
-    pids: set[int] = set()
-    for stat_p in glob.glob("/proc/[0-9]*/cmdline"):
-        try:
-            raw = Path(stat_p).read_bytes().decode("utf-8", errors="replace")
-            if "tmux" in raw and TMUX_SOCKET in raw:
-                pids.add(int(stat_p.split("/")[2]))
-        except Exception:
-            pass
-    return pids
+    """PID of the agy-dash tmux server (panes are its direct children). One tmux call, no /proc sweep."""
+    try:
+        cp = subprocess.run(["tmux", "-L", TMUX_SOCKET, "display-message", "-p", "#{pid}"],
+                            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=1.0)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    out = (cp.stdout or "").strip()
+    return {int(out)} if cp.returncode == 0 and out.isdigit() else set()
 
 
 def _get_window_map_for_session(tmux_session: str) -> dict[str, tuple[str, str]]:
@@ -747,7 +799,12 @@ def load_sessions(limit: int = 40) -> tuple[int, dict[str, int], list[AgySession
     return scan_us, ksm_stats, (live_and_hib + saved)[:limit]
 
 
-def hibernate_session(session: AgySession) -> tuple[bool, str]:
+def hibernate_session(session: AgySession, *, fresh: bool = True) -> tuple[bool, str]:
+    if fresh and session.proc is not None:
+        # The TUI snapshot can be seconds old: a turn may have started since. Re-read before killing.
+        cur = refresh_session(session.conversation_id)
+        if cur is not None:
+            session = cur
     if session.proc is None:
         return False, f"La sesión {session.conversation_id[:8]} no está en RAM."
     if not session.can_hibernate:
@@ -760,17 +817,13 @@ def hibernate_session(session: AgySession) -> tuple[bool, str]:
 
     all_procs = [session.proc] + list(session.extra_procs)
     saved_pss = sum(p.pss_kb + p.swap_kb for p in all_procs)
-    pids = [p.pid for p in all_procs if not is_ancestor_pid(p.pid)]
-    for pid in pids:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
-
-    for _ in range(40):
-        if all(not Path(f"/proc/{pid}").exists() for pid in pids):
-            break
-        time.sleep(0.1)
+    failures = []
+    for p in all_procs:
+        ok, why = terminate_verified(p)
+        if not ok:
+            failures.append(why)
+    if failures:
+        return False, f"No se hibernó '{session.title}' ({session.conversation_id[:8]}): {'; '.join(failures)}"
 
     hib_reg = load_hibernated_registry()
     hib_reg[session.conversation_id] = {
@@ -779,7 +832,7 @@ def hibernate_session(session: AgySession) -> tuple[bool, str]:
         "workspace": session.workspace,
         "step_count": session.step_count,
         "saved_pss_kb": saved_pss,
-        "hibernated_pid": pids[0] if pids else 0,
+        "hibernated_pid": session.proc.pid,
         "hibernated_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     save_hibernated_registry(hib_reg)
@@ -789,33 +842,46 @@ def hibernate_session(session: AgySession) -> tuple[bool, str]:
     )
 
 
+def _dup_kill_ok(session: AgySession) -> bool:
+    """Duplicates are only closed when the whole conversation is quiet (no turn, no background task)."""
+    return not (
+        session.db_status == "CASCADE_RUN_STATUS_RUNNING"
+        or session.transcript_busy
+        or session.not_fully_idle
+    )
+
+
 def deduplicate_session_procs(session: AgySession) -> int:
-    """Close idle duplicate copies when a session already has a primary process."""
+    """Close idle duplicate copies when a session already has a primary process (manual action only)."""
+    if not session.extra_procs:
+        return 0
+    session = refresh_session(session.conversation_id) or session
+    if not _dup_kill_ok(session):
+        return 0
     freed_kb = 0
     for ep in list(session.extra_procs):
-        if not ep.in_dash and not ep.active_children and not is_ancestor_pid(ep.pid):
-            try:
-                os.kill(ep.pid, signal.SIGTERM)
+        if not ep.in_dash and not ep.active_children:
+            ok, _ = terminate_verified(ep)
+            if ok:
                 freed_kb += ep.pss_kb + ep.swap_kb
-            except OSError:
-                pass
     return freed_kb
 
 
 def close_stale_dash_duplicates(session: AgySession) -> int:
-    """Close a stale in-dash duplicate `agy` when external `ext:pts/*` holds active work."""
-    freed_kb = 0
+    """Close a stale in-dash duplicate `agy` when external `ext:pts/*` holds active work (manual only)."""
     all_procs = ([session.proc] if session.proc else []) + list(session.extra_procs)
-    has_busy_ext = any((not p.in_dash) and p.active_children for p in all_procs)
-    if not has_busy_ext:
+    if not any((not p.in_dash) and p.active_children for p in all_procs):
         return 0
+    session = refresh_session(session.conversation_id) or session
+    all_procs = ([session.proc] if session.proc else []) + list(session.extra_procs)
+    if not any((not p.in_dash) and p.active_children for p in all_procs):
+        return 0
+    freed_kb = 0
     for p in all_procs:
-        if p.in_dash and not p.active_children and not is_ancestor_pid(p.pid):
-            try:
-                os.kill(p.pid, signal.SIGTERM)
+        if p.in_dash and not p.active_children:
+            ok, _ = terminate_verified(p)
+            if ok:
                 freed_kb += p.pss_kb + p.swap_kb
-            except OSError:
-                pass
     return freed_kb
 
 
@@ -1721,14 +1787,15 @@ def open_session_in_dashboard_tab(
     )
 
     migrated_ext = False
-    if not as_stub and not use_mirror and session.proc is not None and (not session.proc.in_dash or account_slot):
-        if not session.proc.active_children and session.db_status != "CASCADE_RUN_STATUS_RUNNING" and not is_ancestor_pid(session.proc.pid):
-            if not session.proc.in_dash:
-                try:
-                    os.kill(session.proc.pid, signal.SIGTERM)
-                    migrated_ext = True
-                except OSError:
-                    pass
+    if not as_stub and not use_mirror and session.proc is not None and not session.proc.in_dash:
+        # Migrate an idle external copy into the dash: it must be verifiably gone BEFORE the new agy
+        # opens the same conversation (two writers on one conversation corrupt its state).
+        if not session.external_busy:
+            ok, _why = terminate_verified(session.proc)
+            if ok:
+                migrated_ext = True
+            elif not force_interactive:
+                use_mirror = True
 
     model_disp, model_slug = resolve_model_arg(model)
     slot_flag = f" --account {sh_quote(chosen_slot)}" if chosen_slot else ""
@@ -1811,20 +1878,12 @@ def baton_pass_session(
     model_disp = pf["model_display"]
     model_slug = pf["model_slug"]
 
-    # Ensure zero duplicate operations: terminate any live IDLE/duplicate procs and wait for clean exit
-    pids_to_stop: list[int] = []
+    # Ensure zero duplicate writers: stop live external copies (verified) BEFORE the new account opens it.
     for p in ([session.proc] if session.proc else []) + list(session.extra_procs):
-        if p and not p.in_dash and not is_ancestor_pid(p.pid):
-            pids_to_stop.append(p.pid)
-            try:
-                os.kill(p.pid, signal.SIGTERM)
-            except OSError:
-                pass
-    if pids_to_stop:
-        for _ in range(40):
-            if all(not Path(f"/proc/{pid}").exists() for pid in pids_to_stop):
-                break
-            time.sleep(0.1)
+        if p and not p.in_dash:
+            ok, why = terminate_verified(p)
+            if not ok:
+                return False, f"⚠️ Baton Pass cancelado: {why}"
 
     hib_reg = load_hibernated_registry()
     if session.conversation_id in hib_reg:
@@ -2096,7 +2155,7 @@ def should_offer_compaction(session: AgySession) -> tuple[bool, int, int]:
     if session.proc is not None:
         return (False, est_tok, size_b)
     is_heavy = session.step_count >= COMPACT_MIN_STEPS or size_b >= COMPACT_MIN_BYTES
-    return (is_heavy, est_tokens := est_tok, size_b)
+    return (is_heavy, est_tok, size_b)
 
 
 def build_compaction_digest(conv_id: str, title: str, workspace: str, max_chars: int = 44000) -> tuple[str, int]:
@@ -2530,7 +2589,6 @@ def evaluate_context_heartbeat(
     due = force or (last_ts <= 0.0) or ((cur_t - last_ts) >= iv) or escalated_urgent
 
     ws = cwd or str(Path.cwd())
-    short_id = conv_id[:8]
     tok_s = f"{metrics['used_tokens']:,}"
     max_s = f"{metrics['max_tokens']:,}"
     pct_s = f"{metrics['pct']:.1f}%"
@@ -2836,11 +2894,16 @@ def cmd_live_mirror(args: argparse.Namespace) -> int:
     if action in ("migrate", "interactive"):
         _, _, sessions = load_sessions(limit=40)
         sess = next((s for s in sessions if s.conversation_id == cid), None)
-        if action == "migrate" and sess and sess.proc and not sess.proc.in_dash and not sess.external_busy:
-            try:
-                os.kill(sess.proc.pid, signal.SIGTERM)
-            except OSError:
-                pass
+        if action == "migrate" and sess and sess.proc and not sess.proc.in_dash:
+            if sess.external_busy:
+                print("La copia externa tiene un turno o tarea activa; sigo en el espejo.", file=sys.stderr)
+                time.sleep(2.0)
+                return cmd_live_mirror(args)
+            ok, why = terminate_verified(sess.proc)
+            if not ok:
+                print(f"No se migró: {why}", file=sys.stderr)
+                time.sleep(2.0)
+                return cmd_live_mirror(args)
         return exec_agy_optimized(["--conversation", cid], cwd=cwd, preview_conv=cid, preview_title=title)
     return 0
 
@@ -3236,8 +3299,40 @@ def inspect_account_removal(
         "slot_dir": str(slot_dir),
         "local_files": local_files,
         "shared_symlinks": symlinks,
+        "diverged_shared": [str(x) for x in diverged_shared_items(safe, accounts_dir=accounts_dir)]
+        if safe != "primary" else [],
         "blocked_reason": blocked,
     }
+
+
+def diverged_shared_items(slot: str, *, accounts_dir: Path | None = None) -> list[Path]:
+    """Items that should be symlinks to the shared data but AGY replaced with real files (e.g. it rewrote
+    conversation_summaries.db in place). They hold real data, so a purge must rescue them first."""
+    safe = validate_slot_name(slot)
+    slot_home = (accounts_dir or ACCOUNTS_DIR) / safe / "home"
+    found = []
+    for base, names in ((slot_home / ".gemini" / "antigravity-cli", _SHARED_AGY_DATA_ITEMS),
+                        (slot_home / ".gemini", _SHARED_GEMINI_ITEMS)):
+        for name in names:
+            fp = base / name
+            if fp.exists() and not fp.is_symlink():
+                found.append(fp)
+    return found
+
+
+def rescue_diverged_shared(slot: str, *, accounts_dir: Path | None = None) -> Path | None:
+    """Move diverged shared items to accounts/.rescued/<slot>-<ts>/ (never deleted). Returns that dir."""
+    items = diverged_shared_items(slot, accounts_dir=accounts_dir)
+    if not items:
+        return None
+    acct_root = accounts_dir or ACCOUNTS_DIR
+    slot_home = acct_root / validate_slot_name(slot) / "home"
+    dest = acct_root / ".rescued" / f"{validate_slot_name(slot)}-{time.strftime('%Y%m%d-%H%M%S')}"
+    for fp in items:
+        target = dest / fp.relative_to(slot_home)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(fp), str(target))
+    return dest
 
 
 def purge_isolated_slot_dir(slot: str, *, accounts_dir: Path | None = None) -> tuple[int, int]:
@@ -3317,7 +3412,9 @@ def remove_account_slot(
     repoint_to = info["duplicate_of"][0] if info["duplicate_of"] else "primary"
     files_del = 0
     links_del = 0
+    rescued: Path | None = None
     if purge_local and info["mode"] == "isolated":
+        rescued = rescue_diverged_shared(safe, accounts_dir=accounts_dir)
         files_del, links_del = purge_isolated_slot_dir(safe, accounts_dir=accounts_dir)
 
     reg = load_accounts_registry(registry_path=registry_path, base_home=base_home)
@@ -3332,7 +3429,8 @@ def remove_account_slot(
     return (
         True,
         f"🗑 Perfil local [{safe}] ({info['email'] or 'sin email'}) eliminado "
-        f"({files_del} locales borrados, {links_del} symlinks desligados, compartido intacto).",
+        f"({files_del} locales borrados, {links_del} symlinks desligados, compartido intacto)"
+        + (f"; datos propios del perfil rescatados en {rescued}." if rescued else "."),
     )
 
 
@@ -3530,9 +3628,11 @@ def detect_caller_conversation_id(sessions: list[AgySession]) -> str | None:
         for ep in s.extra_procs:
             if is_ancestor_pid(ep.pid):
                 return s.conversation_id
-    if os.environ.get("TMUX"):
+    pane = os.environ.get("TMUX_PANE", "")
+    if os.environ.get("TMUX") and pane:
+        # -t $TMUX_PANE: the caller's own window, not whichever tab Danny is looking at right now.
         cp = subprocess.run(
-            ["tmux", "display-message", "-p", "#{@agy_conv_id}"],
+            ["tmux", "display-message", "-p", "-t", pane, "#{@agy_conv_id}"],
             capture_output=True,
             text=True,
             timeout=1.5,
@@ -3542,7 +3642,7 @@ def detect_caller_conversation_id(sessions: list[AgySession]) -> str | None:
             return t_cid
     cwd_s = str(Path.cwd())
     active_ws = [s for s in sessions if s.proc is not None and s.workspace == cwd_s]
-    if active_ws:
+    if len(active_ws) == 1:  # ambiguous when several sessions share the workspace: refuse to guess
         return active_ws[0].conversation_id
     return None
 
@@ -3722,13 +3822,14 @@ def cmd_self_compact(args: argparse.Namespace) -> int:
             return 1
         target = resolved_cid
 
-    matches = [
-        s
-        for s in sessions
-        if s.conversation_id == target
-        or s.conversation_id.startswith(target)
-        or target.lower() in s.title.lower()
-    ]
+    matches = [s for s in sessions if s.conversation_id == target]
+    if not matches and len(target) >= 4:
+        matches = [s for s in sessions if s.conversation_id.startswith(target)]
+    if not matches:
+        matches = [s for s in sessions if target.lower() in s.title.lower()]
+    if len(matches) > 1:
+        print(f"'{target}' coincide con {len(matches)} sesiones; pasa el conv_id completo.", file=sys.stderr)
+        return 1
     if matches:
         sel = matches[0]
     else:
@@ -3764,6 +3865,7 @@ def cmd_self_compact(args: argparse.Namespace) -> int:
         ]
         if win_idx:
             worker_cmd.extend(["--win", win_idx])
+        worker_cmd.extend(["--wait", str(float(getattr(args, "wait", 900.0) or 900.0))])
         if resume_prompt:
             worker_cmd.extend(["--resume-prompt", resume_prompt])
         if getattr(args, "model", ""):
@@ -3831,10 +3933,31 @@ def cmd_self_compact(args: argparse.Namespace) -> int:
             print(f"{msg} · Handoff: {hfile}")
         return 0
 
-    # Give the agent up to 3s to finish outputting its final tool reply before in-place respawn
-    deadline = time.time() + 3.0
-    while time.time() < deadline and is_transcript_turn_active(sel.conversation_id, max_recent_sec=2.0):
-        time.sleep(0.4)
+    # Respawning kills the pane: wait until the turn is really over (never cut a reply mid-way).
+    wait_s = float(getattr(args, "wait", 900.0) or 900.0)
+    deadline = time.time() + wait_s
+    quiet_since = 0.0
+    while time.time() < deadline:
+        cur = refresh_session(sel.conversation_id)
+        busy = cur is not None and cur.proc is not None and (
+            cur.db_status == "CASCADE_RUN_STATUS_RUNNING"
+            or is_transcript_turn_active(sel.conversation_id, max_recent_sec=3.0)
+            or bool(cur.proc.active_children)
+        )
+        if not busy:
+            quiet_since = quiet_since or time.time()
+            if time.time() - quiet_since >= 3.0:
+                break
+        else:
+            quiet_since = 0.0
+        time.sleep(1.0)
+    else:
+        msg_busy = f"{msg} · la sesión siguió ocupada {wait_s:.0f}s; handoff en el Baúl, no se cortó el turno"
+        _write_compact_status(sel.conversation_id, "done", msg_busy, hfile)
+        tmux_cmd("display-message", "-d", "5000", f"⚠ {msg_busy}")
+        if not getattr(args, "bg_worker", False):
+            print(msg_busy)
+        return 2
 
     if getattr(args, "in_place", True):
         res_msg = respawn_compacted_session_in_place(
@@ -4006,7 +4129,6 @@ def run_curses_tui(stdscr) -> None:
     saved_session_cursor = 0
     mode = "sessions"
     status_banner = "Listo — [Enter] Abrir (o Compactar NV) | [c] Compactar NV | [t] Renombrar | [B] Baton Pass | [u] Cuentas"
-    last_scan_ts = 0.0
     last_auto_check = time.time()
     idle_seen_since: dict[str, float] = {}
     cached_preview_cid = ""
@@ -4016,8 +4138,17 @@ def run_curses_tui(stdscr) -> None:
     scan_us = 0
     ksm: dict[str, int] = {"run": 1, "pages_shared": 0, "pages_sharing": 0, "pages_scanned": 0}
     sessions: list[AgySession] = []
-    last_db_sig = (0, 0, 0)
     force_scan = True
+    ctx_cache: dict[str, tuple[tuple[int, int], dict]] = {}
+
+    def cached_context(s: AgySession) -> dict:
+        """measure_session_context re-parses 64 KB of JSON: only redo it when the transcript changed."""
+        sig = transcript_sig(s.conversation_id)
+        hit = ctx_cache.get(s.conversation_id)
+        if hit is None or hit[0] != sig:
+            hit = (sig, measure_session_context(s.conversation_id, step_count=s.step_count))
+            ctx_cache[s.conversation_id] = hit
+        return hit[1]
 
     led_tick = 0
     last_led_ts = 0.0
@@ -4282,6 +4413,32 @@ def run_curses_tui(stdscr) -> None:
             )
         return ""
 
+    # Session scan (~50 ms: zig scan + sqlite + tmux) runs in its own thread so keys never wait on it.
+    scan_lock = threading.Lock()
+    scan_wake = threading.Event()
+    scan_box: dict = {"data": load_sessions(limit=35), "ver": 1}
+    seen_scan_ver = 0
+
+    def _scanner() -> None:
+        last_sig = db_wal_sig()
+        last_t = time.time()
+        while True:
+            forced = scan_wake.wait(0.1)
+            scan_wake.clear()
+            sig = db_wal_sig()
+            if not forced and sig == last_sig and (time.time() - last_t) < 0.6:
+                continue
+            last_sig, last_t = sig, time.time()
+            try:
+                res = load_sessions(limit=35)
+            except Exception:
+                continue
+            with scan_lock:
+                scan_box["data"] = res
+                scan_box["ver"] += 1
+
+    threading.Thread(target=_scanner, daemon=True).start()
+
     # Initial non-blocking quota check when cached quota is absent/stale
     reg_init = load_accounts_registry()
     if any(not a.get("quota", {}).get("ok") for a in reg_init.get("accounts", {}).values()):
@@ -4306,14 +4463,16 @@ def run_curses_tui(stdscr) -> None:
                 force_scan = True
             else:
                 status_banner = f"❌ {c_msg}"
-        cur_db_sig = db_wal_sig()
-        if force_scan or cur_db_sig != last_db_sig or (now - last_scan_ts) >= 0.6:
-            last_db_sig = cur_db_sig
-            last_scan_ts = now
+        if force_scan:
             force_scan = False
-            scan_us, ksm, sessions = load_sessions(limit=35)
+            scan_wake.set()
+        with scan_lock:
+            snap_ver, snap = scan_box["ver"], scan_box["data"]
+        if snap_ver != seen_scan_ver:
+            seen_scan_ver = snap_ver
+            scan_us, ksm, sessions = snap
             last_refresh_clock = time.strftime("%H:%M:%S")
-        if (now - last_led_ts) >= 0.45:
+        if (now - last_led_ts) >= LED_TICK_SEC:
             last_led_ts = now
             led_tick += 1
             trigger_led_sync(sessions, led_tick)
@@ -4322,10 +4481,10 @@ def run_curses_tui(stdscr) -> None:
             last_auto_check = now
             active_idle_ids: set[str] = set()
             for s in sessions:
-                if s.extra_procs:
-                    freed_dup = deduplicate_session_procs(s)
-                    if freed_dup > 0:
-                        status_banner = f"Auto-dedup '{s.title}' -> +{freed_dup // 1024} MB libres."
+                if s.extra_procs and not status_banner:
+                    # Never close a copy automatically: it may be the one Danny is typing in elsewhere.
+                    status_banner = (f"'{s.title[:30]}' está abierta {1 + len(s.extra_procs)} veces "
+                                     f"(+{sum(p.pss_kb for p in s.extra_procs) // 1024} MB): pulsa [x] si sobra.")
                 if s.can_hibernate and s.proc is not None and s.dash_win_idx is not None:
                     active_idle_ids.add(s.conversation_id)
                     first_t = idle_seen_since.setdefault(s.conversation_id, now)
@@ -4483,7 +4642,7 @@ def run_curses_tui(stdscr) -> None:
                     acct_tag = conv_accounts.get(sel.conversation_id, active_slot)
                     nv_cfg = load_nvapi_config()
                     nv_lbl = mask_api_key(str(nv_cfg.get("api_key", "")))
-                    ctx_m = measure_session_context(sel.conversation_id, step_count=sel.step_count)
+                    ctx_m = cached_context(sel)
                     ctx_tok = ctx_m["used_tokens"]
                     ctx_pct = ctx_m["pct"]
                     ctx_lvl = ctx_m["level"]
@@ -4720,7 +4879,7 @@ def run_curses_tui(stdscr) -> None:
             if running_compact:
                 j0 = running_compact[0]
                 el_s = int(max(0, now - j0["started"]))
-                spin = _LED_SPINNER_FRAMES[led_tick % len(_LED_SPINNER_FRAMES)]
+                spin = _SPINNER_FRAMES[led_tick % len(_SPINNER_FRAMES)]
                 banner_line = (
                     f"{spin} Compactando 2º plano ({len(running_compact)}): '{j0['title'][:26]}' ({el_s}s) | {status_banner}"
                 )
@@ -5132,6 +5291,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_sc.add_argument("--no-in-place", dest="in_place", action="store_false", help="Open a new tab instead of replacing current tab")
     p_sc.add_argument("--no-respawn", action="store_true", help="Compact and write handoff/status without respawning tmux tab")
     p_sc.add_argument("--respawn-only", action="store_true", help="Skip NVAPI call and respawn tmux tab from existing vault handoff")
+    p_sc.add_argument("--wait", type=float, default=900.0, help="Max seconds waiting for the turn to end before respawn")
     p_sc.add_argument("--bg", action="store_true", help="Run detached in background")
     p_sc.add_argument("--_bg-worker", dest="bg_worker", action="store_true", help=argparse.SUPPRESS)
     p_sc.set_defaults(fn=cmd_self_compact, in_place=True)
