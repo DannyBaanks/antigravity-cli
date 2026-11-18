@@ -60,9 +60,9 @@ Paquete `tools/agy-dash/agy_dash/`:
 | Agente | Modelo | Módulo(s) | Tarea |
 |---|---|---|---|
 | A | Nemotron 550B | `tui.py` | Convertir `run_curses_tui` en clase `Dashboard` con `render_list`, `render_inspector`, `render_preview`, `handle_key`, `execute_action`; ningún método >150 líneas |
-| B | Nemotron 550B | `accounts.py` | Separar cuota / baton / perfiles; tests de `baton_preflight` y purga |
+| B | MiniMax 3.1 (relanzado: 550B dio HTTP 429 con 3 en paralelo; MiniMax pasó con ISYCODE_STREAM_TIMEOUT_S=400) | `accounts.py` | Separar cuota / baton / perfiles; tests de `baton_preflight` y purga |
 | C | Step 5 (`stepfun-ai/step-5-preview`) | `sessions.py` + `procs.py` | Tests de `load_sessions` con DB sqlite falsa; docstrings; sin cambios de lógica |
-| D | MiniMax 3.1 (`minimaxai/minimax-m3.1-flash`) | `compact.py` + `mirror.py` | Separar NVAPI / Baúl / heartbeat; tests del heartbeat y del Baúl |
+| D | Nemotron 550B (MiniMax 3.1 dio timeout 2 veces; Danny: "SI NO, USA NEMOTRON 550B") | `compact.py` + `mirror.py` | Separar NVAPI / Baúl / heartbeat; tests del heartbeat y del Baúl |
 | E | Mistral 4 (`mistralai/mistral-large-4-1t-a52b`) | `tmuxctl.py` + `cli.py` | Tests de construcción de comandos tmux (sin servidor real) |
 
 Reglas que va en el prompt de cada agente (literal):
