@@ -1642,7 +1642,8 @@ bind -T copy-mode-vi TripleClick1Pane select-pane \\; send-keys -X select-line \
 bind -T copy-mode Enter {copy_exit_action}
 bind -T copy-mode-vi y {copy_exit_action}
 bind -T copy-mode-vi Enter {copy_exit_action}
-bind -n M-s copy-mode
+# Alt+S/Alt+X belong to AGY (swarm board / dismiss): copy-mode lives on Alt+C
+bind -n M-c copy-mode
 
 # Red ⚡ AGY DASH button (top-left) toggles Command Center; × closes tabs keeping busy agents alive
 bind -T root MouseDown1StatusLeft run-shell {tmux_dquote(py_self + " show-dash --toggle")}
@@ -1656,7 +1657,7 @@ set -g status-style "bg=#14171f,fg=#d8dee9"
 set -g status-left-length 32
 set -g status-right-length 78
 set -g status-left "{dash_btn_fmt}"
-set -g status-right "#[fg=#414650]│ #[fg=#8be9fd]#({status_cmd}) #[fg=#414650]│ #[fg=#f1fa8c]Alt+D:Dash Alt+1..9:Tab Alt+S:Copy Alt+N:New "
+set -g status-right "#[fg=#414650]│ #[fg=#8be9fd]#({status_cmd}) #[fg=#414650]│ #[fg=#f1fa8c]Alt+D:Dash Alt+1..9:Tab Alt+C:Copy Alt+N:New "
 
 setw -g window-status-format "{win_fmt}"
 setw -g window-status-current-format "{win_cur_fmt}"
