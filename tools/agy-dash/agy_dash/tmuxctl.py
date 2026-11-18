@@ -103,6 +103,7 @@ def write_tmux_config(self_path: Path) -> None:
 
     copy_action = f"send-keys -X copy-pipe-no-clear {tmux_dquote(clip_cmd)}" if clip_cmd else "send-keys -X copy-selection-no-clear"
     copy_exit_action = f"send-keys -X copy-pipe-and-cancel {tmux_dquote(clip_cmd)}" if clip_cmd else "send-keys -X copy-selection-and-cancel"
+    passive_keys = passive_copy_bindings(copy_exit_action)
     close_btn = " #[range=user|x_#{window_index} fg=#ff5555 bold]×#[range=window|#{window_index}]"
     py_self = f'python3 "{self_path}"'
     win_fmt = f"#{{?#{{m:*DASH*,#W}},,#[fg=#6272a4] #I:#W{close_btn} }}"
@@ -133,8 +134,12 @@ setw -g automatic-rename off
 set -g window-status-separator ""
 
 # Freeze-select & persistent clipboard copy even while AGY streams output!
-bind -n MouseDrag1Pane if -F '#{{m:*DASH*,#{{window_name}}}}' 'send-keys -M' 'copy-mode -M'
-bind -n WheelUpPane if -F '#{{||:#{{m:*DASH*,#{{window_name}}}},#{{m:*👁*,#{{window_name}}}}}}' 'send-keys -M' 'if -F "#{{pane_in_mode}}" "send-keys -M" "copy-mode -e; send-keys -M"'
+# Wheel/drag enter a PASSIVE copy-mode (@passive_copy=1): AGY draws menus inline, so a long
+# ask_question list overflows into the scrollback and the wheel is how you see its top. Typing a
+# menu key there must reach AGY, not move tmux's copy cursor (2026-11-18: the swarm model picker
+# looked frozen, ↑↓/Enter moved a white block instead). Alt+C = ACTIVE copy-mode (@passive_copy=0).
+bind -n MouseDrag1Pane if -F '#{{m:*DASH*,#{{window_name}}}}' 'send-keys -M' 'set -p @passive_copy 1 ; copy-mode -M'
+bind -n WheelUpPane if -F '#{{||:#{{m:*DASH*,#{{window_name}}}},#{{m:*👁*,#{{window_name}}}}}}' 'send-keys -M' 'if -F "#{{pane_in_mode}}" "send-keys -M" "set -p @passive_copy 1 ; copy-mode -e ; send-keys -M"'
 bind -T copy-mode MouseDragEnd1Pane {copy_action}
 bind -T copy-mode-vi MouseDragEnd1Pane {copy_action}
 bind -T copy-mode DoubleClick1Pane select-pane \\; send-keys -X select-word \\; {copy_action}
@@ -143,9 +148,9 @@ bind -T copy-mode TripleClick1Pane select-pane \\; send-keys -X select-line \\; 
 bind -T copy-mode-vi TripleClick1Pane select-pane \\; send-keys -X select-line \\; {copy_action}
 bind -T copy-mode Enter {copy_exit_action}
 bind -T copy-mode-vi y {copy_exit_action}
-bind -T copy-mode-vi Enter {copy_exit_action}
+{passive_keys}
 # Alt+S/Alt+X belong to AGY (swarm board / dismiss): copy-mode lives on Alt+C
-bind -n M-c copy-mode
+bind -n M-c set -p @passive_copy 0 \\; copy-mode
 
 # Red ⚡ AGY DASH button (top-left) toggles Command Center; × closes tabs keeping busy agents alive
 bind -T root MouseDown1StatusLeft run-shell {tmux_dquote(py_self + " show-dash --toggle")}
@@ -181,6 +186,20 @@ bind -n M-n run-shell {tmux_dquote(py_self + " open-new-tab")}
 bind -n M-h run-shell {tmux_dquote(py_self + " hibernate all-idle")}
 """
     _paths.TMUX_CONF.write_text(conf, encoding="utf-8")
+
+
+def passive_copy_bindings(copy_exit_action: str) -> str:
+    """copy-mode-vi keys: in PASSIVE copy-mode (wheel/drag) menu keys leave the scroll and go to
+    the app; in ACTIVE copy-mode (Alt+C) they keep their copy-mode meaning."""
+    keys = [("Up", "send-keys -X cursor-up"), ("Down", "send-keys -X cursor-down"),
+            ("Left", "send-keys -X cursor-left"), ("Right", "send-keys -X cursor-right"),
+            ("Enter", copy_exit_action), ("Tab", "send-keys -X cancel ; send-keys Tab")]
+    lines = [f"bind -T copy-mode-vi {k} if -F '#{{@passive_copy}}' "
+             f"{{ send-keys -X cancel ; send-keys {k} }} {{ {active} }}" for k, active in keys]
+    # Esc in passive mode only leaves the scroll: forwarding it would cancel AGY's menu
+    lines.append("bind -T copy-mode-vi Escape if -F '#{@passive_copy}' "
+                 "{ send-keys -X cancel } { send-keys -X clear-selection }")
+    return "\n".join(lines)
 
 
 def tmux_cmd(*args: str, capture: bool = False) -> subprocess.CompletedProcess:
