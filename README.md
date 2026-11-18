@@ -96,9 +96,14 @@ Powered by a **Zig 0.16 (`ReleaseFast`) core** (`agy-fast-core`) + Python `curse
 - **Clickable `⚡ AGY DASH` Badge & OpenCode-Style `×` Tab Close**:
   - Top-left red **`⚡ AGY DASH`** badge (turns green `▾` inside the dashboard) toggles between the Command Center and your last tab (`MouseDown1StatusLeft` / `Alt+D` / `Alt+0`) without cluttering the tab strip with a `0:⚡DASH` tab.
   - Clicking **`×`** (or middle-click) on any session tab runs `close-tab`: active `RUNNING` / `BG-TASK` tabs are parked alive in a hidden background `agy-bg` session (zero process termination) and restored transparently when reopened from the dashboard.
-- **LED Marquee Tab Bar**: Active tabs animate Braille spinners (`⠋..⠏`) on the left alongside a scrolling status ticker (`Editing files...`, `Running cmd...`, `Task running...`) read from `transcript.jsonl`.
+- **LED Marquee Tab Bar & Persistent Custom Titles (`[t]` / `rename`)**:
+  - Active tabs animate Braille spinners (`⠋..⠏`) on the left alongside a scrolling status ticker (`Editing files...`, `Running cmd...`, `Task running...`) read from `transcript.jsonl`.
+  - Rename any conversation permanently via `[t]` (`[t] ✏️ Renombrar`), `agy-dash rename <id> "<title>"`, or standard tmux `rename-window` (`Ctrl+B ,`): `sync_led_tmux_tabs` automatically detects manual tmux renames, persists them to `~/.gemini/antigravity-cli/custom_titles.json` + all `conversation_summaries.db` instances (including isolated account slots), and never reverts them back to the default summary title.
+- **External Context Compactor via NVIDIA NIM (`[c]` / `[K]` / `nvapi` — Nemotron Ultra)**:
+  - Save your NVIDIA API key (`nvapi-...`) once with `[K]` (`[K] 🔑 Key NVIDIA`) or `agy-dash nvapi set-key <nvapi-...>` (stored with `0600` permissions in `~/.gemini/antigravity-cli/nvapi_config.json`).
+  - Before reopening a heavy `SAVED` or `HIBERNATED` conversation (`>= 80` steps or `>= 120 KB`), `agy-dash` presents a pre-open compaction modal (and wake-stub option `[c]`) that sends a structured digest of the transcript to NVIDIA NIM (`nvidia/llama-3.1-nemotron-ultra-253b-v1` / `nemotron-3-ultra-550b`), writes a high-density continuation handoff (`compacted/<id>_handoff.md`), and launches a fresh lightweight `agy` tab pre-loaded (`-i`) with the compacted context — saving **95%+ of input tokens** on every subsequent turn.
 - **Dual-Pane Command Center + `<4 ms` Zig Transcript Preview**:
-  - Left session table (`RUNNING` / `BG-TASK` / `IDLE` / `HIBERNATED` / `SAVED`), clickable right Command Center (`[r] Actualizar`, `[↵] Abrir/Ir`, `[v] Espejo Vivo`, `[R] Recargar Tab`, `[n] Nueva`, `[h/H] Hibernar 0MB`, `[x] Deduplicar`, `[B] Baton Pass`, `[u] Cuentas`, `[m] Memoria`), and bottom real-time transcript tail.
+  - Left session table (`RUNNING` / `BG-TASK` / `IDLE` / `HIBERNATED` / `SAVED`), clickable right Command Center (`[r] Actualizar`, `[↵] Abrir/Ir`, `[v] Espejo Vivo`, `[R] Recargar Tab`, `[n] Nueva`, `[h/H] Hibernar 0MB`, `[x] Deduplicar`, `[B] Baton Pass`, `[u] Cuentas`, `[m] Memoria`, `[c] Compactar NV`, `[t] Renombrar`, `[K] Key NVIDIA`), and bottom real-time transcript tail.
 - **Streaming-Safe Freeze Selection (`copy-pipe-no-clear`)**:
   - Mouse dragging or scrolling up (`WheelUpPane` / `Alt+S`) inside any `agy` chat tab enters tmux `copy-mode` to freeze the viewport while the model streams output, keeping the highlight visible and copying automatically to the system clipboard (`wl-copy` / `xclip` / `xsel`).
 - **Multi-Account Google Pro Vault, Preflight & 1-Click Baton Pass (`[u]` / `[B]`)**:
@@ -108,7 +113,7 @@ Powered by a **Zig 0.16 (`ReleaseFast`) core** (`agy-fast-core`) + Python `curse
   - **Confirmed Local-Only Profile Removal (`[x]` / `Del`)**: Displays profile identity, duplicate-email detection, associated sessions, and live `/proc` PID checks; refuses `primary` or in-use profiles; removes only regular files inside `accounts/<slot>/` without traversing shared symlinks.
 - **Shared RAM (`KSM` + `GOMEMLIMIT`), `<3 MB` Live Mirror & `0 MB` Auto-Hibernate**:
   - Enables Linux 6.4+/7.0 KSM (`prctl(PR_SET_MEMORY_MERGE, 1)`) inherited across `execvp` + `GOGC=35 GOMEMLIMIT=180MiB`.
-  - Streams busy external sessions (`transcript.jsonl` + active `task-*.log`) every `0.4 s` in `<3 MB RAM` without opening duplicate `agy` processes, and hibernates 100% idle tabs to `0 MB RAM` with `<1 s` wake stubs.
+  - Streams busy external sessions (`transcript.jsonl` + active `task-*.log`) every `0.4 s` in `<3 MB RAM` without opening duplicate `agy` processes, and hibernates 100% idle tabs to `0 MB RAM` with `<1 s` wake stubs. Active turns (`is_transcript_turn_active` checking `transcript.jsonl` mtime and pending `tool_calls`) are strictly protected from hibernation even when `agy` has no child shell process running, and background timer auto-hibernate is opt-in (`AGY_IDLE_HIBERNATE_SEC=0` by default).
 
 ### 2. `agy-limited` (`tools/agy-dash/agy-limited`)
 Runs `agy` inside a `systemd --user` cgroup scope with configurable CPU/memory caps + KSM + `GOMEMLIMIT`.
@@ -125,6 +130,9 @@ agy-dash quota --refresh                         # Check /usage quotas across al
 agy-dash account add pro2                        # Isolated OAuth login without signing out primary
 agy-dash baton <conv-or-title> --check --json    # Verify preflight safety (isolation, quota, 0 dup)
 agy-dash baton <conv-or-title> [--to pro2]       # Hand off conversation + active model seamlessly
+agy-dash nvapi set-key <nvapi-...>               # Save NVIDIA NIM API key (0600) for Nemotron compaction
+agy-dash compact <conv-or-title> --open          # Compact heavy conversation via Nemotron & open lightweight tab
+agy-dash rename <conv-or-title> "<new-title>"    # Permanently rename session across dashboard and LED tabs
 agy-dash hibernate all-idle                      # Freeze 100% idle sessions to 0 MB RAM
 isymem doctor                                    # Verify cross-harness shared memory links
 ```

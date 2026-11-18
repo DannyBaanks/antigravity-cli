@@ -131,17 +131,27 @@ El panel `0:⚡DASH` muestra la lista de sesiones a la izquierda, la **Vista en 
 | `B` (`[B] 🔀 Baton Pass`) | `0:⚡DASH` / `👁️ Espejo` | Pasa la estafeta de la conversación + mismo modelo a otra cuenta Pro sin hacer logout |
 | `u` (`[u] 💳 Cuentas`) | `0:⚡DASH` | Abre gestor de cuentas Pro, cuotas `/usage` (`+`: login aislado, `B`: baton, `R`: refrescar) |
 | `U` | `0:⚡DASH` | Refresca en segundo plano las cuotas (`/usage`) de todas las cuentas |
+| `c` (`[c] 🗜 Compactar NV`) | `0:⚡DASH` o pestaña `💤` | Compacta la conversación seleccionada con NVIDIA NIM (Nemotron Ultra) y la abre ligera ahorrando >95% de tokens de entrada |
+| `t` (`[t] ✏️ Renombrar`) | `0:⚡DASH` o `Ctrl+B ,` | Renombra permanentemente la conversación en el dashboard, pestañas LED y bases de datos |
+| `K` (`[K] 🔑 Key NVIDIA`) | `0:⚡DASH` o pestaña `💤` | Guarda tu NVIDIA API Key (`nvapi-...`, permisos `0600`) para compactación externa |
 | `m` (`[m] 🧠 Memoria Shared`) | `0:⚡DASH` | Alterna el visor de Memoria Compartida Multi-Harness (`MEMORY.md`) |
-| `Alt+0` / `Alt+D` | Cualquier pestaña | Volver al Command Center (`0:⚡DASH`) |
+| `Alt+0` / `Alt+D` / Clic en `⚡ AGY DASH` | Cualquier pestaña | Alterna entre el Command Center (`0:⚡DASH`) y tu pestaña activa |
 | `Alt+1` .. `Alt+9` / `Alt+Left`/`Right` | Cualquier pestaña | Cambiar entre pestañas en la misma ventana |
 
-### Multi-Cuenta Google Pro, Alertas LED y Baton Pass sin Logout
+### Multi-Cuenta Google Pro, Alertas LED, Compactación NVIDIA NIM y Baton Pass sin Logout
 
 1. **`primary`** usa automáticamente tu sesión actual en el keyring del sistema (`agy-dash quota --refresh`).
 2. **Agregar 2ª+ cuenta Pro sin cerrar la actual:** pulsa `u` -> `+` en el dashboard (o corre `agy-dash account add pro2`). Abre una pestaña aislada (`DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent` + `HOME` aislado con symlinks a tus conversaciones/MCP) para completar OAuth una sola vez sin tocar `primary`.
 3. **Baton Pass (`[B]` o `agy-dash baton <conv> [--to <slot>]`):** cuando la alerta de cuota baja (`🚨 <=5%` / `⚠️ <=15%`) avise en el banner del dashboard, pulsa `B` para relanzar exactamente `--conversation <uuid> --model <modelo>` bajo la cuenta con mayor cuota restante.
-4. **Pestañas tipo letrero LED:** las pestañas en `RUNNING` / `BG-TASK` muestran un spinner Braille animándose a la izquierda (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`) junto con el título + la acción actual desplazándose estilo marquee (`Editing files...`, `Running cmd...`).
-5. **Botón `×` en pestañas (estilo OpenCode) y Selección Freeze-Copy:**
+4. **Compactador Externo con NVIDIA NIM (`[c]` / `[K]` / `agy-dash nvapi set-key <nvapi-...>`):**
+   - Guarda tu API key de NVIDIA una sola vez (`~/.gemini/antigravity-cli/nvapi_config.json`, `0600`).
+   - Antes de reabrir una conversación `SAVED` o `HIBERNATED` pesada (`>=80` pasos o `>=120 KB`), aparece una pantalla que ofrece compactarla con **NVIDIA Nemotron Ultra** (`nvidia/llama-3.1-nemotron-ultra-253b-v1` / `nemotron-3-ultra-550b`), generando `compacted/<id>_handoff.md` y abriendo una sesión `agy` ligera con todo el estado técnico en ~1,000 tokens en lugar de >100,000 tokens de entrada.
+5. **Pestañas tipo letrero LED y Renombrado Persistente (`[t]` / `agy-dash rename` / `Ctrl+B ,`):**
+   - Las pestañas en `RUNNING` / `BG-TASK` muestran un spinner Braille animándose a la izquierda (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`) junto con el título + la acción actual desplazándose estilo marquee (`Editing files...`, `Running cmd...`).
+   - Si renombras una sesión con `[t]`, `agy-dash rename <id> "<nombre>"` o directamente en tmux (`Ctrl+B ,`), el nombre personalizado se guarda en `custom_titles.json` y en todas las `conversation_summaries.db` (incluyendo cuentas aisladas) sin regresar nunca al nombre anterior.
+6. **Protección contra hibernación en medio de un turno (`is_transcript_turn_active`):**
+   - Aunque `agy` reporte temporalmente `CASCADE_RUN_STATUS_IDLE` entre llamadas de herramientas (`read_file`, `edit_file`) sin subprocesos `bash`, `agy-dash` inspecciona `transcript.jsonl` (mtime reciente y `tool_calls` pendientes) para mantener la sesión en `RUNNING` y nunca enviarla a la pantalla `💤 SESIÓN EN MODO HIBERNADO`. Auto-hibernate por temporizador está desactivado por defecto (`AGY_IDLE_HIBERNATE_SEC=0`).
+7. **Botón `×` en pestañas (estilo OpenCode) y Selección Freeze-Copy:**
    - Hacer clic en **`×`** (o clic central) sobre una pestaña cierra **solo el tab visual**: si esa sesión sigue en `RUNNING` o `BG-TASK`, se estaciona viva en la sesión oculta `agy-bg` sin matar el proceso (puedes traerla de vuelta al frente en cualquier momento desde `0:⚡DASH` con `Enter`).
    - Arrastrar con el mouse o usar la rueda arriba en cualquier pestaña `agy` entra automáticamente en `copy-mode` (congela el scroll mientras el modelo escribe para que **nunca se corte ni deseleccione lo subrayado**) y `MouseDragEnd1Pane` copia al portapapeles sin limpiar la selección (`Alt+S` activa el mismo modo por teclado).
    - Al abrir login aislado (`u -> +`), un wrapper `xdg-open` restaura tu `DBUS_SESSION_BUS_ADDRESS` real para abrir el navegador automáticamente y copia la URL OAuth completa en 1 línea al portapapeles (`Ctrl+V`).

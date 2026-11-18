@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -371,6 +372,113 @@ class AgyDashboardTests(unittest.TestCase):
             )
             self.assertFalse(pf_busy["ok"])
             self.assertFalse(pf_busy["checks"]["no_duplicate_operation"])
+
+    def test_transcript_busy_prevents_false_hibernate_and_default_auto_hib_disabled(self) -> None:
+        self.assertEqual(ad.DEFAULT_IDLE_HIBERNATE_SEC, 0)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            logs_dir = root / "brain" / "cid-work" / ".system_generated" / "logs"
+            logs_dir.mkdir(parents=True)
+            tp = logs_dir / "transcript.jsonl"
+            tp.write_text(
+                '{"step_index":1,"type":"PLANNER_RESPONSE","content":"","tool_calls":[{"name":"read_file"}]}\n',
+                encoding="utf-8",
+            )
+            orig_brain = ad.BRAIN_DIR
+            try:
+                ad.BRAIN_DIR = root / "brain"
+                self.assertTrue(ad.is_transcript_turn_active("cid-work", now=time.time()))
+            finally:
+                ad.BRAIN_DIR = orig_brain
+
+            sess = ad.AgySession(
+                conversation_id="cid-work",
+                title="Working Agent",
+                preview="",
+                step_count=50,
+                last_modified="ahora",
+                workspace=str(root),
+                db_status="CASCADE_RUN_STATUS_IDLE",
+                not_fully_idle=False,
+                proc=ad.ProcMemInfo(pid=12345, tty="pts/3", in_dash=True, active_children=[]),
+                transcript_busy=True,
+            )
+            self.assertEqual(sess.state_label, "RUNNING")
+            self.assertFalse(sess.can_hibernate)
+
+    def test_persistent_custom_titles_and_tmux_rename_adoption(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            titles_file = root / "custom_titles.json"
+            saved = ad.save_custom_title("cid-malb", "malbolge", titles_path=titles_file)
+            self.assertEqual(saved, "malbolge")
+            loaded = ad.load_custom_titles(titles_path=titles_file)
+            self.assertEqual(loaded.get("cid-malb"), "malbolge")
+            self.assertFalse(ad._is_led_generated_name("malbolge"))
+            self.assertTrue(ad._is_led_generated_name("⠋⠁·malbolge- · Running ×"))
+            self.assertTrue(ad._is_led_generated_name("●malbolge ×"))
+
+    def test_nvapi_compactor_saves_key_and_compacts_heavy_conversation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg_path = root / "nvapi.json"
+            handoffs_dir = root / "handoffs"
+            logs_dir = root / "brain" / "cid-heavy" / ".system_generated" / "logs"
+            logs_dir.mkdir(parents=True)
+            tp = logs_dir / "transcript.jsonl"
+            lines = [
+                f'{{"step_index":{i},"type":"USER_INPUT","content":"Paso {i}: optimizar el motor Zig y Baton Pass."}}'
+                for i in range(180)
+            ]
+            tp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            ad.save_nvapi_config(api_key="nvapi-testSecretKey1234567890", cfg_path=cfg_path)
+            self.assertEqual(cfg_path.stat().st_mode & 0o777, 0o600)
+            cfg = ad.load_nvapi_config(cfg_path=cfg_path)
+            self.assertEqual(cfg["api_key"], "nvapi-testSecretKey1234567890")
+            self.assertIn("...", ad.mask_api_key(cfg["api_key"]))
+
+            orig_brain = ad.BRAIN_DIR
+            try:
+                ad.BRAIN_DIR = root / "brain"
+                heavy_sess = ad.AgySession(
+                    conversation_id="cid-heavy",
+                    title="Heavy Session",
+                    preview="Contexto largo",
+                    step_count=180,
+                    last_modified="hace 5m",
+                    workspace=str(root),
+                    db_status="CASCADE_RUN_STATUS_IDLE",
+                    not_fully_idle=False,
+                    proc=None,
+                )
+                offer, est_tok, _ = ad.should_offer_compaction(heavy_sess)
+                self.assertTrue(offer)
+                self.assertGreater(est_tok, 1000)
+
+                class _FakeResp:
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *args):
+                        return False
+
+                    def read(self) -> bytes:
+                        return b'{"choices":[{"message":{"content":"## 1. Objetivo\\nContinuar sin gastar tokens."}}]}'
+
+                ok, msg, hfile = ad.compact_conversation_with_nvapi(
+                    heavy_sess,
+                    cfg_path=cfg_path,
+                    handoffs_dir=handoffs_dir,
+                    opener=lambda req, timeout=90.0: _FakeResp(),
+                )
+                self.assertTrue(ok, msg)
+                self.assertIsNotNone(hfile)
+                assert hfile is not None
+                self.assertTrue(hfile.is_file())
+                self.assertIn("Continuar sin gastar tokens", hfile.read_text(encoding="utf-8"))
+            finally:
+                ad.BRAIN_DIR = orig_brain
 
 
 if __name__ == "__main__":

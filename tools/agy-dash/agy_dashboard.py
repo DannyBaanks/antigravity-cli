@@ -32,7 +32,9 @@ import sys
 import textwrap
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -46,6 +48,9 @@ SUMMARIES_DB = AGY_DATA_DIR / "conversation_summaries.db"
 BRAIN_DIR = AGY_DATA_DIR / "brain"
 PRESENCE_DIR = AGY_DATA_DIR / "presence"
 HIBERNATED_FILE = AGY_DATA_DIR / "dashboard_hibernated.json"
+CUSTOM_TITLES_FILE = AGY_DATA_DIR / "custom_titles.json"
+NVAPI_CONFIG_FILE = AGY_DATA_DIR / "nvapi_config.json"
+COMPACTED_DIR = AGY_DATA_DIR / "compacted"
 ACCOUNTS_DIR = AGY_DATA_DIR / "accounts"
 ACCOUNTS_REGISTRY = ACCOUNTS_DIR / "registry.json"
 TMUX_CONF = AGY_DATA_DIR / "agy-dash.tmux.conf"
@@ -56,10 +61,14 @@ TMUX_BG_SESSION = "agy-bg"
 AGY_BIN = os.environ.get("AGY_BIN", str(HOME / ".local" / "bin" / "agy"))
 DEFAULT_GOGC = os.environ.get("AGY_GOGC", "35")
 DEFAULT_GOMEMLIMIT = os.environ.get("AGY_GOMEMLIMIT", "180MiB")
-DEFAULT_IDLE_HIBERNATE_SEC = int(os.environ.get("AGY_IDLE_HIBERNATE_SEC", "180"))
+DEFAULT_IDLE_HIBERNATE_SEC = int(os.environ.get("AGY_IDLE_HIBERNATE_SEC", "0"))
 QUOTA_WARN_PCT = float(os.environ.get("AGY_QUOTA_WARN_PCT", "15"))
 QUOTA_CRIT_PCT = float(os.environ.get("AGY_QUOTA_CRIT_PCT", "5"))
 QUOTA_POLL_INTERVAL_SEC = float(os.environ.get("AGY_QUOTA_POLL_SEC", "120"))
+DEFAULT_NVAPI_BASE_URL = os.environ.get("AGY_NVAPI_BASE_URL", "https://integrate.api.nvidia.com/v1")
+DEFAULT_NVAPI_MODEL = os.environ.get("AGY_NVAPI_MODEL", "nvidia/llama-3_1-nemotron-ultra-253b-v1")
+COMPACT_MIN_STEPS = int(os.environ.get("AGY_COMPACT_MIN_STEPS", "40"))
+COMPACT_MIN_BYTES = int(os.environ.get("AGY_COMPACT_MIN_BYTES", "49152"))
 
 MODEL_DISPLAY_TO_SLUG: dict[str, str] = {
     "Gemini 4 Argon (Medium)": "gemini-4-argon-medium",
@@ -152,11 +161,12 @@ class AgySession:
     dash_win_idx: str | None = None
     dash_win_name: str = ""
     bg_win_idx: str | None = None
+    transcript_busy: bool = False
 
     @property
     def state_label(self) -> str:
         if self.proc is not None:
-            if self.db_status == "CASCADE_RUN_STATUS_RUNNING":
+            if self.db_status == "CASCADE_RUN_STATUS_RUNNING" or self.transcript_busy:
                 return "RUNNING"
             if self.not_fully_idle or self.proc.active_children:
                 return "BG-TASK"
@@ -187,7 +197,7 @@ class AgySession:
             return False
         if is_ancestor_pid(self.proc.pid):
             return False
-        if self.db_status == "CASCADE_RUN_STATUS_RUNNING":
+        if self.db_status == "CASCADE_RUN_STATUS_RUNNING" or self.transcript_busy:
             return False
         if self.not_fully_idle or self.proc.active_children:
             return False
@@ -200,6 +210,7 @@ class AgySession:
             return False
         return (
             self.db_status == "CASCADE_RUN_STATUS_RUNNING"
+            or self.transcript_busy
             or self.not_fully_idle
             or bool(self.proc.active_children)
         )
@@ -222,7 +233,64 @@ def is_ancestor_pid(target_pid: int) -> bool:
 
 
 def transcript_path_for(conv_id: str) -> Path:
-    return BRAIN_DIR / conv_id / ".system_generated" / "logs" / "transcript.jsonl"
+    primary_p = BRAIN_DIR / conv_id / ".system_generated" / "logs" / "transcript.jsonl"
+    if primary_p.is_file():
+        return primary_p
+    if ACCOUNTS_DIR.is_dir():
+        for alt in ACCOUNTS_DIR.glob(f"*/home/.gemini/antigravity-cli/brain/{conv_id}/.system_generated/logs/transcript.jsonl"):
+            if alt.is_file():
+                return alt
+    return primary_p
+
+
+_TRANSCRIPT_BUSY_CACHE: dict[str, tuple[tuple[int, int], float, bool]] = {}
+
+
+def is_transcript_turn_active(conv_id: str, max_recent_sec: float = 45.0, *, now: float | None = None) -> bool:
+    """Return True if transcript.jsonl was written recently or its last step is an unfinished turn."""
+    tpath = transcript_path_for(conv_id)
+    try:
+        st = tpath.stat()
+    except OSError:
+        return False
+    cur_now = now if now is not None else time.time()
+    age_s = max(0.0, cur_now - (st.st_mtime_ns / 1e9))
+    if age_s <= max_recent_sec:
+        return True
+
+    sig = (st.st_mtime_ns, st.st_size)
+    cached = _TRANSCRIPT_BUSY_CACHE.get(conv_id)
+    if cached and cached[0] == sig and (cur_now - cached[1]) < 15.0:
+        return cached[2]
+
+    busy = False
+    try:
+        with tpath.open("rb") as f:
+            f.seek(max(0, st.st_size - 32768), os.SEEK_SET)
+            lines = [l for l in f.read().decode("utf-8", errors="replace").splitlines() if l.strip().startswith("{")]
+        for raw in reversed(lines[-6:]):
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            stype = obj.get("type", "")
+            status = obj.get("status", "DONE")
+            if status != "DONE":
+                busy = True
+                break
+            if stype in ("USER_INPUT", "GENERIC"):
+                # Only treat recent (<600s) unfinished tool/user turns as active
+                busy = age_s <= 600.0
+                break
+            if stype == "PLANNER_RESPONSE":
+                tcalls = obj.get("tool_calls") or []
+                busy = bool(tcalls) and age_s <= 600.0
+                break
+    except OSError:
+        busy = False
+
+    _TRANSCRIPT_BUSY_CACHE[conv_id] = (sig, cur_now, busy)
+    return busy
 
 
 def transcript_sig(conv_id: str) -> tuple[int, int]:
@@ -476,12 +544,59 @@ def parse_workspace_uri(raw_uris: str) -> str:
     return str(Path.cwd())
 
 
+def load_custom_titles(titles_path: Path | None = None) -> dict[str, str]:
+    p = titles_path or CUSTOM_TITLES_FILE
+    if not p.is_file():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return {str(k): str(v) for k, v in data.items() if str(v).strip()} if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_custom_title(conv_id: str, new_title: str, *, titles_path: Path | None = None) -> str:
+    p = titles_path or CUSTOM_TITLES_FILE
+    clean = re.sub(r"\s+", " ", new_title.strip())[:60]
+    if not clean:
+        return ""
+    titles = load_custom_titles(titles_path=p)
+    titles[conv_id] = clean
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(titles, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, p)
+
+    if titles_path is None:
+        for db_p in _all_summaries_dbs():
+            try:
+                conn = sqlite3.connect(str(db_p), timeout=1.5)
+                conn.execute("UPDATE conversation_summaries SET title = ? WHERE conversation_id = ?", (clean, conv_id))
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+    return clean
+
+
+def _all_summaries_dbs() -> list[Path]:
+    dbs: list[Path] = []
+    if SUMMARIES_DB.is_file():
+        dbs.append(SUMMARIES_DB)
+    if ACCOUNTS_DIR.is_dir():
+        for p in ACCOUNTS_DIR.glob("*/home/.gemini/antigravity-cli/conversation_summaries.db"):
+            if p.is_file() and not p.is_symlink():
+                dbs.append(p)
+    return dbs
+
+
 def load_sessions(limit: int = 40) -> tuple[int, dict[str, int], list[AgySession]]:
     scan_us, ksm_stats, live_by_conv = zig_scan()
     win_map = _get_dash_window_map()
     tty_map = _get_dash_tty_map()
     bg_map = _get_bg_window_map()
     hib_reg = load_hibernated_registry()
+    custom_titles = load_custom_titles()
 
     dirty_hib = False
     for cid in list(hib_reg.keys()):
@@ -494,10 +609,10 @@ def load_sessions(limit: int = 40) -> tuple[int, dict[str, int], list[AgySession
     if dirty_hib:
         save_hibernated_registry(hib_reg)
 
-    rows_by_id: dict[str, AgySession] = {}
-    if SUMMARIES_DB.is_file():
+    merged_db_rows: dict[str, tuple] = {}
+    for db_path in _all_summaries_dbs():
         try:
-            uri = f"file:{SUMMARIES_DB}?mode=ro"
+            uri = f"file:{db_path}?mode=ro"
             conn = sqlite3.connect(uri, uri=True, timeout=2.0)
             cur = conn.execute(
                 """
@@ -510,57 +625,87 @@ def load_sessions(limit: int = 40) -> tuple[int, dict[str, int], list[AgySession
                 """,
                 (max(limit, 80),),
             )
-            for cid, title, preview, steps, lastmod, ws_uris, status, not_idle in cur.fetchall():
-                procs = live_by_conv.get(cid, [])
-                procs_sorted = sorted(
-                    procs,
-                    key=lambda p: (not p.in_dash, len(p.active_children) == 0, p.pid),
-                )
-                primary = procs_sorted[0] if procs_sorted else None
-                extras = procs_sorted[1:] if len(procs_sorted) > 1 else []
-                if primary and extras:
-                    for ep in extras:
-                        for kc in ep.active_children:
-                            if kc not in primary.active_children:
-                                primary.active_children.append(kc)
-
-                hib_info = hib_reg.get(cid)
-                win_idx, win_name = win_map.get(cid, (None, ""))
-                if win_idx is None and primary and primary.tty in tty_map:
-                    win_idx, win_name = tty_map[primary.tty]
-                    if "DASH" not in win_name:
-                        tmux_cmd("set-window-option", "-t", f"{TMUX_SESSION}:{win_idx}", "@agy_conv_id", cid)
-                bg_idx, _ = bg_map.get(cid, (None, ""))
-                clean_title = (title or "").strip() or f"Sesión {cid[:8]}"
-                clean_prev = re.sub(r"\s+", " ", (preview or "").strip())[:100]
-                rows_by_id[cid] = AgySession(
-                    conversation_id=cid,
-                    title=clean_title,
-                    preview=clean_prev,
-                    step_count=int(steps or 0),
-                    last_modified=str(lastmod or "")[:19],
-                    workspace=parse_workspace_uri(ws_uris),
-                    db_status=str(status or ""),
-                    not_fully_idle=bool(not_idle),
-                    proc=primary,
-                    extra_procs=extras,
-                    hibernated=(hib_info is not None and primary is None),
-                    hibernated_saved_kb=int((hib_info or {}).get("saved_pss_kb", 250_000)),
-                    dash_win_idx=win_idx,
-                    dash_win_name=win_name,
-                    bg_win_idx=bg_idx,
-                )
+            for row in cur.fetchall():
+                cid = row[0]
+                prev_row = merged_db_rows.get(cid)
+                if prev_row is None:
+                    merged_db_rows[cid] = row
+                else:
+                    # Prefer row with higher step_count or non-empty title
+                    prev_steps = int(prev_row[3] or 0)
+                    new_steps = int(row[3] or 0)
+                    if new_steps > prev_steps or (not prev_row[1] and row[1]):
+                        best_title = row[1] or prev_row[1]
+                        merged_db_rows[cid] = (
+                            cid,
+                            best_title,
+                            row[2] or prev_row[2],
+                            max(prev_steps, new_steps),
+                            max(str(prev_row[4] or ""), str(row[4] or "")),
+                            row[5] or prev_row[5],
+                            row[6] or prev_row[6],
+                            row[7] or prev_row[7],
+                        )
             conn.close()
         except Exception:
             pass
 
+    rows_by_id: dict[str, AgySession] = {}
+    for cid, title, preview, steps, lastmod, ws_uris, status, not_idle in merged_db_rows.values():
+        procs = live_by_conv.get(cid, [])
+        procs_sorted = sorted(
+            procs,
+            key=lambda p: (not p.in_dash, len(p.active_children) == 0, p.pid),
+        )
+        primary = procs_sorted[0] if procs_sorted else None
+        extras = procs_sorted[1:] if len(procs_sorted) > 1 else []
+        if primary and extras:
+            for ep in extras:
+                for kc in ep.active_children:
+                    if kc not in primary.active_children:
+                        primary.active_children.append(kc)
+
+        hib_info = hib_reg.get(cid)
+        win_idx, win_name = win_map.get(cid, (None, ""))
+        if win_idx is None and primary and primary.tty in tty_map:
+            win_idx, win_name = tty_map[primary.tty]
+            if "DASH" not in win_name:
+                tmux_cmd("set-window-option", "-t", f"{TMUX_SESSION}:{win_idx}", "@agy_conv_id", cid)
+        bg_idx, _ = bg_map.get(cid, (None, ""))
+        t_busy = is_transcript_turn_active(cid) if primary is not None else False
+        clean_title = custom_titles.get(cid) or (title or "").strip() or f"Sesión {cid[:8]}"
+        clean_prev = re.sub(r"\s+", " ", (preview or "").strip())[:100]
+        rows_by_id[cid] = AgySession(
+            conversation_id=cid,
+            title=clean_title,
+            preview=clean_prev,
+            step_count=int(steps or 0),
+            last_modified=str(lastmod or "")[:19],
+            workspace=parse_workspace_uri(ws_uris),
+            db_status=str(status or ""),
+            not_fully_idle=bool(not_idle),
+            proc=primary,
+            extra_procs=extras,
+            hibernated=(hib_info is not None and primary is None),
+            hibernated_saved_kb=int((hib_info or {}).get("saved_pss_kb", 250_000)),
+            dash_win_idx=win_idx,
+            dash_win_name=win_name,
+            bg_win_idx=bg_idx,
+            transcript_busy=t_busy,
+        )
+
     for cid, procs in live_by_conv.items():
         if cid not in rows_by_id and procs:
             win_idx, win_name = win_map.get(cid, (None, ""))
+            if win_idx is None and procs[0].tty in tty_map:
+                win_idx, win_name = tty_map[procs[0].tty]
+                if "DASH" not in win_name:
+                    tmux_cmd("set-window-option", "-t", f"{TMUX_SESSION}:{win_idx}", "@agy_conv_id", cid)
             bg_idx, _ = bg_map.get(cid, (None, ""))
+            fallback_title = custom_titles.get(cid) or f"Sesión activa {cid[:8]}"
             rows_by_id[cid] = AgySession(
                 conversation_id=cid,
-                title=f"Sesión activa {cid[:8]}",
+                title=fallback_title,
                 preview="",
                 step_count=0,
                 last_modified="ahora",
@@ -572,6 +717,7 @@ def load_sessions(limit: int = 40) -> tuple[int, dict[str, int], list[AgySession
                 dash_win_idx=win_idx,
                 dash_win_name=win_name,
                 bg_win_idx=bg_idx,
+                transcript_busy=is_transcript_turn_active(cid),
             )
 
     def sort_key(s: AgySession) -> tuple[int, str]:
@@ -1799,28 +1945,359 @@ def format_led_tab_title(
     return f"{prefix}{body}"
 
 
+def _is_led_generated_name(name: str) -> bool:
+    if not name:
+        return True
+    return name.startswith(_SPINNER_FRAMES) or name.startswith(("●", "👁", "💤", "🔑", "⚡"))
+
+
 def sync_led_tmux_tabs(
     sessions: list[AgySession],
     tick_idx: int,
     last_tab_names: dict[str, str],
     activity_cache: dict[str, tuple[tuple[int, int], str]],
 ) -> None:
-    """Update open tmux tab names with animated spinner + LED action marquee."""
+    """Update open tmux tab names with animated spinner + LED action marquee, respecting user rename-window."""
     cmds: list[str] = []
     for s in sessions:
         if s.dash_win_idx is None:
             continue
-        # Do not clobber interactive login windows
         if s.dash_win_name.startswith("🔑"):
             continue
+        prev = last_tab_names.get(s.dash_win_idx)
+        # If the user manually renamed the window in tmux (`Ctrl+B ,`), adopt and persist their custom title!
+        if (
+            prev is not None
+            and s.dash_win_name
+            and s.dash_win_name != prev
+            and not _is_led_generated_name(s.dash_win_name)
+        ):
+            save_custom_title(s.conversation_id, s.dash_win_name)
+            s.title = s.dash_win_name.strip()
+
         busy, act_txt = session_live_activity(s, activity_cache)
         new_name = format_led_tab_title(s, tick_idx, act_txt, busy)
-        prev = last_tab_names.get(s.dash_win_idx)
         if prev != new_name:
             last_tab_names[s.dash_win_idx] = new_name
             cmds.extend(["rename-window", "-t", f"{TMUX_SESSION}:{s.dash_win_idx}", new_name, ";"])
     if cmds:
         tmux_cmd(*cmds[:-1])
+
+
+# ============================================================================
+# External Context Compactor via NVIDIA NIM API (`nvapi` / Nemotron Ultra)
+# ============================================================================
+
+_NEMOTRON_CANDIDATE_MODELS = (
+    "nvidia/llama-3_1-nemotron-ultra-253b-v1",
+    "nvidia/nemotron-3-ultra-550b",
+    "nvidia/nemotron-3-ultra-550b-a55b",
+    "nvidia/llama-3.3-nemotron-super-49b-v1",
+    "nvidia/llama-3.1-nemotron-70b-instruct",
+)
+
+
+def mask_api_key(key: str) -> str:
+    k = key.strip()
+    if not k:
+        return "(no configurada)"
+    if len(k) <= 10:
+        return "****"
+    return f"{k[:6]}...{k[-4:]}"
+
+
+def load_nvapi_config(
+    config_path: Path | None = None,
+    *,
+    cfg_path: Path | None = None,
+) -> dict:
+    p = cfg_path or config_path or NVAPI_CONFIG_FILE
+    data: dict = {}
+    if p.is_file():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    env_key = os.environ.get("NVIDIA_API_KEY") or os.environ.get("NVAPI_KEY") or ""
+    api_key = str(data.get("api_key") or env_key).strip()
+    base_url = str(data.get("base_url") or DEFAULT_NVAPI_BASE_URL).strip().rstrip("/")
+    model = str(data.get("model") or DEFAULT_NVAPI_MODEL).strip()
+    return {
+        "api_key": api_key,
+        "base_url": base_url,
+        "model": model,
+    }
+
+
+def save_nvapi_config(
+    api_key: str = "",
+    *,
+    model: str = "",
+    base_url: str = "",
+    config_path: Path | None = None,
+    cfg_path: Path | None = None,
+) -> dict:
+    p = cfg_path or config_path or NVAPI_CONFIG_FILE
+    cur = load_nvapi_config(config_path=p)
+    if api_key.strip():
+        cur["api_key"] = api_key.strip()
+    if model.strip():
+        cur["model"] = model.strip()
+    if base_url.strip():
+        cur["base_url"] = base_url.strip().rstrip("/")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cur, indent=2, ensure_ascii=False), encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, p)
+    return cur
+
+
+def estimate_session_tokens(conv_or_session: str | AgySession, step_count: int = 0) -> tuple[int, int]:
+    """Return (estimated_input_tokens, transcript_bytes) for a conversation."""
+    if isinstance(conv_or_session, AgySession):
+        conv_id = conv_or_session.conversation_id
+        step_count = conv_or_session.step_count
+    else:
+        conv_id = str(conv_or_session)
+    tpath = transcript_path_for(conv_id)
+    try:
+        size_b = tpath.stat().st_size if tpath.is_file() else 0
+    except OSError:
+        size_b = 0
+    est_tokens = max(step_count * 140, size_b // 4)
+    return (est_tokens, size_b)
+
+
+def should_offer_compaction(session: AgySession) -> tuple[bool, int, int]:
+    """Return (is_heavy, est_tokens, size_bytes) when reopening a SAVED/HIBERNATED conversation."""
+    est_tok, size_b = estimate_session_tokens(session.conversation_id, session.step_count)
+    if session.proc is not None:
+        return (False, est_tok, size_b)
+    is_heavy = session.step_count >= COMPACT_MIN_STEPS or size_b >= COMPACT_MIN_BYTES
+    return (is_heavy, est_tokens := est_tok, size_b)
+
+
+def build_compaction_digest(conv_id: str, title: str, workspace: str, max_chars: int = 44000) -> tuple[str, int]:
+    """Extract high-signal user requests, tool actions, and recent turns from transcript.jsonl."""
+    tpath = transcript_path_for(conv_id)
+    if not tpath.is_file():
+        return (f"Título: {title}\nWorkspace: {workspace}\n(Sin transcript.jsonl local)", 0)
+
+    try:
+        raw_bytes = tpath.read_bytes()
+    except OSError:
+        return (f"Título: {title}\nWorkspace: {workspace}", 0)
+
+    lines = [l for l in raw_bytes.decode("utf-8", errors="replace").splitlines() if l.strip().startswith("{")]
+    user_prompts: list[str] = []
+    tool_events: list[str] = []
+    recent_turns: list[str] = []
+
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        idx = obj.get("step_index", 0)
+        stype = obj.get("type", "")
+        content = (obj.get("content") or "").strip()
+        if "<USER_REQUEST>" in content and "</USER_REQUEST>" in content:
+            m = re.search(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", content, re.DOTALL)
+            if m:
+                content = m.group(1).strip()
+        if stype == "USER_INPUT" and content:
+            user_prompts.append(f"[Paso #{idx} USUARIO]: {content[:600]}")
+            recent_turns.append(f"[Paso #{idx} USUARIO]: {content[:900]}")
+        elif stype == "PLANNER_RESPONSE":
+            tcs = []
+            for tc in obj.get("tool_calls") or []:
+                if isinstance(tc, dict):
+                    tn = tc.get("name") or "tool"
+                    args = tc.get("arguments") or {}
+                    sm = args.get("toolSummary") or args.get("Path") or args.get("CommandLine") or ""
+                    tcs.append(f"{tn}({str(sm)[:80]})" if sm else tn)
+            if tcs:
+                tool_events.append(f"[Paso #{idx} TOOLS]: {', '.join(tcs)}")
+            if content or tcs:
+                recent_turns.append(f"[Paso #{idx} AGENTE]: {content[:1100]} {' | Tools: ' + ', '.join(tcs) if tcs else ''}")
+
+    head_users = "\n".join(user_prompts[:8])
+    tail_users = "\n".join(user_prompts[-8:]) if len(user_prompts) > 8 else ""
+    tools_sample = "\n".join(tool_events[-25:])
+    tail_recent = "\n".join(recent_turns[-18:])
+
+    digest = (
+        f"# Conversación a Compactar: {title} ({conv_id})\n"
+        f"- Workspace: {workspace}\n"
+        f"- Tamaño original: {len(raw_bytes) // 1024} KB (~{len(raw_bytes) // 4} tokens)\n\n"
+        f"## Peticiones iniciales del usuario\n{head_users}\n\n"
+        f"## Peticiones recientes del usuario\n{tail_users}\n\n"
+        f"## Herramientas y archivos tocados recientemente\n{tools_sample}\n\n"
+        f"## Últimos turnos detallados\n{tail_recent}\n"
+    )
+    if len(digest) > max_chars:
+        digest = digest[: max_chars // 3] + "\n\n...[TRUNCADO]...\n\n" + digest[-(max_chars * 2 // 3) :]
+    return (digest, len(raw_bytes))
+
+
+def _discover_nvapi_nemotron_model(base_url: str, api_key: str) -> str:
+    req = urllib.request.Request(
+        f"{base_url}/models",
+        headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8.0) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        models = [str(m.get("id", "")) for m in (data.get("data") or []) if isinstance(m, dict)]
+        for pref in ("nemotron-3-ultra", "nemotron-ultra", "550b", "253b", "nemotron-super", "nemotron"):
+            for mid in models:
+                if pref in mid.lower():
+                    return mid
+    except Exception:
+        pass
+    return DEFAULT_NVAPI_MODEL
+
+
+def compact_conversation_with_nvapi(
+    session: AgySession,
+    *,
+    config_path: Path | None = None,
+    cfg_path: Path | None = None,
+    handoffs_dir: Path | None = None,
+    opener=None,
+) -> tuple[bool, str, Path | None]:
+    """Send conversation digest to NVIDIA NIM (Nemotron) and write a compact continuation handoff."""
+    cfg = load_nvapi_config(config_path=cfg_path or config_path)
+    api_key = cfg["api_key"]
+    if not api_key:
+        return (
+            False,
+            "⚠️ Falta configurar tu NVIDIA API Key (`nvapi-...`). Pulsa [K] o corre `agy-dash nvapi set-key <key>`.",
+            None,
+        )
+
+    digest, orig_bytes = build_compaction_digest(session.conversation_id, session.title, session.workspace)
+    orig_tokens = max(session.step_count * 140, orig_bytes // 4)
+    base_url = cfg["base_url"]
+    chosen_model = cfg["model"]
+    if chosen_model.lower() == "auto":
+        chosen_model = _discover_nvapi_nemotron_model(base_url, api_key)
+
+    sys_prompt = (
+        "Eres un compactador experto de contexto para sesiones de ingeniería de software (Antigravity CLI). "
+        "Resume la conversación en español en un documento Markdown ultra-denso (<1200 palabras) con estas secciones exactas:\n"
+        "1. OBJETIVO Y PETICIONES DEL USUARIO\n"
+        "2. TRABAJO COMPLETADO Y DECISIONES TÉCNICAS\n"
+        "3. ARCHIVOS MODIFICADOS / RUTAS Y COMANDOS CLAVE\n"
+        "4. ESTADO ACTUAL EXACTO\n"
+        "5. SIGUIENTE PASO ACCIONABLE INMEDIATO\n"
+        "Conserva rutas exactas, hashes de commits, nombres de funciones y errores pendientes sin inventar nada."
+    )
+
+    candidates = [chosen_model] + [m for m in _NEMOTRON_CANDIDATE_MODELS if m != chosen_model]
+    url_open = opener or urllib.request.urlopen
+    summary_text = ""
+    used_model = chosen_model
+    last_err = ""
+
+    for cand in candidates[:4]:
+        payload = json.dumps({
+            "model": cand,
+            "messages": [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": digest},
+            ],
+            "temperature": 0.2,
+            "max_tokens": 2048,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            f"{base_url}/chat/completions",
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with url_open(req, timeout=45.0) as resp:
+                body = json.loads(resp.read().decode("utf-8", errors="replace"))
+            choices = body.get("choices") or []
+            if choices:
+                msg_obj = choices[0].get("message") or {}
+                summary_text = str(msg_obj.get("content") or msg_obj.get("reasoning_content") or "").strip()
+                if summary_text:
+                    used_model = cand
+                    break
+        except urllib.error.HTTPError as he:
+            err_body = ""
+            try:
+                err_body = he.read().decode("utf-8", errors="replace")[:160]
+            except Exception:
+                pass
+            last_err = f"HTTP {he.code}: {err_body or he.reason}"
+            if he.code in (401, 403):
+                return (False, f"❌ NVIDIA API Key rechazada ({last_err}). Revisa con [K].", None)
+            continue
+        except Exception as e:
+            last_err = str(e)
+            break
+
+    if not summary_text:
+        return (False, f"❌ Falló compactación NVAPI ({used_model}): {last_err or 'respuesta vacía'}", None)
+
+    out_dir = handoffs_dir or COMPACTED_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    handoff_file = out_dir / f"{session.conversation_id[:8]}_handoff.md"
+    compact_tokens = max(1, len(summary_text) // 4)
+    saved_pct = round(max(0.0, (1.0 - (compact_tokens / max(1, orig_tokens))) * 100.0), 1)
+    header = (
+        f"# 🗜️ Handoff Compactado por NVIDIA NIM (`{used_model}`)\n"
+        f"- **Conversación original:** `{session.conversation_id}` ({session.title})\n"
+        f"- **Workspace:** `{session.workspace}`\n"
+        f"- **Reducción de contexto:** `~{orig_tokens:,} tokens` -> `~{compact_tokens:,} tokens` (**{saved_pct}% ahorrado**)\n\n"
+    )
+    handoff_file.write_text(header + summary_text + "\n", encoding="utf-8")
+    try:
+        os.chmod(handoff_file, 0o600)
+    except OSError:
+        pass
+    return (
+        True,
+        f"🗜️ Compactada con `{used_model}`: ~{orig_tokens:,} -> ~{compact_tokens:,} tokens ({saved_pct}% ahorro).",
+        handoff_file,
+    )
+
+
+def open_compacted_session_in_tab(session: AgySession, handoff_file: Path, *, switch_to: bool = True) -> str:
+    """Open a fresh lightweight AGY session tab pre-loaded with the NVAPI compacted handoff."""
+    self_path = Path(__file__).resolve()
+    cwd = session.workspace if Path(session.workspace).is_dir() else str(Path.cwd())
+    reg = load_accounts_registry()
+    slot = reg.get("conv_accounts", {}).get(session.conversation_id) or reg.get("active_slot", "primary")
+    tab_name = _short_tab_title(session.title, prefix="🗜")
+    boot_prompt = (
+        f"Contexto compactado de la sesión '{session.title}' ({session.conversation_id[:8]}). "
+        f"Lee primero `{handoff_file}` para retomar el estado exacto sin gastar tokens de historial y confirma que estás listo."
+    )
+    cmd = (
+        f"exec python3 {sh_quote(str(self_path))} run "
+        f"--cwd {sh_quote(cwd)} --account {sh_quote(slot)} --title {sh_quote(session.title)} "
+        f"-- -i {sh_quote(boot_prompt)}"
+    )
+    args = ["new-window", "-t", TMUX_SESSION, "-n", tab_name, "-c", cwd]
+    if not switch_to:
+        args.insert(1, "-d")
+    args.append(cmd)
+    tmux_cmd(*args)
+    return f"🚀 Abierta sesión compactada '{session.title}' en pestaña `{tab_name}` (leyendo {handoff_file.name})."
 
 
 def reload_session_tab(session: AgySession) -> str:
@@ -2176,19 +2653,63 @@ def cmd_hibernate(args: argparse.Namespace) -> int:
 def cmd_wake_stub(args: argparse.Namespace) -> int:
     cid = args.conversation_id
     cwd = args.cwd or str(Path.cwd())
-    title = args.title or f"Sesión {cid[:8]}"
+    title = load_custom_titles().get(cid) or args.title or f"Sesión {cid[:8]}"
 
     print_instant_zig_preview(cid, title, cwd)
-    print("\n\033[1;33m  💤 SESIÓN EN MODO HIBERNADO (0 MB RAM en uso — ~250-369 MB ahorrados)\033[0m")
-    print("  \033[1;32m[ENTER]\033[0m Despertar motor interactivo AGY aquí mismo  |  \033[1;36m[d]\033[0m Ir a 0:⚡DASH  |  \033[1;31m[q]\033[0m Cerrar pestaña")
+    est_tok, size_b = estimate_session_tokens(cid)
+    nv_cfg = load_nvapi_config()
+    print(
+        f"\n\033[1;33m  💤 SESIÓN EN MODO HIBERNADO (0 MB RAM — Contexto en disco: {size_b // 1024} KB / ~{est_tok:,} tokens est.)\033[0m"
+    )
+    print(
+        f"  \033[1;35m[c]\033[0m 🗜️ Compactar con NVIDIA Nemotron ({mask_api_key(nv_cfg['api_key'])}) y abrir ligera (~95%+ ahorro tokens)"
+    )
+    print(
+        "  \033[1;32m[ENTER]\033[0m Despertar conversación completa tal cual  |  \033[1;36m[k]\033[0m Configurar NVAPI Key  |  \033[1;36m[d]\033[0m ⚡DASH  |  \033[1;31m[q]\033[0m Cerrar"
+    )
     try:
-        ans = input("\n  Acción [ENTER / d / q]: ").strip().lower()
+        ans = input("\n  Acción [c / ENTER / k / d / q]: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         return 0
     if ans == "q":
         return 0
     if ans == "d":
         _select_dash_window()
+        return cmd_wake_stub(args)
+    if ans == "k":
+        try:
+            k_in = input("  Introduce tu NVIDIA API Key (nvapi-...): ").strip()
+            if k_in:
+                save_nvapi_config(k_in)
+                print("  ✅ NVIDIA API Key guardada en ~/.gemini/antigravity-cli/nvapi_config.json (0600).")
+        except (EOFError, KeyboardInterrupt):
+            pass
+        return cmd_wake_stub(args)
+    if ans == "c":
+        print("  ⏳ Compactando conversación con NVIDIA NIM (Nemotron)...")
+        dummy_sess = AgySession(
+            conversation_id=cid,
+            title=title,
+            preview="",
+            step_count=0,
+            last_modified="",
+            workspace=cwd,
+            db_status="CASCADE_RUN_STATUS_IDLE",
+            not_fully_idle=False,
+        )
+        ok, msg, hfile = compact_conversation_with_nvapi(dummy_sess)
+        print(f"  {msg}")
+        if ok and hfile is not None:
+            reg = load_hibernated_registry()
+            if cid in reg:
+                del reg[cid]
+                save_hibernated_registry(reg)
+            boot_prompt = (
+                f"Contexto compactado de la sesión '{title}' ({cid[:8]}). "
+                f"Lee primero `{hfile}` para retomar el estado exacto sin gastar tokens de historial y confirma que estás listo."
+            )
+            return exec_agy_optimized(["-i", boot_prompt], cwd=cwd, preview_conv=cid, preview_title=title)
+        time.sleep(2.0)
         return cmd_wake_stub(args)
 
     reg = load_hibernated_registry()
@@ -2661,6 +3182,76 @@ def cmd_baton(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def cmd_nvapi(args: argparse.Namespace) -> int:
+    sub_act = getattr(args, "nvapi_cmd", None) or "status"
+    if sub_act == "status":
+        cfg = load_nvapi_config()
+        print(f"  NVIDIA API Key : {mask_api_key(cfg['api_key'])}")
+        print(f"  Base URL       : {cfg['base_url']}")
+        print(f"  Modelo Nemotron: {cfg['model']}")
+        print(f"  Archivo config : {NVAPI_CONFIG_FILE} (0600)")
+        return 0
+    if sub_act == "set-key":
+        key_val = getattr(args, "key", "") or ""
+        if not key_val and sys.stdin.isatty():
+            key_val = input("Introduce tu NVIDIA API Key (nvapi-...): ").strip()
+        if not key_val:
+            print("Uso: agy-dash nvapi set-key <nvapi-...> [--model ...] [--base-url ...]", file=sys.stderr)
+            return 1
+        cfg = save_nvapi_config(
+            key_val,
+            model=getattr(args, "model", "") or "",
+            base_url=getattr(args, "base_url", "") or "",
+        )
+        print(f"✅ NVIDIA API Key guardada ({mask_api_key(cfg['api_key'])}, modelo={cfg['model']}).")
+        return 0
+    return 1
+
+
+def cmd_compact(args: argparse.Namespace) -> int:
+    target = args.target
+    _, _, sessions = load_sessions(limit=60)
+    matches = [
+        s
+        for s in sessions
+        if s.conversation_id == target
+        or s.conversation_id.startswith(target)
+        or target.lower() in s.title.lower()
+    ]
+    if not matches:
+        print(f"No se encontró sesión coincidente con '{target}'.", file=sys.stderr)
+        return 1
+    sel = matches[0]
+    ok, msg, hfile = compact_conversation_with_nvapi(sel)
+    print(msg, file=sys.stdout if ok else sys.stderr)
+    if not ok or hfile is None:
+        return 1
+    print(f"  Handoff guardado en: {hfile}")
+    if getattr(args, "open", False):
+        print(f"  {open_compacted_session_in_tab(sel, hfile)}")
+    return 0
+
+
+def cmd_rename(args: argparse.Namespace) -> int:
+    target = args.target
+    _, _, sessions = load_sessions(limit=60)
+    matches = [
+        s
+        for s in sessions
+        if s.conversation_id == target
+        or s.conversation_id.startswith(target)
+        or target.lower() in s.title.lower()
+    ]
+    if not matches:
+        print(f"No se encontró sesión coincidente con '{target}'.", file=sys.stderr)
+        return 1
+    sel = matches[0]
+    new_t = getattr(args, "new_title", "") or getattr(args, "title", "")
+    clean = save_custom_title(sel.conversation_id, new_t)
+    print(f"✏️ Sesión {sel.conversation_id[:8]} renombrada permanentemente a '{clean}'.")
+    return 0
+
+
 # ============================================================================
 # Dual-Pane Interactive Command Center (`0:⚡DASH`)
 # ============================================================================
@@ -2689,7 +3280,10 @@ def build_command_buttons(panel_w: int) -> list[CommandButton]:
         CommandButton("dedup", "x", "[x] 🧹 Deduplicar", 3, 2 + half + 1, half),
         CommandButton("baton", "B", "[B] 🔀 Baton Pass", 4, 2, half),
         CommandButton("accounts", "u", "[u] 💳 Cuentas", 4, 2 + half + 1, half),
-        CommandButton("memory", "m", "[m] 🧠 Memoria Shared", 5, 2, half * 2 + 1),
+        CommandButton("compact", "c", "[c] 🗜 Compactar NV", 5, 2, half),
+        CommandButton("rename", "t", "[t] ✏️ Renombrar", 5, 2 + half + 1, half),
+        CommandButton("nvapi_key", "K", "[K] 🔑 Key NVIDIA", 6, 2, half),
+        CommandButton("memory", "m", "[m] 🧠 Memoria", 6, 2 + half + 1, half),
     ]
 
 
@@ -2715,7 +3309,7 @@ def _ram_bar(ratio: float, width: int = 20) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
-def _prompt_curses_text(stdscr, prompt: str, default_val: str = "") -> str:
+def _prompt_curses_text(stdscr, prompt: str, default_val: str = "", max_len: int = 96) -> str:
     """Prompt cleanly for short single-line input in the bottom banner."""
     max_y, max_x = stdscr.getmaxyx()
     stdscr.timeout(-1)
@@ -2730,7 +3324,7 @@ def _prompt_curses_text(stdscr, prompt: str, default_val: str = "") -> str:
     stdscr.addstr(max_y - 2, 0, msg[: max_x - 2], curses.color_pair(4) | curses.A_BOLD)
     stdscr.refresh()
     try:
-        raw = stdscr.getstr(max_y - 2, min(len(msg), max_x - 2), 24)
+        raw = stdscr.getstr(max_y - 2, min(len(msg), max_x - 2), max_len)
         val = raw.decode("utf-8", errors="ignore").strip()
     except Exception:
         val = ""
@@ -2740,7 +3334,7 @@ def _prompt_curses_text(stdscr, prompt: str, default_val: str = "") -> str:
             curses.curs_set(0)
         except curses.error:
             pass
-        stdscr.timeout(500)
+        stdscr.timeout(250)
     return val or default_val
 
 
@@ -2761,7 +3355,7 @@ def run_curses_tui(stdscr) -> None:
     cursor = 0
     saved_session_cursor = 0
     mode = "sessions"
-    status_banner = "Listo — [r] Actualizar | [Enter] Abrir/Espejo | [B] Baton Pass | [u] Cuentas | [h/H] Hibernar | [m] Memoria"
+    status_banner = "Listo — [Enter] Abrir (o Compactar NV) | [c] Compactar NV | [t] Renombrar | [B] Baton Pass | [u] Cuentas"
     last_scan_ts = 0.0
     last_auto_check = time.time()
     idle_seen_since: dict[str, float] = {}
@@ -2803,6 +3397,7 @@ def run_curses_tui(stdscr) -> None:
     quota_lock = threading.Lock()
     quota_worker_state = {"running": False, "last_poll": 0.0, "msg": ""}
     pending_delete_info: dict | None = None
+    pending_compact_sess: AgySession | None = None
 
     def trigger_quota_poll(force: bool = False) -> None:
         with quota_lock:
@@ -2839,7 +3434,7 @@ def run_curses_tui(stdscr) -> None:
             return (0, 0, 0)
 
     def execute_action(action: str) -> str:
-        nonlocal mode, cursor, saved_session_cursor, force_scan, cached_preview_sig
+        nonlocal mode, cursor, saved_session_cursor, force_scan, cached_preview_sig, pending_compact_sess
         if action == "refresh":
             force_scan = True
             cached_preview_sig = (-1, -1)
@@ -2867,6 +3462,19 @@ def run_curses_tui(stdscr) -> None:
             mode = "sessions"
             cursor = saved_session_cursor
             return "Vista: Command Center AGY"
+        if action == "nvapi_key":
+            cur_cfg = load_nvapi_config()
+            masked = mask_api_key(str(cur_cfg.get("api_key", "")))
+            entered = _prompt_curses_text(
+                stdscr,
+                f"NVIDIA API Key (nvapi-... · actual {masked})",
+                "",
+                max_len=110,
+            )
+            if not entered:
+                return f"NVIDIA API Key sin cambios ({masked})."
+            save_nvapi_config(api_key=entered)
+            return f"✅ NVIDIA API Key guardada ({mask_api_key(entered)}) — lista para compactar con Nemotron."
 
         sel = sessions[saved_session_cursor if mode != "sessions" else cursor] if sessions else None
         if action == "baton" and sel:
@@ -2882,7 +3490,50 @@ def run_curses_tui(stdscr) -> None:
             return ""
         sel = sessions[cursor] if (sessions and 0 <= cursor < len(sessions)) else None
         if action == "open" and sel:
+            offer, est_tok, _ = should_offer_compaction(sel)
+            if offer:
+                pending_compact_sess = sel
+                return (
+                    f"⚡ '{sel.title}' consume ~{est_tok:,} tokens de entrada: "
+                    f"[c] Compactar con NVIDIA Nemotron | [Enter/o] Abrir completa | [k] Key NV | [Esc] Cancelar"
+                )
             return open_session_in_dashboard_tab(sel, switch_to=True)
+        if action == "open_full" and sel:
+            pending_compact_sess = None
+            return open_session_in_dashboard_tab(sel, switch_to=True)
+        if action == "compact" and sel:
+            pending_compact_sess = None
+            cfg = load_nvapi_config()
+            if not str(cfg.get("api_key", "")).strip():
+                entered = _prompt_curses_text(stdscr, "Ingresa tu NVIDIA API Key (nvapi-...) para compactar", "", max_len=110)
+                if not entered:
+                    return "Compactación cancelada: falta NVIDIA API Key."
+                save_nvapi_config(api_key=entered)
+            stdscr.move(max_y - 2, 0)
+            stdscr.clrtoeol()
+            stdscr.addstr(
+                max_y - 2,
+                0,
+                f" ⏳ Compactando '{sel.title}' con NVIDIA Nemotron ({cfg.get('model')})..."[: max_x - 2],
+                curses.color_pair(4) | curses.A_BOLD,
+            )
+            stdscr.refresh()
+            ok, msg, hfile = compact_conversation_with_nvapi(sel)
+            if not ok or hfile is None:
+                return f"❌ {msg}"
+            open_msg = open_compacted_session_in_tab(sel, hfile, switch_to=True)
+            force_scan = True
+            return f"{msg} · {open_msg}"
+        if action == "rename" and sel:
+            new_name = _prompt_curses_text(stdscr, f"Renombrar '{sel.title[:24]}'", sel.title, max_len=64)
+            if not new_name or new_name == sel.title:
+                return "Renombrado sin cambios."
+            clean = save_custom_title(sel.conversation_id, new_name)
+            sel.title = clean
+            last_tab_names.pop(sel.conversation_id, None)
+            trigger_led_sync(sessions, led_tick + 1)
+            force_scan = True
+            return f"✏️ Sesión renombrada permanentemente a '{clean}'."
         if action == "mirror" and sel:
             return open_session_in_dashboard_tab(sel, switch_to=True, force_live_mirror=True)
         if action == "reload" and sel:
@@ -3100,7 +3751,7 @@ def run_curses_tui(stdscr) -> None:
                         btn_attr = curses.color_pair(1 if (b.action_id == "baton" and quota_alert) else 7) | curses.A_BOLD
                         stdscr.addstr(by, bx, btn_txt, btn_attr)
 
-                insp_y = panel_btn_y + 7
+                insp_y = panel_btn_y + 8
                 if insp_y < 6 + list_avail and sessions and 0 <= cursor < len(sessions):
                     sel = sessions[cursor]
                     stdscr.addstr(insp_y - 1, panel_x, "─" * panel_w)
@@ -3111,52 +3762,92 @@ def run_curses_tui(stdscr) -> None:
                     pid_txt = str(sel.proc.pid) if sel.proc else "-"
                     extra_txt = f" (+{len(sel.extra_procs)} dup)" if sel.extra_procs else ""
                     acct_tag = conv_accounts.get(sel.conversation_id, active_slot)
+                    nv_cfg = load_nvapi_config()
+                    nv_lbl = mask_api_key(str(nv_cfg.get("api_key", "")))
+                    est_tok, _ = estimate_session_tokens(sel)
                     meta_lines = [
                         (f" 📌 {sel.title[:panel_w - 4]}", curses.A_BOLD),
                         (f" ID: {sel.conversation_id[:14]} PID:{pid_txt}{extra_txt} Cta:[{acct_tag}]", curses.A_NORMAL),
-                        (f" Log: {t_sig[1] // 1024} KB ({age_txt}) | Hijos: {kids_txt[:panel_w - 28]}", curses.color_pair(4) if kids_txt != "ninguno" else curses.A_NORMAL),
+                        (f" Log: {t_sig[1] // 1024} KB (~{est_tok // 1000}k tok · {age_txt}) | NVAPI:{nv_lbl[:14]}", curses.color_pair(4) if kids_txt != "ninguno" else curses.A_NORMAL),
                         (f" RAM: {_ram_bar(min(1.0, total_pss_mb / 2048.0), 18)} {total_pss_mb}M (KSM {total_ksm_mb}M)", curses.color_pair(3)),
                     ]
                     for mi, (ml, ma) in enumerate(meta_lines):
                         if insp_y + mi < 6 + list_avail:
                             stdscr.addstr(insp_y + mi, panel_x, ml[:panel_w], ma)
 
-            # Bottom Real-Time Zig Live Conversation Preview!
+            # Bottom Real-Time Zig Live Conversation Preview (or Pre-Open Compaction Modal)!
             if preview_height > 0 and sessions and 0 <= cursor < len(sessions):
                 sel = sessions[cursor]
-                cur_sig = transcript_sig(sel.conversation_id)
-                if sel.conversation_id != cached_preview_cid or cur_sig != cached_preview_sig:
-                    cached_preview_cid = sel.conversation_id
-                    cached_preview_sig = cur_sig
-                    cached_turns = zig_tail_transcript(sel.conversation_id, max_turns=preview_height - 2)
-
                 py = max_y - 3 - preview_height
                 stdscr.addstr(py, 0, "─" * (max_x - 1))
-                age_s = int(max(0, now - (cur_sig[0] / 1e9))) if cur_sig[0] else -1
-                age_lbl = f"hace {age_s}s" if age_s >= 0 else "sin log"
-                phdr = (
-                    f" ⚡ VISTA EN VIVO ZIG (<4ms · {age_lbl}): {sel.title[:38]} ({sel.conversation_id[:8]}) "
-                    f"[{sel.state_label} · {sel.location_label}]"
-                )
-                stdscr.addstr(py + 1, 0, phdr[: max_x - 1], curses.color_pair(2) | curses.A_BOLD)
-                if not cached_turns:
-                    stdscr.addstr(py + 2, 0, "   (Sin transcript.jsonl local o conversación recién creada)"[: max_x - 1])
+                if pending_compact_sess is not None:
+                    pcs = pending_compact_sess
+                    _, est_tok, log_kb = should_offer_compaction(pcs)
+                    nv_cfg = load_nvapi_config()
+                    has_nv = bool(str(nv_cfg.get("api_key", "")).strip())
+                    nv_status = (
+                        f"LISTA ({mask_api_key(str(nv_cfg.get('api_key', '')))} · {nv_cfg.get('model')})"
+                        if has_nv
+                        else "FALTA KEY — pulsa [k] para guardarla"
+                    )
+                    modal_lines = [
+                        (
+                            f" 🗜  REACTIVACIÓN DE SESIÓN PESADA: '{pcs.title[:38]}' ({pcs.step_count} pasos · {log_kb} KB · ~{est_tok:,} tokens de entrada)",
+                            curses.color_pair(1) | curses.A_BOLD,
+                        ),
+                        (
+                            f"    Reabrir esta sesión completa cargará ~{est_tok:,} tokens de entrada en cada mensaje.",
+                            curses.color_pair(4) | curses.A_BOLD,
+                        ),
+                        (
+                            f"    🔑 NVIDIA NIM ({nv_status}): puede compactarla con Nemotron Ultra antes de abrirla.",
+                            curses.color_pair(3 if has_nv else 4),
+                        ),
+                        (
+                            "    👉 [c] ⚡ Compactar con NVIDIA Nemotron y abrir ligera (~95%+ ahorro de tokens de entrada)",
+                            curses.color_pair(3) | curses.A_BOLD,
+                        ),
+                        (
+                            "    👉 [Enter / o] 🚀 Abrir conversación original completa sin compactar   |   [k] Configurar Key NVIDIA   |   [Esc] Cancelar",
+                            curses.color_pair(2) | curses.A_BOLD,
+                        ),
+                    ]
+                    for mi, (ml, ma) in enumerate(modal_lines):
+                        ry = py + 1 + mi
+                        if ry < max_y - 3:
+                            stdscr.addstr(ry, 0, ml[: max_x - 1].ljust(max_x - 1), ma)
                 else:
-                    for tidx, t in enumerate(cached_turns[-(preview_height - 2) :]):
-                        ry = py + 2 + tidx
-                        if ry >= max_y - 3:
-                            break
-                        if t["role"] == "USER":
-                            txt = f"  👤 [{t['ts']} #{t['idx']}] TÚ: {t['content']}"
-                            stdscr.addstr(ry, 0, txt[: max_x - 1], curses.color_pair(4))
-                        elif t["role"] == "TOOL":
-                            txt = f"  ⏳ [{t['ts']} #{t['idx']}] {t['content']}"
-                            stdscr.addstr(ry, 0, txt[: max_x - 1], curses.color_pair(5))
-                        else:
-                            tools_s = f" [🔧 {', '.join(t['tools'])}]" if t["tools"] else ""
-                            body_s = t["content"] or "(ejecutando herramientas...)"
-                            txt = f"  🤖 [{t['ts']} #{t['idx']}] AGY: {body_s}{tools_s}"
-                            stdscr.addstr(ry, 0, txt[: max_x - 1], curses.color_pair(3))
+                    cur_sig = transcript_sig(sel.conversation_id)
+                    if sel.conversation_id != cached_preview_cid or cur_sig != cached_preview_sig:
+                        cached_preview_cid = sel.conversation_id
+                        cached_preview_sig = cur_sig
+                        cached_turns = zig_tail_transcript(sel.conversation_id, max_turns=preview_height - 2)
+
+                    age_s = int(max(0, now - (cur_sig[0] / 1e9))) if cur_sig[0] else -1
+                    age_lbl = f"hace {age_s}s" if age_s >= 0 else "sin log"
+                    phdr = (
+                        f" ⚡ VISTA EN VIVO ZIG (<4ms · {age_lbl}): {sel.title[:38]} ({sel.conversation_id[:8]}) "
+                        f"[{sel.state_label} · {sel.location_label}]"
+                    )
+                    stdscr.addstr(py + 1, 0, phdr[: max_x - 1], curses.color_pair(2) | curses.A_BOLD)
+                    if not cached_turns:
+                        stdscr.addstr(py + 2, 0, "   (Sin transcript.jsonl local o conversación recién creada)"[: max_x - 1])
+                    else:
+                        for tidx, t in enumerate(cached_turns[-(preview_height - 2) :]):
+                            ry = py + 2 + tidx
+                            if ry >= max_y - 3:
+                                break
+                            if t["role"] == "USER":
+                                txt = f"  👤 [{t['ts']} #{t['idx']}] TÚ: {t['content']}"
+                                stdscr.addstr(ry, 0, txt[: max_x - 1], curses.color_pair(4))
+                            elif t["role"] == "TOOL":
+                                txt = f"  ⏳ [{t['ts']} #{t['idx']}] {t['content']}"
+                                stdscr.addstr(ry, 0, txt[: max_x - 1], curses.color_pair(5))
+                            else:
+                                tools_s = f" [🔧 {', '.join(t['tools'])}]" if t["tools"] else ""
+                                body_s = t["content"] or "(ejecutando herramientas...)"
+                                txt = f"  🤖 [{t['ts']} #{t['idx']}] AGY: {body_s}{tools_s}"
+                                stdscr.addstr(ry, 0, txt[: max_x - 1], curses.color_pair(3))
         elif mode == "accounts":
             acct_list = list(reg.get("accounts", {}).items())
             email_counts: dict[str, int] = {}
@@ -3274,8 +3965,8 @@ def run_curses_tui(stdscr) -> None:
                 )
             else:
                 keys_help = (
-                    " [r] Actualizar  [Enter] Abrir  [B] Baton Pass  [u] Cuentas  "
-                    "[v] Espejo  [n] Nueva  [h/H] Hibernar  [m] Memoria  [Tab] Pestaña "
+                    " [Enter] Abrir  [c] Compactar NV  [t] Renombrar  [K] Key NV  [B] Baton Pass  "
+                    "[u] Cuentas  [h/H] Hibernar  [m] Memoria  [Tab] Pestaña "
                 )
             stdscr.addstr(max_y - 1, 0, keys_help[: max_x - 1], curses.A_REVERSE)
 
@@ -3297,6 +3988,7 @@ def run_curses_tui(stdscr) -> None:
             elif mode == "sessions" and list_start_y <= my < list_start_y + list_avail and mx < left_w:
                 clicked_idx = (max(0, cursor - list_avail + 1) if cursor >= list_avail else 0) + (my - list_start_y)
                 if 0 <= clicked_idx < len(sessions):
+                    pending_compact_sess = None
                     if (bstate & curses.BUTTON1_DOUBLE_CLICKED) or clicked_idx == cursor:
                         cursor = clicked_idx
                         if bstate & curses.BUTTON1_DOUBLE_CLICKED:
@@ -3388,6 +4080,18 @@ def run_curses_tui(stdscr) -> None:
                 tmux_cmd("next-window")
             continue
 
+        if mode == "sessions" and pending_compact_sess is not None:
+            if ch in (ord("c"), ord("C")):
+                status_banner = execute_action("compact")
+            elif ch in (10, 13, curses.KEY_ENTER, ord("o"), ord("O")):
+                status_banner = execute_action("open_full")
+            elif ch in (ord("k"), ord("K")):
+                status_banner = execute_action("nvapi_key")
+            elif ch in (27, ord("n"), ord("N"), ord("q")):
+                pending_compact_sess = None
+                status_banner = "Reactivación cancelada."
+            continue
+
         if ch in (ord("q"), 27, 9):
             tmux_cmd("next-window")
         elif ch == ord("D"):
@@ -3406,6 +4110,12 @@ def run_curses_tui(stdscr) -> None:
             status_banner = execute_action("refresh_quota")
         elif mode == "sessions" and ch in (10, 13, curses.KEY_ENTER):
             status_banner = execute_action("open")
+        elif mode == "sessions" and ch in (ord("c"), ord("C")):
+            status_banner = execute_action("compact")
+        elif mode == "sessions" and ch == ord("t"):
+            status_banner = execute_action("rename")
+        elif mode == "sessions" and ch == ord("K"):
+            status_banner = execute_action("nvapi_key")
         elif mode == "sessions" and ch == ord("v"):
             status_banner = execute_action("mirror")
         elif mode == "sessions" and ch == ord("R"):
@@ -3532,6 +4242,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_bt.add_argument("--check", action="store_true", help="Run Baton Pass preflight checks only (no changes)")
     p_bt.add_argument("--json", action="store_true", help="Emit JSON output for `--check`")
     p_bt.set_defaults(fn=cmd_baton)
+
+    p_nv = sub.add_parser("nvapi", help="Configure NVIDIA NIM API key & model for external context compaction")
+    p_nv.add_argument("nvapi_cmd", nargs="?", default="status", choices=["status", "set-key"])
+    p_nv.add_argument("value", nargs="?", default="", help="NVIDIA API Key (`nvapi-...`) for `set-key`")
+    p_nv.add_argument("--model", default="", help="NVIDIA NIM model (default: nvidia/llama-3.1-nemotron-ultra-253b-v1)")
+    p_nv.add_argument("--base-url", default="", help="Custom OpenAI-compatible NIM base URL")
+    p_nv.set_defaults(fn=cmd_nvapi)
+
+    p_cp = sub.add_parser("compact", help="Compact a heavy conversation via NVIDIA NIM (Nemotron) before reopening")
+    p_cp.add_argument("target", help="Conversation ID prefix or title substring")
+    p_cp.add_argument("--model", default="", help="Override NVIDIA NIM model for this compaction")
+    p_cp.add_argument("--open", action="store_true", help="Open a new lightweight tab pre-loaded with the compacted handoff")
+    p_cp.set_defaults(fn=cmd_compact)
+
+    p_rn = sub.add_parser("rename", help="Permanently rename a conversation across dashboard and LED tabs")
+    p_rn.add_argument("target", help="Conversation ID prefix or title substring")
+    p_rn.add_argument("new_title", help="New custom title for the conversation")
+    p_rn.set_defaults(fn=cmd_rename)
 
     return ap
 
