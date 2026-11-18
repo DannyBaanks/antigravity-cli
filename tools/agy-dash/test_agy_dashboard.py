@@ -219,9 +219,33 @@ class AgyDashboardTests(unittest.TestCase):
                 self.assertIn("copy-pipe-no-clear" if "copy-pipe-no-clear" in conf_txt else "copy-selection-no-clear", conf_txt)
                 self.assertIn("range=user|x_#{window_index}", conf_txt)
                 self.assertIn("close-tab", conf_txt)
+                self.assertIn("{ run-shell", conf_txt)
             finally:
                 ad.BRAIN_DIR = orig_brain
                 ad.TMUX_CONF = orig_conf
+
+    def test_remove_account_slot_cleans_refs_and_protects_primary(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            reg_path = Path(td) / "registry.json"
+            reg_data = {
+                "active_slot": "pro4",
+                "conv_accounts": {"cid-1": "pro4", "cid-2": "pro3"},
+                "accounts": {
+                    "primary": {"slot": "primary", "mode": "system", "authenticated": True},
+                    "pro3": {"slot": "pro3", "mode": "isolated", "authenticated": True},
+                    "pro4": {"slot": "pro4", "mode": "isolated", "authenticated": True},
+                },
+            }
+            ad.save_accounts_registry(reg_data, registry_path=reg_path)
+            ok_pri, _ = ad.remove_account_slot("primary", registry_path=reg_path)
+            self.assertFalse(ok_pri)
+            ok_p4, _ = ad.remove_account_slot("pro4", registry_path=reg_path)
+            self.assertTrue(ok_p4)
+            after = ad.load_accounts_registry(registry_path=reg_path)
+            self.assertNotIn("pro4", after["accounts"])
+            self.assertEqual(after["active_slot"], "primary")
+            self.assertEqual(after["conv_accounts"]["cid-1"], "primary")
+            self.assertEqual(after["conv_accounts"]["cid-2"], "pro3")
 
 
 if __name__ == "__main__":
