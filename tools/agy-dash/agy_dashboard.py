@@ -2243,7 +2243,7 @@ def compact_conversation_with_nvapi(
             method="POST",
         )
         try:
-            with url_open(req, timeout=45.0) as resp:
+            with url_open(req, timeout=110.0) as resp:
                 body = json.loads(resp.read().decode("utf-8", errors="replace"))
             choices = body.get("choices") or []
             if choices:
