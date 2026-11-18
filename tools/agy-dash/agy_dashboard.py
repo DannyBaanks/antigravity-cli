@@ -51,6 +51,7 @@ ACCOUNTS_REGISTRY = ACCOUNTS_DIR / "registry.json"
 TMUX_CONF = AGY_DATA_DIR / "agy-dash.tmux.conf"
 TMUX_SOCKET = "agy-dash"
 TMUX_SESSION = "agy"
+TMUX_BG_SESSION = "agy-bg"
 
 AGY_BIN = os.environ.get("AGY_BIN", str(HOME / ".local" / "bin" / "agy"))
 DEFAULT_GOGC = os.environ.get("AGY_GOGC", "35")
@@ -150,6 +151,7 @@ class AgySession:
     hibernated_saved_kb: int = 0
     dash_win_idx: str | None = None
     dash_win_name: str = ""
+    bg_win_idx: str | None = None
 
     @property
     def state_label(self) -> str:
@@ -171,6 +173,8 @@ class AgySession:
             if self.extra_procs:
                 return f"tab:{self.dash_win_idx}+ext"
             return f"tab:{self.dash_win_idx}"
+        if self.bg_win_idx is not None and self.proc is not None:
+            return f"bg:{self.bg_win_idx}"
         if self.proc is not None:
             return f"ext:{self.proc.tty}"
         if self.hibernated:
@@ -394,13 +398,13 @@ def _get_tmux_dash_server_pids() -> set[int]:
     return pids
 
 
-def _get_dash_window_map() -> dict[str, tuple[str, str]]:
-    """Return mapping conv_id -> (window_index, window_name) inside tmux -L agy-dash."""
+def _get_window_map_for_session(tmux_session: str) -> dict[str, tuple[str, str]]:
+    """Return mapping conv_id -> (window_index, window_name) inside a tmux session."""
     out: dict[str, tuple[str, str]] = {}
     cp = tmux_cmd(
         "list-windows",
         "-t",
-        TMUX_SESSION,
+        tmux_session,
         "-F",
         "#{window_index}|#{window_name}|#{@agy_conv_id}",
         capture=True,
@@ -411,6 +415,16 @@ def _get_dash_window_map() -> dict[str, tuple[str, str]]:
             if len(parts) == 3 and parts[2].strip():
                 out[parts[2].strip()] = (parts[0].strip(), parts[1].strip())
     return out
+
+
+def _get_dash_window_map() -> dict[str, tuple[str, str]]:
+    """Return mapping conv_id -> (window_index, window_name) inside tmux -L agy-dash."""
+    return _get_window_map_for_session(TMUX_SESSION)
+
+
+def _get_bg_window_map() -> dict[str, tuple[str, str]]:
+    """Return mapping conv_id -> (window_index, window_name) for parked background tabs."""
+    return _get_window_map_for_session(TMUX_BG_SESSION)
 
 
 def load_hibernated_registry() -> dict[str, dict]:
@@ -445,6 +459,7 @@ def parse_workspace_uri(raw_uris: str) -> str:
 def load_sessions(limit: int = 40) -> tuple[int, dict[str, int], list[AgySession]]:
     scan_us, ksm_stats, live_by_conv = zig_scan()
     win_map = _get_dash_window_map()
+    bg_map = _get_bg_window_map()
     hib_reg = load_hibernated_registry()
 
     dirty_hib = False
@@ -490,6 +505,7 @@ def load_sessions(limit: int = 40) -> tuple[int, dict[str, int], list[AgySession
 
                 hib_info = hib_reg.get(cid)
                 win_idx, win_name = win_map.get(cid, (None, ""))
+                bg_idx, _ = bg_map.get(cid, (None, ""))
                 clean_title = (title or "").strip() or f"Sesión {cid[:8]}"
                 clean_prev = re.sub(r"\s+", " ", (preview or "").strip())[:100]
                 rows_by_id[cid] = AgySession(
@@ -507,6 +523,7 @@ def load_sessions(limit: int = 40) -> tuple[int, dict[str, int], list[AgySession
                     hibernated_saved_kb=int((hib_info or {}).get("saved_pss_kb", 250_000)),
                     dash_win_idx=win_idx,
                     dash_win_name=win_name,
+                    bg_win_idx=bg_idx,
                 )
             conn.close()
         except Exception:
@@ -515,6 +532,7 @@ def load_sessions(limit: int = 40) -> tuple[int, dict[str, int], list[AgySession
     for cid, procs in live_by_conv.items():
         if cid not in rows_by_id and procs:
             win_idx, win_name = win_map.get(cid, (None, ""))
+            bg_idx, _ = bg_map.get(cid, (None, ""))
             rows_by_id[cid] = AgySession(
                 conversation_id=cid,
                 title=f"Sesión activa {cid[:8]}",
@@ -528,6 +546,7 @@ def load_sessions(limit: int = 40) -> tuple[int, dict[str, int], list[AgySession
                 extra_procs=procs[1:],
                 dash_win_idx=win_idx,
                 dash_win_name=win_name,
+                bg_win_idx=bg_idx,
             )
 
     def sort_key(s: AgySession) -> tuple[int, str]:
@@ -709,13 +728,42 @@ def ensure_isolated_home(
     slot_cfg_agy = slot_cfg / "antigravity"
     slot_gemini = slot_home / ".gemini"
     slot_agy_data = slot_gemini / "antigravity-cli"
+    slot_bin = slot_dir / "bin"
 
-    for d in (acct_root, slot_dir, slot_home, slot_cfg, slot_cfg_agy, slot_gemini, slot_agy_data):
+    for d in (acct_root, slot_dir, slot_home, slot_cfg, slot_cfg_agy, slot_gemini, slot_agy_data, slot_bin):
         d.mkdir(parents=True, exist_ok=True)
         try:
             os.chmod(d, 0o700)
         except OSError:
             pass
+
+    xdg_shim = slot_bin / "xdg-open"
+    shim_code = f"""#!/usr/bin/env bash
+set -u
+url="${{1:-}}"
+if [ -n "$url" ]; then
+  printf '%s' "$url" > "{slot_dir / 'last_oauth.url'}" 2>/dev/null || true
+  chmod 600 "{slot_dir / 'last_oauth.url'}" 2>/dev/null || true
+  if command -v wl-copy >/dev/null 2>&1; then
+    printf '%s' "$url" | wl-copy 2>/dev/null || true
+  elif command -v xclip >/dev/null 2>&1; then
+    printf '%s' "$url" | xclip -in -selection clipboard 2>/dev/null || true
+  elif command -v xsel >/dev/null 2>&1; then
+    printf '%s' "$url" | xsel --clipboard --input 2>/dev/null || true
+  fi
+fi
+if [ -n "${{AGY_REAL_DBUS:-}}" ]; then export DBUS_SESSION_BUS_ADDRESS="$AGY_REAL_DBUS"; else unset DBUS_SESSION_BUS_ADDRESS; fi
+if [ -n "${{AGY_REAL_HOME:-}}" ]; then export HOME="$AGY_REAL_HOME"; fi
+if [ -n "${{AGY_REAL_XDG_CONFIG:-}}" ]; then export XDG_CONFIG_HOME="$AGY_REAL_XDG_CONFIG"; else unset XDG_CONFIG_HOME; fi
+PATH="$(printf '%s' "$PATH" | awk -v RS=: -v ORS=: -v rm="{slot_bin}" '$0 != rm' | sed 's/:$//')"
+export PATH
+exec xdg-open "$@"
+"""
+    xdg_shim.write_text(shim_code, encoding="utf-8")
+    try:
+        os.chmod(xdg_shim, 0o755)
+    except OSError:
+        pass
 
     for name in _SHARED_AGY_DATA_ITEMS:
         _ensure_symlink(slot_agy_data / name, real_agy_data / name)
@@ -927,6 +975,12 @@ def build_agy_env(account_slot: str | None = None, *, registry_path: Path | None
     mode = acct.get("mode", "system" if slot == "primary" else "isolated")
     if mode == "isolated":
         slot_home = ensure_isolated_home(slot)
+        slot_bin = slot_home.parent / "bin"
+        env["AGY_REAL_DBUS"] = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
+        env["AGY_REAL_HOME"] = str(HOME)
+        if "XDG_CONFIG_HOME" in os.environ:
+            env["AGY_REAL_XDG_CONFIG"] = os.environ["XDG_CONFIG_HOME"]
+        env["PATH"] = f"{slot_bin}:{env.get('PATH', '')}"
         env["HOME"] = str(slot_home)
         env["XDG_CONFIG_HOME"] = str(slot_home / ".config")
         env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/nonexistent"
@@ -1140,11 +1194,25 @@ def write_tmux_config(self_path: Path) -> None:
     else:
         status_cmd = f"python3 {self_path} statusbar"
 
+    if shutil.which("wl-copy"):
+        clip_cmd = "wl-copy"
+    elif shutil.which("xclip"):
+        clip_cmd = "xclip -in -selection clipboard >/dev/null 2>&1"
+    elif shutil.which("xsel"):
+        clip_cmd = "xsel --clipboard --input >/dev/null 2>&1"
+    else:
+        clip_cmd = ""
+
+    copy_action = f"send-keys -X copy-pipe-no-clear {sh_quote(clip_cmd)}" if clip_cmd else "send-keys -X copy-selection-no-clear"
+    copy_exit_action = f"send-keys -X copy-pipe-and-cancel {sh_quote(clip_cmd)}" if clip_cmd else "send-keys -X copy-selection-and-cancel"
+    close_btn = "#{?#{m:*DASH*,#W},, #[range=user|x_#{window_index} fg=#ff5555 bold]×#[range=window|#{window_index}]}"
+
     conf = f"""\
 # Auto-generated by agy-dash (Zig+Python Single-Window Command Center)
 set -g default-terminal "tmux-256color"
 set -ga terminal-overrides ",*256col*:Tc"
 set -g mouse on
+setw -g mode-keys vi
 set -g history-limit 50000
 set -g escape-time 10
 set -g focus-events on
@@ -1156,6 +1224,24 @@ set -g renumber-windows on
 set -g allow-rename off
 setw -g automatic-rename off
 
+# Freeze-select & persistent clipboard copy even while AGY streams output!
+bind -n MouseDrag1Pane if -F '#{{m:*DASH*,#{{window_name}}}}' 'send-keys -M' 'copy-mode -M'
+bind -n WheelUpPane if -F '#{{||:#{{m:*DASH*,#{{window_name}}}},#{{m:*👁*,#{{window_name}}}}}}' 'send-keys -M' 'if -F "#{{pane_in_mode}}" "send-keys -M" "copy-mode -e; send-keys -M"'
+bind -T copy-mode MouseDragEnd1Pane {copy_action}
+bind -T copy-mode-vi MouseDragEnd1Pane {copy_action}
+bind -T copy-mode DoubleClick1Pane select-pane \\; send-keys -X select-word \\; {copy_action}
+bind -T copy-mode-vi DoubleClick1Pane select-pane \\; send-keys -X select-word \\; {copy_action}
+bind -T copy-mode TripleClick1Pane select-pane \\; send-keys -X select-line \\; {copy_action}
+bind -T copy-mode-vi TripleClick1Pane select-pane \\; send-keys -X select-line \\; {copy_action}
+bind -T copy-mode Enter {copy_exit_action}
+bind -T copy-mode-vi y {copy_exit_action}
+bind -T copy-mode-vi Enter {copy_exit_action}
+bind -n M-s copy-mode
+
+# OpenCode-style tab close (`×`) keeping working processes alive in background (`agy-bg`)
+bind -T root MouseDown1Status if -F '#{{m:x_*,#{{mouse_status_range}}}}' 'run-shell "python3 {self_path} close-tab #{{s/x_//:#{{mouse_status_range}}}}"' 'select-window -t ='
+bind -T root MouseDown2Status run-shell "python3 {self_path} close-tab #{{window_index}}"
+
 # Top dashboard bar powered by Zig `agy-fast-core statusbar` (<7ms)
 set -g status-position top
 set -g status-interval 1
@@ -1163,10 +1249,10 @@ set -g status-style "bg=#14171f,fg=#d8dee9"
 set -g status-left-length 32
 set -g status-right-length 78
 set -g status-left "#[bg=#e94560,fg=#ffffff,bold] ⚡ AGY DASH #[bg=#14171f,fg=#e94560] "
-set -g status-right "#[fg=#414650]│ #[fg=#8be9fd]#({status_cmd}) #[fg=#414650]│ #[fg=#f1fa8c]Alt+0:Dash Alt+1..9:Tab Alt+N:New "
+set -g status-right "#[fg=#414650]│ #[fg=#8be9fd]#({status_cmd}) #[fg=#414650]│ #[fg=#f1fa8c]Alt+0:Dash Alt+1..9:Tab Alt+S:Copy Alt+N:New "
 
-setw -g window-status-format "#[fg=#6272a4] #I:#W "
-setw -g window-status-current-format "#[bg=#282a36,fg=#50fa7b,bold] ▸ #I:#W #[default]"
+setw -g window-status-format "#[fg=#6272a4] #I:#W{close_btn} "
+setw -g window-status-current-format "#[bg=#282a36,fg=#50fa7b,bold] ▸ #I:#W{close_btn} #[default]"
 
 bind -n M-0 select-window -t :0
 bind -n M-d select-window -t :0
@@ -1274,6 +1360,11 @@ def open_session_in_dashboard_tab(
     model: str = "",
 ) -> str:
     self_path = Path(__file__).resolve()
+    # If this session was parked in hidden background `agy-bg`, pop the live window right back into view!
+    bg_info = _get_bg_window_map().get(session.conversation_id)
+    if bg_info is not None:
+        bg_idx = bg_info[0]
+        tmux_cmd("move-window", "-d", "-s", f"{TMUX_BG_SESSION}:{bg_idx}", "-t", f"{TMUX_SESSION}:")
     existing_idx = _find_tmux_window_by_conv(session.conversation_id)
     cwd = session.workspace if Path(session.workspace).is_dir() else str(Path.cwd())
     reg = load_accounts_registry()
@@ -1479,11 +1570,16 @@ def session_live_activity(
         for t in reversed(turns):
             tools = t.get("tools") or []
             if tools:
-                raw_tool = str(tools[-1])
+                raw_tool = str(tools[-1]).split("(", 1)[0].strip()
                 label = _TOOL_LABELS.get(raw_tool, f"{raw_tool[:14]}...")
                 break
             if t.get("role") == "TOOL" and t.get("content"):
-                label = str(t["content"]).replace("🔧", "").strip()[:18]
+                content_s = str(t["content"])
+                if "Created At:" in content_s or "Tool is running" in content_s or "background task" in content_s:
+                    label = "Task running..."
+                else:
+                    clean_c = content_s.replace("🔧", "").strip(" \"'")[:16]
+                    label = clean_c or "Task running..."
                 break
         activity_cache[cid] = (sig, label)
 
@@ -1503,7 +1599,7 @@ def format_led_tab_title(
     clean_title = re.sub(r"[^A-Za-z0-9áéíóúÁÉÍÓÚñÑ_-]+", "-", session.title.strip()).strip("-") or "session"
     if session.hibernated:
         return f"💤{clean_title[:width - 2]}"
-    is_mirror = session.dash_win_name.startswith("👁")
+    is_mirror = "👁" in session.dash_win_name
     if not busy:
         prefix = "👁" if is_mirror else "●"
         return f"{prefix}{clean_title[:width - 1]}"
@@ -1928,6 +2024,67 @@ def cmd_open_new_tab(args: argparse.Namespace) -> int:
     tab_prefix = f"●{slot[:3]}·" if slot != "primary" else "●"
     cmd = f"exec python3 {sh_quote(str(self_path))} run --cwd {sh_quote(cwd)} --account {sh_quote(slot)}"
     tmux_cmd("new-window", "-t", TMUX_SESSION, "-n", f"{tab_prefix}nueva", "-c", cwd, cmd)
+    return 0
+
+
+def _ensure_bg_session() -> None:
+    has = tmux_cmd("has-session", "-t", TMUX_BG_SESSION, capture=True)
+    if has.returncode != 0:
+        tmux_cmd("new-session", "-d", "-s", TMUX_BG_SESSION, "-n", "_bg_anchor", "sleep infinity")
+
+
+def close_tab_safely(win_idx: str) -> str:
+    """Close a tab (`×`), parking RUNNING/BG-TASK sessions into hidden `agy-bg` instead of killing them."""
+    cp = tmux_cmd(
+        "display-message",
+        "-p",
+        "-t",
+        f"{TMUX_SESSION}:{win_idx}",
+        "#{window_name}|#{@agy_conv_id}|#{pane_current_command}|#{pane_pid}",
+        capture=True,
+    )
+    if cp.returncode != 0 or not cp.stdout.strip():
+        return f"Pestaña #{win_idx} ya no existe."
+    parts = cp.stdout.strip().split("|", 3)
+    win_name = parts[0] if len(parts) > 0 else ""
+    conv_id = parts[1].strip() if len(parts) > 1 else ""
+    pane_cmd = parts[2].strip() if len(parts) > 2 else ""
+    pane_pid = int(parts[3].strip()) if len(parts) > 3 and parts[3].strip().isdigit() else 0
+
+    if "DASH" in win_name:
+        return "No se cierra la pestaña principal ⚡DASH."
+
+    # Live mirrors, wake stubs, and OAuth login helpers can close UI tab directly without affecting background AGY
+    if any(ch in win_name for ch in ("👁", "💤", "🔑")) or pane_cmd == "python3":
+        tmux_cmd("kill-window", "-t", f"{TMUX_SESSION}:{win_idx}")
+        return f"Pestaña '{win_name}' cerrada (solo vista)."
+
+    _, _, sessions = load_sessions(limit=50)
+    sess = next(
+        (
+            s
+            for s in sessions
+            if (conv_id and s.conversation_id == conv_id)
+            or s.dash_win_idx == win_idx
+            or (pane_pid and s.proc and (s.proc.pid == pane_pid or s.proc.ppid == pane_pid))
+        ),
+        None,
+    )
+    is_busy = bool(sess and sess.state_label in ("RUNNING", "BG-TASK"))
+    if is_busy:
+        if sess and not conv_id:
+            tmux_cmd("set-window-option", "-t", f"{TMUX_SESSION}:{win_idx}", "@agy_conv_id", sess.conversation_id)
+        _ensure_bg_session()
+        tmux_cmd("move-window", "-d", "-s", f"{TMUX_SESSION}:{win_idx}", "-t", f"{TMUX_BG_SESSION}:")
+        return f"'{sess.title if sess else win_name}' ocultada en segundo plano (sigue trabajando viva)."
+
+    tmux_cmd("kill-window", "-t", f"{TMUX_SESSION}:{win_idx}")
+    return f"Pestaña '{win_name}' cerrada en IDLE (reabrible desde 0:⚡DASH)."
+
+
+def cmd_close_tab(args: argparse.Namespace) -> int:
+    msg = close_tab_safely(str(args.window_index))
+    tmux_cmd("display-message", "-d", "2500", msg)
     return 0
 
 
@@ -2844,6 +3001,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_new.add_argument("--cwd", default="")
     p_new.add_argument("--account", default="")
     p_new.set_defaults(fn=cmd_open_new_tab)
+
+    p_ct = sub.add_parser("close-tab", help="Safely close tab `×` (parks active RUNNING/BG-TASK tabs in agy-bg)")
+    p_ct.add_argument("window_index")
+    p_ct.set_defaults(fn=cmd_close_tab)
 
     for cname in ("accounts", "account"):
         p_ac = sub.add_parser(cname, help="Manage multi-account Google Pro slots (list|add|use|remove)")

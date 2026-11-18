@@ -141,6 +141,10 @@ El panel `0:⚡DASH` muestra la lista de sesiones a la izquierda, la **Vista en 
 2. **Agregar 2ª+ cuenta Pro sin cerrar la actual:** pulsa `u` -> `+` en el dashboard (o corre `agy-dash account add pro2`). Abre una pestaña aislada (`DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent` + `HOME` aislado con symlinks a tus conversaciones/MCP) para completar OAuth una sola vez sin tocar `primary`.
 3. **Baton Pass (`[B]` o `agy-dash baton <conv> [--to <slot>]`):** cuando la alerta de cuota baja (`🚨 <=5%` / `⚠️ <=15%`) avise en el banner del dashboard, pulsa `B` para relanzar exactamente `--conversation <uuid> --model <modelo>` bajo la cuenta con mayor cuota restante.
 4. **Pestañas tipo letrero LED:** las pestañas en `RUNNING` / `BG-TASK` muestran un spinner Braille animándose a la izquierda (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`) junto con el título + la acción actual desplazándose estilo marquee (`Editing files...`, `Running cmd...`).
+5. **Botón `×` en pestañas (estilo OpenCode) y Selección Freeze-Copy:**
+   - Hacer clic en **`×`** (o clic central) sobre una pestaña cierra **solo el tab visual**: si esa sesión sigue en `RUNNING` o `BG-TASK`, se estaciona viva en la sesión oculta `agy-bg` sin matar el proceso (puedes traerla de vuelta al frente en cualquier momento desde `0:⚡DASH` con `Enter`).
+   - Arrastrar con el mouse o usar la rueda arriba en cualquier pestaña `agy` entra automáticamente en `copy-mode` (congela el scroll mientras el modelo escribe para que **nunca se corte ni deseleccione lo subrayado**) y `MouseDragEnd1Pane` copia al portapapeles sin limpiar la selección (`Alt+S` activa el mismo modo por teclado).
+   - Al abrir login aislado (`u -> +`), un wrapper `xdg-open` restaura tu `DBUS_SESSION_BUS_ADDRESS` real para abrir el navegador automáticamente y copia la URL OAuth completa en 1 línea al portapapeles (`Ctrl+V`).
 
 ## Trampas
 

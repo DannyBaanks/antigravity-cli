@@ -94,6 +94,7 @@ class AgyDashboardTests(unittest.TestCase):
             )
             self.assertTrue((slot_home / ".config" / "antigravity").is_dir())
             self.assertFalse((slot_home / ".config" / "antigravity").is_symlink())
+            self.assertTrue((slot_home.parent / "bin" / "xdg-open").is_file())
             self.assertTrue((slot_home / ".gemini" / "antigravity-cli" / "conversations").is_symlink())
             self.assertTrue((slot_home / ".gemini" / "antigravity-cli" / "settings.json").is_symlink())
             self.assertTrue((slot_home / ".gitconfig").is_symlink())
@@ -176,6 +177,51 @@ class AgyDashboardTests(unittest.TestCase):
             dash_win_name="●Idle",
         )
         self.assertTrue(ad.format_led_tab_title(idle_sess, 3, "IDLE", False).startswith("●"))
+
+    def test_activity_label_sanitizes_tool_logs_and_tmux_conf_has_close_and_freeze(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            orig_brain = ad.BRAIN_DIR
+            orig_conf = ad.TMUX_CONF
+            try:
+                ad.BRAIN_DIR = Path(td)
+                cid = "conv-act-1"
+                log_dir = Path(td) / cid / ".system_generated" / "logs"
+                log_dir.mkdir(parents=True, exist_ok=True)
+                (log_dir / "transcript.jsonl").write_text(
+                    json.dumps({
+                        "step_index": 1,
+                        "type": "GENERIC",
+                        "content": "Created At: 2026-11-18T00:00:00Z Tool is running as a background task",
+                    }) + "\n",
+                    encoding="utf-8",
+                )
+                sess = ad.AgySession(
+                    conversation_id=cid,
+                    title="Demo",
+                    preview="",
+                    step_count=1,
+                    last_modified="ahora",
+                    workspace="/tmp",
+                    db_status="CASCADE_RUN_STATUS_RUNNING",
+                    not_fully_idle=True,
+                    proc=ad.ProcMemInfo(pid=555, in_dash=True),
+                    dash_win_idx="1",
+                    dash_win_name="●Demo",
+                )
+                busy, lbl = ad.session_live_activity(sess, {})
+                self.assertTrue(busy)
+                self.assertEqual(lbl, "Task running...")
+
+                ad.TMUX_CONF = Path(td) / "agy-dash.tmux.conf"
+                ad.write_tmux_config(Path(__file__).resolve())
+                conf_txt = ad.TMUX_CONF.read_text(encoding="utf-8")
+                self.assertIn("MouseDrag1Pane", conf_txt)
+                self.assertIn("copy-pipe-no-clear" if "copy-pipe-no-clear" in conf_txt else "copy-selection-no-clear", conf_txt)
+                self.assertIn("range=user|x_#{window_index}", conf_txt)
+                self.assertIn("close-tab", conf_txt)
+            finally:
+                ad.BRAIN_DIR = orig_brain
+                ad.TMUX_CONF = orig_conf
 
 
 if __name__ == "__main__":
