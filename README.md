@@ -82,4 +82,25 @@ By using Antigravity CLI, you agree to help improve the product by allowing Goog
 ### Legal & Privacy Links
 
 - **Terms of Service**: [antigravity.google/terms](https://antigravity.google/terms)
-- **Privacy Policy**: [policies.google.com/privacy](https://policies.google.com/privacy)
+- **Privacy Policy**: [policies.google.com/privacy](https://policies.google/privacy)
+
+---
+
+## Fork Extensions (`DannyBaanks/antigravity-cli`)
+
+This fork adds companion tooling around the closed `agy` binary to run multiple Antigravity CLI sessions inside a single terminal window with shared RAM, real-time live mirroring, and cross-harness shared memory:
+
+- **`agy-dash` (`tools/agy-dash/`)**: Single-window `tmux` Command Center (`tmux -L agy-dash`) powered by a **Zig 0.16 (`ReleaseFast`) core** (`agy-fast-core`) + Python `curses` parser/UI:
+  - **Dual-pane Command Center**: Left session list + right clickable mouse/hotkey Command Center (`[r] Actualizar`, `[↵] Abrir/Ir`, `[v] Espejo Vivo`, `[R] Recargar Tab`, `[n] Nueva`, `[h/H] Hibernar 0MB`, `[x] Deduplicar`, `[m] Memoria`) + live bottom transcript preview (`<4 ms`).
+  - **Shared RAM & GC Capping**: Enables Linux 6.4+/7.0 KSM (`prctl(PR_SET_MEMORY_MERGE, 1)`) inherited across `execvp` + `GOGC=35 GOMEMLIMIT=180MiB`.
+  - **Real-Time `<3 MB` Live Mirror**: Streams external busy sessions (`transcript.jsonl` + active `task-*.log`) every `0.4 s` without spawning duplicate `agy` processes (`⚠ Conversation already open`).
+  - **Safe `0 MB` Auto-Hibernate**: Parks 100% idle sessions (`not_fully_idle=0` and no active children) to `0 MB RAM` with instant `<1 s` wake stubs.
+- **`agy-limited` (`tools/agy-dash/agy-limited`)**: Runs `agy` inside a `systemd --user` cgroup scope with CPU/memory caps + KSM + `GOMEMLIMIT`.
+- **`isymem` (`tools/isymem/agent_memory.py`)**: Shared Multi-Harness Memory System compatible with Claude Code's `MEMORY.md` across AGY, Codex, Qwen, OpenCode, and Claude Code (`recall`, `show`, `save`, `archive`, `doctor`, `setup`).
+
+### Quick Install
+
+```bash
+./install.sh
+agy-dash
+```

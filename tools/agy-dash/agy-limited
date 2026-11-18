@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# agy-limited — run Google Antigravity CLI (agy) inside a user cgroup scope with
+# Linux 7.0 KSM page-merging (PR_SET_MEMORY_MERGE), Go GC heap cap (GOGC/GOMEMLIMIT),
+# and single-window multi-session Dashboard support (`agy-dash`).
+# Does NOT modify the agy binary. Handoff: chat_sandbox msg_0055 (2026-10-28),
+# extended 2026-11-17 with KSM + GOMEMLIMIT + Single-Window Dashboard.
+#
+#   agy-limited [agy args...]        run agy capped + KSM + GOMEMLIMIT
+#   agy-limited --dashboard          open the single-window multi-session Dashboard (Codex/Grok style)
+#   agy-limited --hibernate-idle     hibernate all idle agy sessions (not_fully_idle=0) to 0 MB RAM
+#   agy-limited --status             list running agy scopes + session RAM table
+#   agy-limited --throttle <CPU%>    change CPUQuota of every running agy scope live
+#
+# Env overrides: AGY_CPU (default 200%), AGY_MEM_HIGH (default 4G),
+#                AGY_GOGC (default 35), AGY_GOMEMLIMIT (default 180MiB), AGY_BIN.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+DASH_PY="$SCRIPT_DIR/agy_dashboard.py"
+
+AGY_BIN="${AGY_BIN:-$HOME/.local/bin/agy}"
+AGY_CPU="${AGY_CPU:-200%}"
+AGY_MEM_HIGH="${AGY_MEM_HIGH:-4G}"
+export AGY_GOGC="${AGY_GOGC:-35}"
+export AGY_GOMEMLIMIT="${AGY_GOMEMLIMIT:-180MiB}"
+export GOGC="$AGY_GOGC"
+export GOMEMLIMIT="$AGY_GOMEMLIMIT"
+
+scopes() {
+  systemctl --user list-units --type=scope --state=running --no-legend --plain 'agy-*.scope' \
+    | awk '{print $1}'
+}
+
+case "${1:-}" in
+  --dashboard|dashboard)
+    shift
+    exec python3 "$DASH_PY" "$@"
+    ;;
+  --hibernate-idle|--hibernate)
+    shift
+    exec python3 "$DASH_PY" hibernate "${1:-all-idle}"
+    ;;
+  --status)
+    found=0
+    for u in $(scopes); do
+      found=1
+      systemctl --user show "$u" -p Id -p CPUQuotaPerSecUSec -p MemoryHigh -p MemoryCurrent -p CPUUsageNSec -p TasksCurrent
+      echo
+    done
+    [ "$found" = 1 ] || echo "no agy scope running"
+    echo
+    python3 "$DASH_PY" status
+    exit 0
+    ;;
+  --throttle)
+    [ -n "${2:-}" ] || { echo "usage: agy-limited --throttle <CPU%>  (e.g. 50%)" >&2; exit 2; }
+    found=0
+    for u in $(scopes); do
+      found=1
+      systemctl --user set-property --runtime "$u" CPUQuota="$2"
+      echo "$u CPUQuota=$2"
+    done
+    [ "$found" = 1 ] || { echo "no agy scope running" >&2; exit 1; }
+    exit 0
+    ;;
+esac
+
+[ -x "$AGY_BIN" ] || { echo "agy-limited: $AGY_BIN not found/executable" >&2; exit 127; }
+
+exec systemd-run --user --scope --quiet --collect \
+  --unit="agy-$$" \
+  -p CPUQuota="$AGY_CPU" \
+  -p MemoryHigh="$AGY_MEM_HIGH" \
+  -p CPUWeight=20 \
+  -p IOWeight=20 \
+  python3 "$DASH_PY" run -- "$@"
