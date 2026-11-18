@@ -29,6 +29,7 @@ KEYS_SHEET = [
         ("Alt+←  /  Alt+→", "pestaña anterior / siguiente"),
         ("Alt+N", "nueva sesión AGY"),
         ("Alt+H", "hibernar todas las sesiones idle (0 MB)"),
+        ("Alt+I", "pestaña ISyMCP (admin ISyMCP)"),
         ("Alt+C", "modo copia (q/Esc sale · Enter/y copia)"),
         ("clic en ×", "cerrar pestaña (si trabaja, va a agy-bg)"),
         ("clic medio en pestaña", "cerrar esa pestaña"),
@@ -361,6 +362,26 @@ def cmd_show_dash(args: argparse.Namespace) -> int:
                 _tmuxctl.tmux_cmd("last-window", "-t", _paths.TMUX_SESSION)
                 return 0
     _tmuxctl._select_dash_window()
+    return 0
+
+
+def cmd_isymcp_tab(args: argparse.Namespace) -> int:
+    """Create or select the ISyMCP admin tab (🔌ISyMCP) running `isymcp dash`."""
+    cp = _tmuxctl.tmux_cmd("list-windows", "-t", _paths.TMUX_SESSION, "-F", "#{window_index}|#{window_name}", capture=True)
+    if cp.returncode == 0 and cp.stdout:
+        for line in cp.stdout.splitlines():
+            parts = line.split("|", 1)
+            if len(parts) == 2 and "🔌ISyMCP" in parts[1]:
+                _tmuxctl.tmux_cmd("select-window", "-t", f"{_paths.TMUX_SESSION}:{parts[0].strip()}")
+                return 0
+    # bash -c (not sh: dash has no read -n/-s/-p): fallback message if `isymcp dash` is missing
+    cmd = "isymcp dash || { echo; echo \"isymcp dash no está disponible (actualiza ISyMCP).\"; read -n1 -s -r -p \"Pulsa una tecla para cerrar\"; }"
+    cp_new = _tmuxctl.tmux_cmd(
+        "new-window", "-d", "-P", "-F", "#{window_index}", "-t", _paths.TMUX_SESSION, "-n", "🔌ISyMCP", "bash", "-c", cmd, capture=True
+    )
+    if cp_new.returncode == 0 and cp_new.stdout.strip():
+        new_idx = cp_new.stdout.strip().splitlines()[-1]
+        _tmuxctl.tmux_cmd("select-window", "-t", f"{_paths.TMUX_SESSION}:{new_idx}")
     return 0
 
 
@@ -949,6 +970,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_sd = sub.add_parser("show-dash", help="Ensure ⚡DASH exists and switch focus to it (Alt+D / ⚡AGY DASH button)")
     p_sd.add_argument("--toggle", action="store_true", help="Return to previous tab when already viewing DASH")
     p_sd.set_defaults(fn=cmd_show_dash)
+
+    p_ism = sub.add_parser("isymcp-tab", help="Create or select the ISyMCP admin tab (🔌ISyMCP) running `isymcp dash`")
+    p_ism.set_defaults(fn=cmd_isymcp_tab)
 
     for cname in ("accounts", "account"):
         p_ac = sub.add_parser(cname, help="Manage multi-account Google Pro slots (list|add|use|remove)")

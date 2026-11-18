@@ -154,7 +154,7 @@ bind -n M-c set -p @passive_copy 0 \\; copy-mode
 
 # Red ⚡ AGY DASH button (top-left) toggles Command Center; × closes tabs keeping busy agents alive
 bind -T root MouseDown1StatusLeft run-shell {tmux_dquote(py_self + " show-dash --toggle")}
-bind -T root MouseDown1Status if -F '#{{m:x_*,#{{mouse_status_range}}}}' {{ run-shell {tmux_dquote(py_self + " close-tab #{s/x_//:#{mouse_status_range}}")} }} {{ if -F '#{{==:#{{mouse_status_range}},keys}}' {{ display-popup -E -w 96% -h 33 -T " ⌨ Atajos " {tmux_dquote(py_self + " keys")} }} {{ select-window -t = }} }}
+bind -T root MouseDown1Status if -F '#{{m:x_*,#{{mouse_status_range}}}}' {{ run-shell {tmux_dquote(py_self + " close-tab #{s/x_//:#{mouse_status_range}}")} }} {{ if -F '#{{==:#{{mouse_status_range}},keys}}' {{ display-popup -E -w 96% -h 33 -T " ⌨ Atajos " {tmux_dquote(py_self + " keys")} }} {{ if -F '#{{==:#{{mouse_status_range}},isymcp}}' {{ run-shell {tmux_dquote(py_self + " isymcp-tab")} }} {{ select-window -t = }} }} }}
 bind -T root MouseDown2Status run-shell {tmux_dquote(py_self + " close-tab #{window_index}")}
 
 # Top dashboard bar powered by Zig `agy-fast-core statusbar` (<7ms)
@@ -162,9 +162,9 @@ set -g status-position top
 set -g status-interval 1
 set -g status-style "bg=#14171f,fg=#d8dee9"
 set -g status-left-length 32
-set -g status-right-length 78
+set -g status-right-length 96
 set -g status-left "{dash_btn_fmt}"
-set -g status-right "#[fg=#414650]│ #[fg=#8be9fd]#({status_cmd}) #[fg=#414650]│ #[range=user|keys]#[fg=#282a36,bg=#f1fa8c,bold] ⌨ Atajos #[norange]#[default] "
+set -g status-right "#[fg=#414650]│ #[fg=#8be9fd]#({status_cmd}) #[fg=#414650]│ #[range=user|isymcp]#[fg=#282a36,bg=#b48ead,bold] 🔌 ISyMCP #[norange]#[default] #[fg=#414650]│ #[range=user|keys]#[fg=#282a36,bg=#f1fa8c,bold] ⌨ Atajos #[norange]#[default] "
 
 setw -g window-status-format "{win_fmt}"
 setw -g window-status-current-format "{win_cur_fmt}"
@@ -184,6 +184,7 @@ bind -n M-Left previous-window
 bind -n M-Right next-window
 bind -n M-n run-shell {tmux_dquote(py_self + " open-new-tab")}
 bind -n M-h run-shell {tmux_dquote(py_self + " hibernate all-idle")}
+bind -n M-i run-shell {tmux_dquote(py_self + " isymcp-tab")}
 """
     _paths.TMUX_CONF.write_text(conf, encoding="utf-8")
 
