@@ -497,7 +497,8 @@ class AgyDashboardTests(unittest.TestCase):
         self.assertIn("vault", ids)
         self.assertIn("vault_compact", ids)
         self.assertIn("compact", ids)
-        src = Path(ad.__file__).read_text(encoding="utf-8")
+        here = Path(ad.__file__).resolve().parent  # shim + agy_dash package (split 2026-11-18)
+        src = "".join(p.read_text(encoding="utf-8") for p in [here / "agy_dashboard.py", *sorted((here / "agy_dash").glob("*.py"))])
         self.assertNotIn("curses.REPORT_MOUSE_POSITION", src)
         self.assertIn("handoff.load", src)
 
