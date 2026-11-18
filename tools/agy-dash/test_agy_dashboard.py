@@ -497,7 +497,8 @@ class AgyDashboardTests(unittest.TestCase):
         self.assertIn("vault", ids)
         self.assertIn("vault_compact", ids)
         self.assertIn("compact", ids)
-        src = Path(ad.__file__).read_text(encoding="utf-8")
+        here = Path(ad.__file__).resolve().parent  # shim + agy_dash package (split 2026-11-18)
+        src = "".join(p.read_text(encoding="utf-8") for p in [here / "agy_dashboard.py", *sorted((here / "agy_dash").glob("*.py"))])
         self.assertNotIn("curses.REPORT_MOUSE_POSITION", src)
         self.assertIn("handoff.load", src)
 
@@ -508,12 +509,12 @@ class AgyDashboardTests(unittest.TestCase):
             hb_dir = root / "heartbeats"
 
             tfile.write_text(
-                '{"step_index":1,"type":"PLANNER_RESPONSE","input_tokens":1500,"cache_read_tokens":245000,"output_tokens":400,"model":"gemini-4-hydrogen-high"}\n',
+                '{"step_index":1,"type":"PLANNER_RESPONSE","input_tokens":1500,"cache_read_tokens":165000,"output_tokens":400,"model":"gemini-4-hydrogen-high"}\n',
                 encoding="utf-8",
             )
             m = ad.measure_session_context("cid-hb-1", transcript_path=tfile)
             self.assertEqual(m["source"], "transcript_usage")
-            self.assertEqual(m["used_tokens"], 246900)
+            self.assertEqual(m["used_tokens"], 166900)
             self.assertEqual(m["level"], "COMPACT_RECOMMENDED")
 
             # First heartbeat fires immediately
@@ -527,7 +528,7 @@ class AgyDashboardTests(unittest.TestCase):
             )
             self.assertTrue(hb1["should_notify"])
             self.assertIn("handoff.self_compact", hb1["notice"])
-            self.assertIn("246,900", hb1["notice"])
+            self.assertIn("166,900", hb1["notice"])
 
             # Within 5 minutes (at +120s) at same level -> suppressed (0 noise)
             hb2 = ad.evaluate_context_heartbeat(
@@ -610,6 +611,122 @@ class AgyDashboardTests(unittest.TestCase):
             # Enter confirms typed text
             res_ok = ad._prompt_curses_text(_FakeScr(["n", "v", "\n"]), "Key", "fallback")
             self.assertEqual(res_ok, "nv")
+
+
+class SafetyFixesTests(unittest.TestCase):
+    """Audit 2026-11-18: kills are verified, snapshots re-checked, purges rescue data, self is unambiguous."""
+
+    def _fake_agy(self, td: str):
+        import subprocess
+        script = Path(td) / "agy"
+        script.write_text("#!/bin/sh\nwhile :; do sleep 0.1; done\n")
+        script.chmod(0o755)
+        proc = subprocess.Popen([str(script)])
+        self.addCleanup(lambda: (proc.poll() is None and proc.kill(), proc.wait()))
+        for _ in range(50):
+            if ad._proc_is_agy(proc.pid):
+                break
+            time.sleep(0.02)
+        return proc
+
+    def test_terminate_verified_kills_the_same_agy_and_waits(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            proc = self._fake_agy(td)
+            info = ad.ProcMemInfo(pid=proc.pid, start_ticks=ad.proc_start_ticks(proc.pid))
+            ok, why = ad.terminate_verified(info, timeout_s=5)
+            self.assertTrue(ok, why)
+            self.assertIsNotNone(proc.wait(timeout=2))
+
+    def test_terminate_verified_refuses_recycled_pid_non_agy_and_self(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            proc = self._fake_agy(td)
+            stale = ad.ProcMemInfo(pid=proc.pid, start_ticks=ad.proc_start_ticks(proc.pid) + 1)
+            ok, why = ad.terminate_verified(stale)
+            self.assertFalse(ok)
+            self.assertIn("reutilizado", why)
+            self.assertIsNone(proc.poll(), "a recycled PID must never be signalled")
+        import subprocess
+        other = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(lambda: (other.kill(), other.wait()))
+        ok, why = ad.terminate_verified(ad.ProcMemInfo(pid=other.pid, start_ticks=ad.proc_start_ticks(other.pid)))
+        self.assertFalse(ok)
+        self.assertIn("no es agy", why)
+        import os
+        ok, _ = ad.terminate_verified(ad.ProcMemInfo(pid=os.getpid()))
+        self.assertFalse(ok)
+
+    def _sess(self, **kw) -> "ad.AgySession":
+        base = dict(conversation_id="c" * 36, title="T", preview="", step_count=1, last_modified="",
+                    workspace="/w", db_status="CASCADE_RUN_STATUS_IDLE", not_fully_idle=False,
+                    proc=ad.ProcMemInfo(pid=999999, in_dash=True))
+        base.update(kw)
+        return ad.AgySession(**base)
+
+    def test_hibernate_rechecks_fresh_state_before_killing(self) -> None:
+        stale_idle = self._sess()
+        now_busy = self._sess(db_status="CASCADE_RUN_STATUS_RUNNING")
+        with mock.patch.object(ad, "refresh_session", return_value=now_busy), \
+                mock.patch.object(ad, "terminate_verified") as kill:
+            ok, msg = ad.hibernate_session(stale_idle)
+        self.assertFalse(ok)
+        kill.assert_not_called()
+
+    def test_hibernate_does_not_register_when_a_process_survives(self) -> None:
+        s = self._sess()
+        with mock.patch.object(ad, "refresh_session", return_value=s), \
+                mock.patch.object(ad, "terminate_verified", return_value=(False, "sigue vivo")), \
+                mock.patch.object(ad, "save_hibernated_registry") as save:
+            ok, msg = ad.hibernate_session(s)
+        self.assertFalse(ok)
+        self.assertIn("sigue vivo", msg)
+        save.assert_not_called()
+
+    def test_dedup_leaves_busy_conversations_alone(self) -> None:
+        ext = ad.ProcMemInfo(pid=999998, in_dash=False)
+        busy = self._sess(extra_procs=[ext], transcript_busy=True)
+        with mock.patch.object(ad, "refresh_session", return_value=busy), \
+                mock.patch.object(ad, "terminate_verified") as kill:
+            self.assertEqual(ad.deduplicate_session_procs(busy), 0)
+        kill.assert_not_called()
+
+    def test_detect_caller_uses_own_pane_and_refuses_ambiguous_workspace(self) -> None:
+        a = self._sess(conversation_id="a" * 36, proc=ad.ProcMemInfo(pid=999997), workspace=str(Path.cwd()))
+        b = self._sess(conversation_id="b" * 36, proc=ad.ProcMemInfo(pid=999996), workspace=str(Path.cwd()))
+        env = {k: v for k, v in __import__("os").environ.items() if k not in ("AGY_CONVERSATION_ID", "TMUX", "TMUX_PANE")}
+        with mock.patch.dict("os.environ", env, clear=True):
+            self.assertIsNone(ad.detect_caller_conversation_id([a, b]))
+            self.assertEqual(ad.detect_caller_conversation_id([a]), a.conversation_id)
+        env.update(TMUX="/tmp/tmux-1/agy-dash,1,0", TMUX_PANE="%7")
+        with mock.patch.dict("os.environ", env, clear=True), mock.patch("subprocess.run") as run:
+            run.return_value = mock.Mock(returncode=0, stdout="b" * 36 + "\n")
+            self.assertEqual(ad.detect_caller_conversation_id([a, b]), "b" * 36)
+            self.assertIn("%7", run.call_args[0][0])
+
+    def test_remove_account_rescues_diverged_shared_db(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            accts = Path(td) / "accounts"
+            reg = accts / "registry.json"
+            data = Path(td) / "data"
+            data.mkdir()
+            ad.ensure_isolated_home("pro3", base_home=Path(td), agy_data_dir=data, accounts_dir=accts)
+            db = accts / "pro3" / "home" / ".gemini" / "antigravity-cli" / "conversation_summaries.db"
+            if db.is_symlink():
+                db.unlink()
+            db.write_bytes(b"real summaries")  # AGY rewrote the shared symlink as a real file
+            reg.write_text(json.dumps({"accounts": {"pro3": {"mode": "isolated", "email": "x@y"}},
+                                       "active_slot": "primary", "conv_accounts": {}}))
+            with mock.patch.object(ad, "_active_pids_for_slot", return_value=[]):
+                ok, msg = ad.remove_account_slot("pro3", confirmed=True, registry_path=reg,
+                                                 accounts_dir=accts, base_home=Path(td))
+            self.assertTrue(ok, msg)
+            rescued = list((accts / ".rescued").glob("pro3-*/.gemini/antigravity-cli/conversation_summaries.db"))
+            self.assertEqual(len(rescued), 1)
+            self.assertEqual(rescued[0].read_bytes(), b"real summaries")
+            self.assertIn("rescatados", msg)
+
+    def test_tui_has_no_undefined_spinner_name(self) -> None:
+        src = Path(ad.__file__).read_text()
+        self.assertNotIn("_LED_SPINNER_FRAMES", src)
 
 
 if __name__ == "__main__":
