@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import agy_dashboard as ad  # noqa: E402
@@ -477,8 +478,138 @@ class AgyDashboardTests(unittest.TestCase):
                 assert hfile is not None
                 self.assertTrue(hfile.is_file())
                 self.assertIn("Continuar sin gastar tokens", hfile.read_text(encoding="utf-8"))
+
+                # Vault listing, metadata parsing, lookup & cleanup
+                self.assertEqual(ad.get_vault_handoff("cid-heavy", handoffs_dir=handoffs_dir), hfile)
+                vault = ad.list_compacted_vault(handoffs_dir=handoffs_dir)
+                self.assertEqual(len(vault), 1)
+                self.assertEqual(vault[0]["title"], "Heavy Session")
+                self.assertEqual(vault[0]["conv_id"], "cid-heavy")
+                self.assertEqual(vault[0]["workspace"], str(root))
+                self.assertTrue(ad.delete_vault_handoff(hfile))
+                self.assertIsNone(ad.get_vault_handoff("cid-heavy", handoffs_dir=handoffs_dir))
             finally:
                 ad.BRAIN_DIR = orig_brain
+
+    def test_command_buttons_include_vault_and_no_hover_mousemask(self) -> None:
+        btns = ad.build_command_buttons(48)
+        ids = {b.action_id for b in btns}
+        self.assertIn("vault", ids)
+        self.assertIn("vault_compact", ids)
+        self.assertIn("compact", ids)
+        src = Path(ad.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("curses.REPORT_MOUSE_POSITION", src)
+        self.assertIn("handoff.load", src)
+
+    def test_context_heartbeat_5min_cooldown_and_ranges(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tfile = root / "transcript.jsonl"
+            hb_dir = root / "heartbeats"
+
+            tfile.write_text(
+                '{"step_index":1,"type":"PLANNER_RESPONSE","input_tokens":1500,"cache_read_tokens":245000,"output_tokens":400,"model":"gemini-4-hydrogen-high"}\n',
+                encoding="utf-8",
+            )
+            m = ad.measure_session_context("cid-hb-1", transcript_path=tfile)
+            self.assertEqual(m["source"], "transcript_usage")
+            self.assertEqual(m["used_tokens"], 246900)
+            self.assertEqual(m["level"], "COMPACT_RECOMMENDED")
+
+            # First heartbeat fires immediately
+            hb1 = ad.evaluate_context_heartbeat(
+                "cid-hb-1",
+                transcript_path=tfile,
+                cwd=str(root),
+                interval_sec=300,
+                now=1000.0,
+                heartbeats_dir=hb_dir,
+            )
+            self.assertTrue(hb1["should_notify"])
+            self.assertIn("handoff.self_compact", hb1["notice"])
+            self.assertIn("246,900", hb1["notice"])
+
+            # Within 5 minutes (at +120s) at same level -> suppressed (0 noise)
+            hb2 = ad.evaluate_context_heartbeat(
+                "cid-hb-1",
+                transcript_path=tfile,
+                cwd=str(root),
+                interval_sec=300,
+                now=1120.0,
+                heartbeats_dir=hb_dir,
+            )
+            self.assertFalse(hb2["should_notify"])
+
+            # After 5 minutes (+305s) -> fires again
+            hb3 = ad.evaluate_context_heartbeat(
+                "cid-hb-1",
+                transcript_path=tfile,
+                cwd=str(root),
+                interval_sec=300,
+                now=1305.0,
+                heartbeats_dir=hb_dir,
+            )
+            self.assertTrue(hb3["should_notify"])
+
+            # Escalation to COMPACT_URGENT fires even before 5m cooldown
+            tfile.write_text(
+                '{"step_index":2,"type":"PLANNER_RESPONSE","input_tokens":2000,"cache_read_tokens":360000,"output_tokens":500,"model":"gemini-4-hydrogen-high"}\n',
+                encoding="utf-8",
+            )
+            hb4 = ad.evaluate_context_heartbeat(
+                "cid-hb-1",
+                transcript_path=tfile,
+                cwd=str(root),
+                interval_sec=300,
+                now=1320.0,
+                heartbeats_dir=hb_dir,
+            )
+            self.assertTrue(hb4["should_notify"])
+            self.assertEqual(hb4["level"], "COMPACT_URGENT")
+
+    def test_prompt_curses_text_cancels_on_esc(self) -> None:
+        class _FakeScr:
+            def __init__(self, keys):
+                self._keys = list(keys)
+                self._nodelay = False
+
+            def getmaxyx(self):
+                return (30, 120)
+
+            def timeout(self, _ms):
+                pass
+
+            def nodelay(self, flag):
+                self._nodelay = flag
+
+            def move(self, _y, _x):
+                pass
+
+            def clrtoeol(self):
+                pass
+
+            def addstr(self, _y, _x, _s, _attr=0):
+                pass
+
+            def refresh(self):
+                pass
+
+            def get_wch(self):
+                return self._keys.pop(0)
+
+            def getch(self):
+                if self._nodelay:
+                    return -1
+                return self._keys.pop(0) if self._keys else -1
+
+        with mock.patch("curses.noecho"), mock.patch("curses.curs_set"), mock.patch("curses.color_pair", return_value=0):
+            # Esc cancels even if user typed partial text first
+            res_esc = ad._prompt_curses_text(_FakeScr(["a", "b", "\x1b"]), "Key", "fallback")
+            self.assertEqual(res_esc, "")
+
+            # Enter confirms typed text
+            res_ok = ad._prompt_curses_text(_FakeScr(["n", "v", "\n"]), "Key", "fallback")
+            self.assertEqual(res_ok, "nv")
 
 
 if __name__ == "__main__":
