@@ -1214,7 +1214,13 @@ def ensure_dash_window_zero() -> None:
         if len(parts) >= 2 and "DASH" in parts[1]:
             return
     tui_cmd = f"exec python3 {sh_quote(str(self_path))} tui"
-    tmux_cmd("new-window", "-d", "-b", "-t", f"{TMUX_SESSION}:0", "-n", "⚡DASH", tui_cmd)
+    cp_new = tmux_cmd(
+        "new-window", "-d", "-P", "-F", "#{window_index}", "-t", TMUX_SESSION, "-n", "⚡DASH", tui_cmd, capture=True
+    )
+    if cp_new.returncode == 0 and cp_new.stdout.strip():
+        new_idx = cp_new.stdout.strip().splitlines()[-1]
+        if new_idx != "0":
+            tmux_cmd("swap-window", "-d", "-s", f"{TMUX_SESSION}:{new_idx}", "-t", f"{TMUX_SESSION}:0")
 
 
 def _short_tab_title(title: str, prefix: str = "") -> str:
