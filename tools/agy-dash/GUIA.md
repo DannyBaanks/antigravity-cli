@@ -128,9 +128,19 @@ El panel `0:⚡DASH` muestra la lista de sesiones a la izquierda, la **Vista en 
 | `h` (`[h] 💤 Hibernar 0MB`) | `0:⚡DASH` | Hiberna la sesión `IDLE` seleccionada a `0 MB RAM` |
 | `H` / `a` / `Alt+H` (`[H] ⚡ Hibernar IDLE`) | Global / `0:⚡DASH` | Hiberna todas las sesiones `IDLE` y adopta sus pestañas `💤` |
 | `x` (`[x] 🧹 Deduplicar`) | `0:⚡DASH` | Cierra copias duplicadas inactivas fuera de `agy-dash` |
+| `B` (`[B] 🔀 Baton Pass`) | `0:⚡DASH` / `👁️ Espejo` | Pasa la estafeta de la conversación + mismo modelo a otra cuenta Pro sin hacer logout |
+| `u` (`[u] 💳 Cuentas`) | `0:⚡DASH` | Abre gestor de cuentas Pro, cuotas `/usage` (`+`: login aislado, `B`: baton, `R`: refrescar) |
+| `U` | `0:⚡DASH` | Refresca en segundo plano las cuotas (`/usage`) de todas las cuentas |
 | `m` (`[m] 🧠 Memoria Shared`) | `0:⚡DASH` | Alterna el visor de Memoria Compartida Multi-Harness (`MEMORY.md`) |
 | `Alt+0` / `Alt+D` | Cualquier pestaña | Volver al Command Center (`0:⚡DASH`) |
 | `Alt+1` .. `Alt+9` / `Alt+Left`/`Right` | Cualquier pestaña | Cambiar entre pestañas en la misma ventana |
+
+### Multi-Cuenta Google Pro, Alertas LED y Baton Pass sin Logout
+
+1. **`primary`** usa automáticamente tu sesión actual en el keyring del sistema (`agy-dash quota --refresh`).
+2. **Agregar 2ª+ cuenta Pro sin cerrar la actual:** pulsa `u` -> `+` en el dashboard (o corre `agy-dash account add pro2`). Abre una pestaña aislada (`DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent` + `HOME` aislado con symlinks a tus conversaciones/MCP) para completar OAuth una sola vez sin tocar `primary`.
+3. **Baton Pass (`[B]` o `agy-dash baton <conv> [--to <slot>]`):** cuando la alerta de cuota baja (`🚨 <=5%` / `⚠️ <=15%`) avise en el banner del dashboard, pulsa `B` para relanzar exactamente `--conversation <uuid> --model <modelo>` bajo la cuenta con mayor cuota restante.
+4. **Pestañas tipo letrero LED:** las pestañas en `RUNNING` / `BG-TASK` muestran un spinner Braille animándose a la izquierda (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`) junto con el título + la acción actual desplazándose estilo marquee (`Editing files...`, `Running cmd...`).
 
 ## Trampas
 

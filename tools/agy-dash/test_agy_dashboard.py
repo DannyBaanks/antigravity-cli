@@ -58,6 +58,8 @@ class AgyDashboardTests(unittest.TestCase):
     def test_command_button_hit_test_and_external_busy_guard(self) -> None:
         btns = ad.build_command_buttons(60)
         self.assertEqual(ad.hit_test_button(btns, 90, 5, 93, 5), "refresh")
+        self.assertTrue(any(b.action_id == "baton" for b in btns))
+        self.assertTrue(any(b.action_id == "accounts" for b in btns))
         self.assertIsNone(ad.hit_test_button(btns, 90, 5, 10, 5))
 
         busy_ext = ad.AgySession(
@@ -73,6 +75,107 @@ class AgyDashboardTests(unittest.TestCase):
         )
         self.assertTrue(busy_ext.external_busy)
         self.assertFalse(busy_ext.can_hibernate)
+
+    def test_isolated_home_shares_conversations_and_isolates_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            base_home = root / "real_home"
+            agy_data = base_home / ".gemini" / "antigravity-cli"
+            (agy_data / "conversations").mkdir(parents=True)
+            (agy_data / "brain").mkdir(parents=True)
+            (agy_data / "settings.json").write_text('{"model":"Gemini 4 Argon (Medium)"}', encoding="utf-8")
+            (base_home / ".gitconfig").write_text("[user]\n\tname = Test\n", encoding="utf-8")
+
+            slot_home = ad.ensure_isolated_home(
+                "pro2",
+                base_home=base_home,
+                agy_data_dir=agy_data,
+                accounts_dir=agy_data / "accounts",
+            )
+            self.assertTrue((slot_home / ".config" / "antigravity").is_dir())
+            self.assertFalse((slot_home / ".config" / "antigravity").is_symlink())
+            self.assertTrue((slot_home / ".gemini" / "antigravity-cli" / "conversations").is_symlink())
+            self.assertTrue((slot_home / ".gemini" / "antigravity-cli" / "settings.json").is_symlink())
+            self.assertTrue((slot_home / ".gitconfig").is_symlink())
+            self.assertEqual((slot_home.stat().st_mode & 0o777), 0o700)
+
+    def test_usage_parser_alert_and_baton_target_selection(self) -> None:
+        sample = json.dumps({
+            "status": "SUCCESS",
+            "command": {
+                "data": {
+                    "groups": [
+                        {
+                            "name": "Gemini Models",
+                            "buckets": [{"id": "gemini-5h", "name": "Five Hour", "window": "5h", "remaining_fraction": 0.65, "reset_time": "2026-11-18T09:00:00Z"}],
+                        },
+                        {
+                            "name": "Gemini 4 Argon",
+                            "buckets": [{"id": "gemini-argon-wtu-weekly", "name": "Argon Weekly", "window": "weekly", "remaining_fraction": 0.01, "reset_time": "2026-11-25T00:00:00Z"}],
+                        },
+                    ]
+                }
+            },
+        })
+        parsed = ad.parse_usage_output(sample)
+        self.assertTrue(parsed["ok"])
+        self.assertEqual(parsed["families"]["argon"], 1.0)
+        self.assertEqual(parsed["families"]["gemini"], 65.0)
+
+        reg = {
+            "active_slot": "primary",
+            "accounts": {
+                "primary": {"slot": "primary", "mode": "system", "email": "a@example.com", "authenticated": True, "quota": parsed},
+                "pro2": {
+                    "slot": "pro2",
+                    "mode": "isolated",
+                    "email": "b@example.com",
+                    "authenticated": True,
+                    "quota": {"ok": True, "families": {"argon": 92.0, "gemini": 88.0}, "min_pct": 88.0, "buckets": []},
+                },
+            },
+        }
+        alert = ad.compute_quota_alert(reg, active_slot="primary", model_name="Gemini 4 Argon (Medium)")
+        self.assertIsNotNone(alert)
+        self.assertEqual(alert["level"], "CRITICAL")
+        self.assertEqual(alert["target_slot"], "pro2")
+        self.assertEqual(ad.choose_baton_target(reg, "primary", "Gemini 4 Argon (Medium)"), "pro2")
+        self.assertEqual(ad.resolve_model_arg("Gemini 4 Argon (Medium)")[1], "gemini-4-argon-medium")
+
+    def test_led_tab_title_spinner_and_marquee(self) -> None:
+        sess = ad.AgySession(
+            conversation_id="cid-1",
+            title="Orquestacion Piton Wave",
+            preview="",
+            step_count=5,
+            last_modified="ahora",
+            workspace="/tmp",
+            db_status="CASCADE_RUN_STATUS_RUNNING",
+            not_fully_idle=False,
+            proc=ad.ProcMemInfo(pid=123, in_dash=True),
+            dash_win_idx="1",
+            dash_win_name="●Orquestacion",
+        )
+        t0 = ad.format_led_tab_title(sess, 0, "Editing files...", True, width=16)
+        t1 = ad.format_led_tab_title(sess, 1, "Editing files...", True, width=16)
+        self.assertTrue(t0.startswith("⠋"))
+        self.assertTrue(t1.startswith("⠙"))
+        self.assertNotEqual(t0, t1)
+
+        idle_sess = ad.AgySession(
+            conversation_id="cid-2",
+            title="Idle Session",
+            preview="",
+            step_count=2,
+            last_modified="ahora",
+            workspace="/tmp",
+            db_status="CASCADE_RUN_STATUS_IDLE",
+            not_fully_idle=False,
+            proc=ad.ProcMemInfo(pid=124, in_dash=True),
+            dash_win_idx="2",
+            dash_win_name="●Idle",
+        )
+        self.assertTrue(ad.format_led_tab_title(idle_sess, 3, "IDLE", False).startswith("●"))
 
 
 if __name__ == "__main__":
