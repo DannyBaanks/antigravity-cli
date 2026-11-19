@@ -50,7 +50,7 @@ from . import paths as _paths
 from . import procs as _procs
 from . import sessions as _sessions
 from . import tmuxctl as _tmuxctl
-from .termtext import clean, ellipsize, fit, put, tail, text_cols
+from .termtext import clean, ellipsize, first_fit, fit, put, tail, text_cols
 
 
 # ============================================================================
@@ -102,6 +102,7 @@ HEADER_ROWS = 6  # rows 0-5: header, RAM, quota, notice, title, column header; l
 FOOTER_ROWS = 3  # rule, banner, key footer
 RAM_BAR_FULL_MB = 2048  # the inspector's RAM bar is full at this PSS total
 CRASH_STREAK_RESET = 3  # this many failing frames in a row drop back to the sessions view
+ESC_SEQ_WAIT_MS = 40  # _prompt_curses_text: espera al 2º byte antes de leer Esc como "cancelar"
 DEFAULT_BANNER = "Listo · ↑/↓ elige una sesión · ? muestra todas las teclas"
 CRASH_LOG = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "agy-dash" / "tui-errors.log"
 CRASH_LOG_MAX_BYTES = 1 << 20  # past 1 MiB the log is rotated once to tui-errors.log.1
@@ -288,14 +289,14 @@ def _prompt_curses_text(stdscr, prompt: str, default_val: str = "", max_len: int
             except curses.error:
                 continue
             if key in ("\x1b", 27):
-                # Distinguish standalone Esc from terminal escape sequences (e.g. arrows)
-                stdscr.nodelay(True)
+                # Distinguish standalone Esc from terminal escape sequences (e.g. arrows): a slow
+                # terminal (ssh, tmux) can send `ESC [ A` with a gap, so wait briefly for byte 2.
+                stdscr.timeout(ESC_SEQ_WAIT_MS)
                 try:
                     nxt = stdscr.getch()
                 except Exception:
                     nxt = -1
                 finally:
-                    stdscr.nodelay(False)
                     stdscr.timeout(-1)
                 if nxt == -1:
                     cancelled = True
@@ -406,10 +407,14 @@ class Dashboard:
         self.footer_hits: list[tuple[int, int, int]] = []
         # Escaneo de procesos fallido: lo pone _adopt_scan_snapshot desde el resultado del scan.
         self.scan_failed = False
-        self.scan_error = ""  # excepción del último load_sessions, si falló
+        self.scan_error = ""  # causa del último escaneo fallido (excepción o SCAN_STATE["reason"])
         self.dup_notice = ""  # aviso permanente de sesiones abiertas varias veces
         self.compact_slots = threading.Semaphore(COMPACT_PARALLEL)
         self.forget_tab_names: set[str] = set()  # renombradas: el hilo LED olvida su nombre viejo
+        self.led_renames: list[tuple[str, str]] = []  # (cid, título) renombradas a mano en tmux
+        self.preview_lock = threading.Lock()
+        self.preview_busy = False
+        self.preview_result: tuple[str, tuple[int, int], list[dict]] | None = None
         self.crash_streak = 0
         self.last_crash_sig = ""
         self.io_cache: dict[str, tuple[tuple, Any]] = {}  # clave -> (firma mtime, valor)
@@ -457,14 +462,16 @@ class Dashboard:
         threading.Thread(target=self._led_work, args=(snap, tick_n), daemon=True).start()
 
     def _led_work(self, snap: list[_sessions.AgySession], tick_n: int) -> None:
-        """Trabaja sobre copias: el hilo principal nunca ve los dicts a medio mutar."""
+        """Trabaja sobre copias de los dicts y no toca las sesiones (son las de la UI): los
+        renombrados a mano que encuentra los aplica el hilo principal (_apply_led_renames)."""
         try:
             with self.led_lock:
                 names = {k: v for k, v in self.last_tab_names.items() if k not in self.forget_tab_names}
                 self.forget_tab_names.clear()
                 activity = dict(self.activity_cache)
-            _tmuxctl.sync_led_tmux_tabs(snap, tick_n, names, activity)
+            renames = _tmuxctl.sync_led_tmux_tabs(snap, tick_n, names, activity) or []
             with self.led_lock:
+                self.led_renames.extend(renames)
                 for k in self.forget_tab_names:  # renombrada mientras el hilo trabajaba
                     names.pop(k, None)
                 self.last_tab_names = names
@@ -474,6 +481,19 @@ class Dashboard:
         finally:
             with self.led_lock:
                 self.led_worker_busy["running"] = False
+
+    def _apply_led_renames(self) -> None:
+        """Hilo principal: persiste los títulos que el usuario puso con `Ctrl+B ,` y los aplica a
+        las sesiones actuales (un escaneo nuevo pudo reemplazar las que vio el hilo LED)."""
+        with self.led_lock:
+            renames, self.led_renames = self.led_renames, []
+        for cid, title in renames:
+            saved = _sessions.save_custom_title(cid, title)
+            for s in self.sessions:
+                if s.conversation_id == cid:
+                    s.title = saved
+        if renames:
+            self.force_scan = True
 
     def start_async_compaction(
         self,
@@ -725,16 +745,9 @@ class Dashboard:
         if action == "hib_all":
             # Solo hiberna (reversible: la pestaña queda con el stub de despertar). Cerrar copias
             # duplicadas mata procesos y es [x], con su propia confirmación.
-            freed = 0
-            count = 0
-            for s in self.sessions:
-                if s.can_hibernate:
-                    saved = (s.proc.pss_kb + s.proc.swap_kb) if s.proc else 0
-                    ok, _ = _sessions.hibernate_session(s)
-                    if ok:
-                        freed += saved
-                        count += 1
-                        _tmuxctl.open_session_in_dashboard_tab(s, switch_to=False, as_stub=True)
+            # Un solo escaneo fresco para todo el lote (no uno por sesión en el hilo de la UI).
+            count, freed, _ = _sessions.hibernate_all_idle(
+                self.sessions, lambda s: _tmuxctl.open_session_in_dashboard_tab(s, switch_to=False, as_stub=True))
             self.force_scan = True
             return (
                 f"Hibernadas {count} sesiones IDLE -> liberados {freed // 1024} MB."
@@ -775,7 +788,7 @@ class Dashboard:
         try:
             res = _sessions.load_sessions(limit=SCAN_SESSION_LIMIT)
             failed = _procs.scan_failed()
-            err = ""
+            reason = str(_procs.SCAN_STATE.get("reason") or "") if failed else ""
         except Exception as exc:  # noqa: BLE001 — sin esto el hilo muere y la UI muestra datos viejos como vivos
             with self.scan_lock:
                 self.scan_box["error"] = f"{type(exc).__name__}: {exc}"
@@ -783,7 +796,8 @@ class Dashboard:
                 self.scan_box["ver"] = self.scan_box.get("ver", 0) + 1
             return
         with self.scan_lock:
-            self.scan_box.update(data=res, failed=failed, error=err, ver=self.scan_box.get("ver", 0) + 1)
+            self.scan_box.update(data=res, failed=failed, reason=reason, error="",
+                                 ver=self.scan_box.get("ver", 0) + 1)
 
     def _start_scanner(self) -> None:
         self.scan_box = {"data": (0, dict(self.ksm), []), "failed": False, "error": "", "ver": 0}
@@ -834,13 +848,28 @@ class Dashboard:
                 keep_cur = self._cid_at(self.cursor) if self.mode == "sessions" else None
                 keep_saved = self._cid_at(self.saved_session_cursor)
                 self.scan_us, self.ksm, self.sessions = box["data"]
+                self._prune_caches()
                 if keep_cur is not None:
                     self.cursor = self._index_of(keep_cur, self.cursor)
                 if keep_saved is not None:
                     self.saved_session_cursor = self._index_of(keep_saved, self.saved_session_cursor)
             # Del mismo escaneo que los datos (lo calcula zig_scan en el hilo del escáner).
             self.scan_failed = bool(box.get("failed", False))
+            self.scan_error = str(box.get("reason") or "") if self.scan_failed else ""
             self.last_refresh_clock = time.strftime("%H:%M:%S")
+
+    def _prune_caches(self) -> None:
+        """Las cachés por conversación solo guardan las que el último escaneo aún lista: un dash
+        abierto días no acumula entradas de conversaciones que ya no se ven."""
+        keep = {s.conversation_id for s in self.sessions}
+        for cid in [c for c in self.ctx_cache if c not in keep]:
+            del self.ctx_cache[cid]
+        with self.led_lock:
+            for cid in [c for c in self.activity_cache if c not in keep]:
+                del self.activity_cache[cid]
+        busy = _sessions._TRANSCRIPT_BUSY_CACHE
+        for cid in [c for c in list(busy) if c not in keep]:
+            busy.pop(cid, None)
 
     def _cid_at(self, idx: int) -> str | None:
         return self.sessions[idx].conversation_id if 0 <= idx < len(self.sessions) else None
@@ -869,16 +898,20 @@ class Dashboard:
             self.dup_notice = ""
         if self.scan_failed:
             return  # sin estado de procesos fiable no se auto-hiberna nada
+        due: list[_sessions.AgySession] = []
         for s in self.sessions:
             if s.can_hibernate and s.proc is not None and s.dash_win_idx is not None:
                 active_idle_ids.add(s.conversation_id)
                 first_t = self.idle_seen_since.setdefault(s.conversation_id, now)
                 if _paths.DEFAULT_IDLE_HIBERNATE_SEC > 0 and (now - first_t) >= _paths.DEFAULT_IDLE_HIBERNATE_SEC:
-                    ok, msg = _sessions.hibernate_session(s)
-                    if ok:
-                        _tmuxctl._replace_tmux_pane_with_wake_stub(s)
-                        self.status_banner = f"Auto-Hibernate: {msg}"
-                        self.idle_seen_since.pop(s.conversation_id, None)
+                    due.append(s)
+        if due:
+            # Un solo escaneo fresco para todas las vencidas (hibernate_batch re-verifica cada una).
+            _, _, results = _sessions.hibernate_batch(due, _tmuxctl._replace_tmux_pane_with_wake_stub)
+            for s, (ok, msg) in zip(due, results):
+                if ok:
+                    self.status_banner = f"Auto-Hibernate: {msg}"
+                    self.idle_seen_since.pop(s.conversation_id, None)
         for cid in list(self.idle_seen_since.keys()):
             if cid not in active_idle_ids:
                 del self.idle_seen_since[cid]
@@ -887,6 +920,7 @@ class Dashboard:
         self.trigger_quota_poll(force=False)
         self._process_compact_results()
         self._adopt_scan_snapshot()
+        self._apply_led_renames()
         if (now - self.last_led_ts) >= _paths.LED_TICK_SEC:
             self.last_led_ts = now
             self.led_tick += 1
@@ -909,7 +943,10 @@ class Dashboard:
     def _tick(self) -> None:
         now = time.time()
         self.frame_now = now
-        self._advance_background(now)
+        try:
+            self._advance_background(now)
+        except Exception as exc:  # noqa: BLE001 — un fallo de fondo no cierra la confirmación abierta
+            self._report_crash(exc, clear_confirm=False)
         # Un dibujo que falla no debe impedir leer teclas: si no, q/Esc/V nunca llegan y la vista
         # rota no se puede abandonar. Tras CRASH_STREAK_RESET fallos seguidos se vuelve a sesiones.
         try:
@@ -930,17 +967,19 @@ class Dashboard:
                 return
         self.handle_key(ch)
 
-    def _report_crash(self, exc: Exception) -> None:
+    def _report_crash(self, exc: Exception, *, clear_confirm: bool = True) -> None:
         """Un frame o una tecla que fallan no matan el dashboard: se anota en CRASH_LOG (una vez por
         traceback distinto: un fallo en cada frame no hace crecer el log 4 veces por segundo) y en
-        el banner. Una confirmación a medias se descarta para no dejar la vista atascada en ella."""
+        el banner. Si falló el dibujo o una tecla, la confirmación a medias se descarta para no dejar
+        la vista atascada en ella; un fallo del trabajo de fondo (`clear_confirm=False`) la deja."""
         tb = traceback.format_exc()
         if tb != self.last_crash_sig:
             self.last_crash_sig = tb
             self._log_error(tb)
         self.status_banner = f"⚠ error interno ({type(exc).__name__}: {exc}) — detalle en {CRASH_LOG}"
-        self.show_help = False
-        self._clear_pending()
+        if clear_confirm:
+            self.show_help = False
+            self._clear_pending()
         time.sleep(0.25)  # si el fallo se repite en cada frame, no quemar CPU
 
     @staticmethod
@@ -956,6 +995,9 @@ class Dashboard:
 
     # ---- Confirmaciones: un único self.confirm (ver Confirm y CONFIRM_SPECS) ----
     def _ask(self, kind: str, payload: Any, banner: str) -> None:
+        # "pending_blocked" es solo una vista de teclas (un pending_delete con blocked_reason).
+        if kind not in CONFIRM_SPECS:
+            raise ValueError(f"_ask: {kind!r} no es una confirmación (CONFIRM_SPECS)")
         mode, any_key, cancel_msg = CONFIRM_SPECS[kind]
         self.confirm = Confirm(kind, mode, payload, any_key, cancel_msg)
         self.status_banner = banner
@@ -1081,7 +1123,7 @@ class Dashboard:
     # mata el proceso y la reabre en otra cuenta). El espejo (solo lectura) y compactar (lee el
     # transcript) siguen permitidos; una compactación que termina no abre pestaña. `new` y `+`
     # (login) no tocan ninguna conversación existente. Borrar un perfil y el Baton Pass de la
-    # vista de cuentas se bloquean en _handle_account_key.
+    # vista de cuentas se bloquean en _k_acct_delete_yes y _k_acct_baton.
     SCAN_BLOCKED_ACTIONS = ("open", "open_full", "open_vault", "reload", "hibernate", "hib_all", "dedup",
                             "baton")
     KEY_CODES = {"↵": 10, "Esc": 27, "Tab": 9}  # código que manda un clic en esa tecla del pie
@@ -1136,7 +1178,8 @@ class Dashboard:
             ("↵", "abrir (una sesión pesada ofrece compactarla antes)"),
             ("c / C", "compactar y abrir · compactar solo al Baúl (2º plano)"),
             ("V", "ver el Baúl de handoffs compactados"),
-            ("h / H / a", "hibernar · hibernar todas las IDLE (sin cerrar copias)"),
+            ("h", "hibernar la sesión seleccionada"),
+            ("H / a", "hibernar TODAS las IDLE (sin cerrar copias)"),
             ("x", "cerrar copias duplicadas inactivas (pide x otra vez)"),
             ("v / R", "espejo vivo · recargar la pestaña"),
             ("n / t", "nueva sesión · renombrar"),
@@ -1223,11 +1266,11 @@ class Dashboard:
                 text += seg
                 x += text_cols(seg)
             built.append((text, hits))
-        for text, hits in built:
-            if text_cols(text) <= cols:
+        text = first_fit([t for t, _ in built], cols)
+        for t, hits in built:
+            if t == text:
                 return text, hits
-        text, hits = built[-1]
-        return fit(text, cols), [h for h in hits if h[1] < cols]
+        return text, [h for h in built[-1][1] if h[1] < cols]
 
     def _draw_header(self) -> None:
         self._put(
@@ -1425,12 +1468,36 @@ class Dashboard:
             if py + 1 + mi < self.max_y - 3:
                 self._put(py + 1 + mi, 0, ml, ma)
 
+    def _refresh_preview(self, cid: str, sig: tuple[int, int], max_turns: int) -> None:
+        """La cola del transcript se lee en un hilo (lanza agy-fast-core y parsea hasta 128 KB):
+        el frame usa lo último que llegó y nunca espera. Un resultado de otra conversación no se
+        muestra; uno viejo de la misma sí, hasta que llegue el nuevo."""
+        with self.preview_lock:
+            res, self.preview_result = self.preview_result, None
+            busy = self.preview_busy
+        if res is not None and res[0] == cid:
+            self.cached_preview_cid, self.cached_preview_sig, self.cached_turns = res
+        elif cid != self.cached_preview_cid:
+            self.cached_preview_cid, self.cached_preview_sig, self.cached_turns = cid, (-1, -1), []
+        if busy or sig == self.cached_preview_sig:
+            return
+        with self.preview_lock:
+            self.preview_busy = True
+
+        def _work() -> None:
+            turns: list[dict] = []
+            try:
+                turns = _sessions.zig_tail_transcript(cid, max_turns=max_turns)
+            except Exception as exc:  # noqa: BLE001 — un traceback en stderr rompería la pantalla curses
+                self._log_error(f"preview: {type(exc).__name__}: {exc}")
+            with self.preview_lock:
+                self.preview_result = (cid, sig, turns)
+                self.preview_busy = False
+        threading.Thread(target=_work, daemon=True).start()
+
     def _draw_live_preview(self, sel: _sessions.AgySession, py: int, now: float) -> None:
         cur_sig = _sessions.transcript_sig(sel.conversation_id)
-        if sel.conversation_id != self.cached_preview_cid or cur_sig != self.cached_preview_sig:
-            self.cached_preview_cid = sel.conversation_id
-            self.cached_preview_sig = cur_sig
-            self.cached_turns = _sessions.zig_tail_transcript(sel.conversation_id, max_turns=self.preview_height - 2)
+        self._refresh_preview(sel.conversation_id, cur_sig, max(1, self.preview_height - 2))
         age_s = int(max(0, now - (cur_sig[0] / 1e9))) if cur_sig[0] else -1
         age_lbl = f"hace {age_s}s" if age_s >= 0 else "sin log"
         phdr = (

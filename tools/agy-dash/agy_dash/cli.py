@@ -234,19 +234,13 @@ def cmd_hibernate(args: argparse.Namespace) -> int:
         for s in sessions:
             dedup_kb += _sessions.deduplicate_session_procs(s)
             dedup_kb += _sessions.close_stale_dash_duplicates(s)
-        candidates = [s for s in sessions if s.can_hibernate]
-        if not candidates and dedup_kb == 0:
+        if not any(s.can_hibernate for s in sessions) and dedup_kb == 0:
             print("No hay sesiones AGY ociosas (IDLE con not_fully_idle=0) fuera de la sesión actual.")
             return 0
-        total_freed = dedup_kb
-        for s in candidates:
-            saved = (s.proc.pss_kb + s.proc.swap_kb) if s.proc else 0
-            ok, msg = _sessions.hibernate_session(s)
+        _, freed_kb, results = _sessions.hibernate_all_idle(sessions, _tmuxctl._replace_tmux_pane_with_wake_stub)
+        for ok, msg in results:
             print(("  [OK] " if ok else "  [--] ") + msg)
-            if ok:
-                total_freed += saved
-                _tmuxctl._replace_tmux_pane_with_wake_stub(s)
-        print(f"Total liberado: {total_freed // 1024} MB RAM.")
+        print(f"Total liberado: {(dedup_kb + freed_kb) // 1024} MB RAM.")
         return 0
 
     for s in sessions:

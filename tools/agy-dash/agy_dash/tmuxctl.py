@@ -1,6 +1,7 @@
 """agy_dash.tmuxctl — split verbatim from agy_dashboard.py @ f255869 (Phase 1, no behaviour change)."""
 from __future__ import annotations
 
+import copy as _copy
 import re
 import shutil
 import subprocess
@@ -203,21 +204,22 @@ def passive_copy_bindings(copy_exit_action: str) -> str:
     return "\n".join(lines)
 
 
-def tmux_cmd(*args: str, capture: bool = False) -> subprocess.CompletedProcess:
-    if capture:
-        return subprocess.run(
-            ["tmux", "-L", _paths.TMUX_SOCKET, "-f", str(_paths.TMUX_CONF), *args],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-        )
-    return subprocess.run(
-        ["tmux", "-L", _paths.TMUX_SOCKET, "-f", str(_paths.TMUX_CONF), *args],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        text=True,
-    )
+# A hung tmux server must not hang the scanner thread: a stuck scan would keep showing the last
+# session list as live with scan_failed False. load_sessions turns a timeout into a failed scan.
+TMUX_TIMEOUT_SEC = 2.0
+TMUX_STATE: dict[str, int] = {"timeouts": 0}
+
+
+def tmux_cmd(*args: str, capture: bool = False, timeout: float | None = TMUX_TIMEOUT_SEC) -> subprocess.CompletedProcess:
+    """Run tmux on the agy-dash socket. `timeout=None` only for calls that block on purpose
+    (display-popup). On timeout returns rc 124 and counts it in TMUX_STATE["timeouts"]."""
+    argv = ["tmux", "-L", _paths.TMUX_SOCKET, "-f", str(_paths.TMUX_CONF), *args]
+    out = subprocess.PIPE if capture else subprocess.DEVNULL
+    try:
+        return subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=out, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        TMUX_STATE["timeouts"] += 1
+        return subprocess.CompletedProcess(argv, 124, "", f"tmux no respondió en {timeout:g} s")
 
 
 def ensure_dash_window_zero() -> None:
@@ -537,32 +539,40 @@ def sync_led_tmux_tabs(
     tick_idx: int,
     last_tab_names: dict[str, str],
     activity_cache: dict[str, tuple[tuple[int, int], str]],
-) -> None:
-    """Update open tmux tab names with animated spinner + LED action marquee, respecting user rename-window."""
+) -> list[tuple[str, str]]:
+    """Update open tmux tab names with animated spinner + LED action marquee, respecting user rename-window.
+
+    Runs on the LED thread: it never mutates the sessions it gets (they are the UI's objects) nor
+    writes titles to disk. A tab the user renamed by hand (`Ctrl+B ,`) is returned as
+    (conversation_id, title); the caller persists it and updates its sessions on its own thread."""
     cmds: list[str] = []
+    renames: list[tuple[str, str]] = []
     for s in sessions:
         if s.dash_win_idx is None:
             continue
         if s.dash_win_name.startswith("🔑"):
             continue
         prev = last_tab_names.get(s.dash_win_idx)
-        # If the user manually renamed the window in tmux (`Ctrl+B ,`), adopt and persist their custom title!
+        view = s
         if (
             prev is not None
             and s.dash_win_name
             and s.dash_win_name != prev
             and not _is_led_generated_name(s.dash_win_name)
         ):
-            _sessions.save_custom_title(s.conversation_id, s.dash_win_name)
-            s.title = s.dash_win_name.strip()
+            title = s.dash_win_name.strip()
+            renames.append((s.conversation_id, title))
+            view = _copy.copy(s)  # this tick's label already shows the new title
+            view.title = title
 
-        busy, act_txt = session_live_activity(s, activity_cache)
-        new_name = format_led_tab_title(s, tick_idx, act_txt, busy)
+        busy, act_txt = session_live_activity(view, activity_cache)
+        new_name = format_led_tab_title(view, tick_idx, act_txt, busy)
         if prev != new_name:
             last_tab_names[s.dash_win_idx] = new_name
             cmds.extend(["rename-window", "-t", f"{_paths.TMUX_SESSION}:{s.dash_win_idx}", new_name, ";"])
     if cmds:
         tmux_cmd(*cmds[:-1])
+    return renames
 
 
 def _ensure_bg_session() -> None:

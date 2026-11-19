@@ -10,6 +10,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.parse
+from collections.abc import Callable
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -366,9 +367,13 @@ def _all_summaries_dbs() -> list[Path]:
 
 def load_sessions(limit: int = 40) -> tuple[int, dict[str, int], list[AgySession]]:
     scan_us, ksm_stats, live_by_conv = _procs.zig_scan()
+    tmux_timeouts = _tmuxctl.TMUX_STATE["timeouts"]
     win_map = _tmuxctl._get_dash_window_map()
     tty_map = _tmuxctl._get_dash_tty_map()
     bg_map = _tmuxctl._get_bg_window_map()
+    if _tmuxctl.TMUX_STATE["timeouts"] != tmux_timeouts:
+        # Without the tab maps a session in a tab looks "not open": as unreliable as a failed /proc scan.
+        _procs._mark_scan(True, f"tmux no respondió en {_tmuxctl.TMUX_TIMEOUT_SEC:g} s")
     hib_reg = load_hibernated_registry()
     custom_titles = load_custom_titles()
 
@@ -573,6 +578,44 @@ def hibernate_session(session: AgySession, *, fresh: bool = True) -> tuple[bool,
         f"Hibernada '{session.title}' ({session.conversation_id[:8]}) -> "
         f"liberados {saved_pss // 1024} MB RAM (ahora 0 MB)"
     )
+
+
+def hibernate_batch(
+    candidates: list[AgySession],
+    on_ok: Callable[[AgySession], object] | None = None,
+) -> tuple[int, int, list[tuple[bool, str]]]:
+    """Hibernate several sessions with ONE fresh scan for the whole batch (not one full scan per
+    session). Each candidate is re-checked against that scan; the freed KB come from the fresh
+    objects, not from the caller's snapshot. Returns (count, freed_kb, [(ok, msg), ...]).
+    `on_ok(fresh_session)` runs after each success (the caller swaps the tab for a wake stub)."""
+    if not candidates:
+        return 0, 0, []
+    _, _, sessions = load_sessions(limit=200)
+    fresh_by_cid = {s.conversation_id: s for s in sessions}
+    count = freed_kb = 0
+    results: list[tuple[bool, str]] = []
+    for cand in candidates:
+        cur = fresh_by_cid.get(cand.conversation_id)
+        if cur is None or cur.proc is None:
+            results.append((False, f"La sesión {cand.conversation_id[:8]} ya no está en RAM."))
+            continue
+        saved = sum(p.pss_kb + p.swap_kb for p in [cur.proc, *cur.extra_procs])
+        ok, msg = hibernate_session(cur, fresh=False)
+        results.append((ok, msg))
+        if ok:
+            count += 1
+            freed_kb += saved
+            if on_ok is not None:
+                on_ok(cur)
+    return count, freed_kb, results
+
+
+def hibernate_all_idle(
+    sessions: list[AgySession],
+    on_ok: Callable[[AgySession], object] | None = None,
+) -> tuple[int, int, list[tuple[bool, str]]]:
+    """Hibernate every session the snapshot shows as hibernatable (TUI [H] and `hibernate all-idle`)."""
+    return hibernate_batch([s for s in sessions if s.can_hibernate], on_ok)
 
 
 def _dup_kill_ok(session: AgySession) -> bool:
