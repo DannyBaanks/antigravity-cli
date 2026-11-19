@@ -15,8 +15,10 @@ from . import accounts as _accounts
 from . import cli as _cli
 from . import compact as _compact
 from . import paths as _paths
+from . import procs as _procs
 from . import sessions as _sessions
 from . import tmuxctl as _tmuxctl
+from .termtext import clean, fit, put, tail, text_cols
 
 
 # ============================================================================
@@ -34,26 +36,26 @@ class CommandButton:
 
 
 def build_command_buttons(panel_w: int) -> list[CommandButton]:
-    """Layout clickable Command Center buttons inside the right-hand panel."""
+    """Botones de clic del panel derecho: solo las acciones de uso frecuente, en 2 columnas.
+    El resto de acciones sigue funcionando por tecla y aparece en el pie y en la ayuda (?).
+    refresh, baton, accounts, vault, vault_compact, compact y ranking se mantienen porque los
+    tests de agy-dash (test_agy_dashboard, test_model_board) fijan esos ids y su posición."""
     half = max(18, (panel_w - 4) // 2)
+    grid = [
+        ("refresh", "r", "[r] 🔄 Actualizar"),
+        ("open", "↵", "[↵] 🚀 Abrir"),
+        ("mirror", "v", "[v] 👁 Espejo"),
+        ("compact", "c", "[c] 🗜 Compactar+Ir"),
+        ("accounts", "u", "[u] 💳 Cuentas"),
+        ("baton", "B", "[B] 🔀 Baton Pass"),
+        ("vault", "V", "[V] 🗄️ Baúl"),
+        ("vault_compact", "C", "[C] 📦 Guardar Baúl"),
+        ("hibernate", "h", "[h] 💤 Hibernar"),
+        ("ranking", "M", "[M] 🏆 Ranking"),
+    ]
     return [
-        CommandButton("refresh", "r", "[r] 🔄 Actualizar", 0, 2, half),
-        CommandButton("open", "↵", "[↵] 🚀 Abrir / Ir", 0, 2 + half + 1, half),
-        CommandButton("mirror", "v", "[v] 👁 Espejo Vivo", 1, 2, half),
-        CommandButton("reload", "R", "[R] ♻ Recargar Tab", 1, 2 + half + 1, half),
-        CommandButton("new", "n", "[n] ➕ Nueva Sesión", 2, 2, half),
-        CommandButton("hibernate", "h", "[h] 💤 Hibernar 0MB", 2, 2 + half + 1, half),
-        CommandButton("hib_all", "H", "[H] ⚡ Hibernar IDLE", 3, 2, half),
-        CommandButton("dedup", "x", "[x] 🧹 Deduplicar", 3, 2 + half + 1, half),
-        CommandButton("baton", "B", "[B] 🔀 Baton Pass", 4, 2, half),
-        CommandButton("accounts", "u", "[u] 💳 Cuentas", 4, 2 + half + 1, half),
-        CommandButton("compact", "c", "[c] 🗜 Compactar+Ir", 5, 2, half),
-        CommandButton("rename", "t", "[t] ✏️ Renombrar", 5, 2 + half + 1, half),
-        CommandButton("vault_compact", "C", "[C] 📦 Guardar Baúl", 6, 2, half),
-        CommandButton("vault", "V", "[V] 🗄️ Abrir Baúl", 6, 2 + half + 1, half),
-        CommandButton("nvapi_key", "K", "[K] 🔑 Key NVIDIA", 7, 2, half),
-        CommandButton("memory", "m", "[m] 🧠 Memoria", 7, 2 + half + 1, half),
-        CommandButton("ranking", "M", "[M] 🏆 Ranking Modelos", 8, 2, half),
+        CommandButton(aid, key, label, i // 2, 2 + (i % 2) * (half + 1), half)
+        for i, (aid, key, label) in enumerate(grid)
     ]
 
 
@@ -116,8 +118,8 @@ def _prompt_curses_text(stdscr, prompt: str, default_val: str = "", max_len: int
         while True:
             stdscr.move(max_y - 2, 0)
             stdscr.clrtoeol()
-            shown = (msg + "".join(buf))[-(max_x - 2) :]
-            stdscr.addstr(max_y - 2, 0, shown, curses.color_pair(4) | curses.A_BOLD)
+            shown = tail(clean(msg + "".join(buf)), max_x - 2)
+            put(stdscr, max_y - 2, 0, shown, max_x - 2, curses.color_pair(4) | curses.A_BOLD)
             stdscr.refresh()
             try:
                 key = stdscr.get_wch()
@@ -180,7 +182,7 @@ class Dashboard:
         self.cursor = 0
         self.saved_session_cursor = 0
         self.mode = "sessions"
-        self.status_banner = "Listo — [Enter] Abrir (o Compactar NV) | [c] Compactar NV | [t] Renombrar | [B] Baton Pass | [u] Cuentas"
+        self.status_banner = "Listo · ↑/↓ elige una sesión · ? muestra todas las teclas"
         self.last_auto_check = time.time()
         self.idle_seen_since: dict[str, float] = {}
         self.cached_preview_cid = ""
@@ -240,6 +242,10 @@ class Dashboard:
         self.vault_entries: list[dict] = []
         self.mem_lines: list[str] = []
         self.frame_now = 0.0
+        self.show_help = False
+        self.footer_hits: list[tuple[int, int, int]] = []
+        # Escaneo de procesos fallido: lo pone _adopt_scan_snapshot desde el resultado del scan.
+        self.scan_failed = False
 
     def _configure_curses(self) -> None:
         curses.curs_set(0)
@@ -324,7 +330,7 @@ class Dashboard:
             args=(target_sess, cid, open_when_done),
             daemon=True,
         ).start()
-        dest = "y abrirá pestaña al terminar" if open_when_done else "al Baúl NV (sin abrir pestaña)"
+        dest = "y abrirá pestaña al terminar" if open_when_done else "al Baúl (sin abrir pestaña)"
         return f"⏳ Compactando '{target_sess.title[:26]}' en 2º plano ({dest}) — el dashboard sigue libre."
 
     def _compact_worker(
@@ -382,7 +388,9 @@ class Dashboard:
             return (0, 0, 0)
 
     def execute_action(self, action: str) -> str:
-        if action in ("refresh", "refresh_quota", "memory", "accounts", "vault", "nvapi_key", "ranking"):
+        if self.scan_failed and action in self.SCAN_BLOCKED_ACTIONS:
+            return "⚠ Escaneo de procesos falló: abrir/hibernar bloqueados hasta el próximo escaneo."
+        if action in ("refresh","refresh_quota", "memory", "accounts", "vault", "nvapi_key", "ranking"):
             return self._execute_global_action(action)
         sel = self.sessions[self.saved_session_cursor if self.mode != "sessions" else self.cursor] if self.sessions else None
         if action == "baton" and sel:
@@ -414,7 +422,7 @@ class Dashboard:
                 self.saved_session_cursor = self.cursor
                 self.mode = "memory"
                 self.cursor = 0
-                return "Vista: Memoria Compartida Multi-Harness (isymem)"
+                return "Vista: Memoria compartida (isymem)"
             self.mode = "sessions"
             self.cursor = self.saved_session_cursor
             return "Vista: Command Center AGY"
@@ -424,7 +432,7 @@ class Dashboard:
                 self.mode = "accounts"
                 self.cursor = 0
                 self.trigger_quota_poll(force=False)
-                return "Vista: Cuentas Google Pro, Cuotas (/usage) y Baton Pass"
+                return "Vista: Cuentas y cuotas"
             self.mode = "sessions"
             self.cursor = self.saved_session_cursor
             return "Vista: Command Center AGY"
@@ -434,7 +442,7 @@ class Dashboard:
                     self.saved_session_cursor = self.cursor
                 self.mode = "vault"
                 self.cursor = 0
-                return "Vista: Baúl de Handoffs Compactados (NVIDIA NIM)"
+                return "Vista: Baúl de handoffs compactados"
             self.mode = "sessions"
             self.cursor = self.saved_session_cursor
             return "Vista: Command Center AGY"
@@ -571,7 +579,7 @@ class Dashboard:
                     open_msg = _compact.open_compacted_session_in_tab(c_sess, c_hfile, switch_to=True)
                     self.status_banner = f"{c_msg} · {open_msg}"
                 else:
-                    self.status_banner = f"✅ Guardado en Baúl NV: '{c_sess.title[:26]}' — {c_msg} (pulsa [V] para abrir)"
+                    self.status_banner = f"✅ Guardado en el Baúl: '{c_sess.title[:26]}' — {c_msg} (V abre el Baúl)"
                 self.force_scan = True
             else:
                 self.status_banner = f"❌ {c_msg}"
@@ -585,6 +593,7 @@ class Dashboard:
         if snap_ver != self.seen_scan_ver:
             self.seen_scan_ver = snap_ver
             self.scan_us, self.ksm, self.sessions = snap
+            self.scan_failed = _procs.scan_failed()  # set by zig_scan on the scan thread
             self.last_refresh_clock = time.strftime("%H:%M:%S")
 
     def _periodic_idle_check(self, now: float) -> None:
@@ -659,17 +668,155 @@ class Dashboard:
         self.total_ksm_mb = sum(p.ksm_kb for p in self.all_procs) // 1024
         self.hib_saved_mb = sum(s.hibernated_saved_kb for s in self.hib) // 1024
 
+    # ---- Pintado: todo pasa por _put/_rule (columnas de terminal, nunca la última celda) ----
+    SCAN_FAILED_MSG = "⚠ escaneo de procesos falló — estados no fiables; abrir/hibernar bloqueados"
+    SCAN_BLOCKED_ACTIONS = ("open", "open_full", "hibernate", "hib_all", "dedup")
+    KEY_CODES = {"↵": 10, "Esc": 27}
+
+    # Pie de teclas por vista. Cada variante va de la más completa a la más corta; se usa la
+    # primera que cabe en el ancho. Siempre empieza por la tecla que sale o cierra la vista.
+    # Cada segmento es (tecla, etiqueta); las teclas se pueden pulsar con el ratón.
+    FOOTER_VARIANTS: dict = {
+        "sessions": (
+            (("q", "salir"), ("↵", "abrir"), ("c", "compactar+ir"), ("C", "guardar Baúl"), ("V", "Baúl"),
+             ("t", "renombrar"), ("K", "key NV"), ("B", "baton"), ("u", "cuentas"), ("h", "hibernar"),
+             ("H", "idle"), ("x", "dedup"), ("v", "espejo"), ("n", "nueva"), ("R", "recargar"),
+             ("r", "actualizar"), ("m", "memoria"), ("M", "ranking"), ("?", "ayuda")),
+            (("q", "salir"), ("↵", "abrir"), ("c", "compactar"), ("B", "baton"), ("u", "cuentas"), ("?", "ayuda")),
+            (("q", "salir"), ("↵", "abrir"), ("u", "cuentas"), ("?", "ayuda")),
+        ),
+        "modal": (
+            (("q", "cancelar"), ("c", "compactar+ir"), ("C", "solo Baúl"), ("b", "abrir Baúl"),
+             ("o", "abrir completa"), ("k", "key NV")),
+            (("q", "cancelar"), ("c", "compactar+ir"), ("o", "abrir completa"), ("k", "key NV")),
+            (("q", "cancelar"), ("c", "compactar"), ("o", "abrir")),
+        ),
+        "accounts": (
+            (("q", "salir"), ("+", "agregar"), ("x", "eliminar"), ("B", "baton"), ("s", "activar"),
+             ("R", "cuotas"), ("u", "volver")),
+            (("q", "salir"), ("+", "agregar"), ("x", "eliminar"), ("B", "baton"), ("u", "volver")),
+            (("q", "salir"), ("+", "agregar"), ("u", "volver")),
+        ),
+        "pending_delete": (
+            (("q", "cancelar"), ("S", "confirmar borrado"), ("N", "cancelar")),
+            (("q", "cancelar"), ("S", "confirmar")),
+        ),
+        "pending_blocked": ((("q", "volver"), ("Esc", "volver")),),
+        "vault": (
+            (("q", "salir"), ("↵", "abrir"), ("r", "re-compactar"), ("A", "compactar pesadas"),
+             ("x", "borrar"), ("V", "volver")),
+            (("q", "salir"), ("↵", "abrir"), ("A", "compactar"), ("x", "borrar"), ("V", "volver")),
+            (("q", "salir"), ("↵", "abrir"), ("V", "volver")),
+        ),
+        "memory": (
+            (("q", "salir"), ("m", "volver"), ("↑↓", "mover"), ("u", "cuentas")),
+            (("q", "salir"), ("m", "volver")),
+        ),
+    }
+
+    # Ayuda (?): la hoja de atajos completa de cada vista, incluidas las acciones sin botón.
+    HELP_LINES: dict = {
+        "sessions": (
+            ("↵", "abrir (una sesión pesada ofrece compactarla antes)"),
+            ("c / C", "compactar y abrir · compactar solo al Baúl (2º plano)"),
+            ("V", "ver el Baúl de handoffs compactados"),
+            ("h / H / a", "hibernar · hibernar todas las IDLE"),
+            ("x", "deduplicar copias redundantes"),
+            ("v / R", "espejo vivo · recargar la pestaña"),
+            ("n / t", "nueva sesión · renombrar"),
+            ("B / b", "baton pass a otra cuenta"),
+            ("u / U", "cuentas · consultar cuotas"),
+            ("K", "clave NVIDIA"),
+            ("m / M", "memoria compartida · ranking de modelos"),
+            ("r", "actualizar"),
+            ("D", "desconectar el cliente tmux"),
+            ("↑↓ / j k", "mover (ratón: clic y rueda)"),
+            ("q / Esc / Tab", "siguiente ventana tmux"),
+        ),
+        "modal": (
+            ("c", "compactar con Nemotron y abrir"),
+            ("C", "compactar solo al Baúl (2º plano)"),
+            ("b", "abrir la versión del Baúl"),
+            ("o / ↵", "abrir la conversación completa"),
+            ("k", "clave NVIDIA"),
+            ("q / n", "cancelar"),
+        ),
+        "accounts": (
+            ("+", "añadir cuenta Pro"),
+            ("x / Del", "eliminar perfil (pide confirmación)"),
+            ("s / ↵", "activar como cuenta por defecto"),
+            ("B", "baton pass de la sesión a esta cuenta"),
+            ("R / r", "consultar cuotas"),
+            ("u / m / Esc", "volver"),
+        ),
+        "pending_delete": (("S / Y", "confirmar: borra SOLO ese perfil local"), ("N / Esc", "cancelar")),
+        "pending_blocked": (("Esc / q", "volver"),),
+        "vault": (
+            ("↵", "abrir del Baúl en una pestaña"),
+            ("r", "re-compactar la sesión"),
+            ("A", "compactar las pesadas al Baúl (2º plano)"),
+            ("x / Del", "borrar el handoff"),
+            ("V / Esc", "volver"),
+        ),
+        "memory": (("↑↓ / j k", "mover"), ("m / Esc", "volver"), ("u", "cuentas")),
+    }
+
+    def _put(self, y: int, x: int, text: str, attr: int = 0, cols: int | None = None, pad: bool = False) -> None:
+        put(self.stdscr, y, x, clean(text), self.max_x if cols is None else cols, attr, pad)
+
+    def _rule(self, y: int, x: int, width: int, attr: int = 0) -> None:
+        width = max(0, width)
+        put(self.stdscr, y, x, "─" * width, width, attr)
+
+    def _view_name(self) -> str:
+        if self.mode == "accounts":
+            if self.pending_delete_info is not None:
+                return "pending_blocked" if self.pending_delete_info.get("blocked_reason") else "pending_delete"
+            return "accounts"
+        if self.mode == "vault":
+            return "vault"
+        if self.mode == "memory":
+            return "memory"
+        return "modal" if self.pending_compact_sess is not None else "sessions"
+
+    def _footer(self, view: str, cols: int) -> tuple[str, list[tuple[int, int, int]]]:
+        """Texto del pie para `view` en `cols` columnas, y su mapa de clics (x0, x1, código)."""
+        built: list[tuple[str, list[tuple[int, int, int]]]] = []
+        for variant in self.FOOTER_VARIANTS.get(view, self.FOOTER_VARIANTS["sessions"]):
+            text = ""
+            hits: list[tuple[int, int, int]] = []
+            x = 0
+            for i, (key, label) in enumerate(variant):
+                seg = f"[{key}] {label}"
+                if i:
+                    text += "  "
+                    x += 2
+                code = self.KEY_CODES.get(key, ord(key) if len(key) == 1 else None)
+                if code is not None:
+                    hits.append((x, x + text_cols(seg) - 1, code))
+                text += seg
+                x += text_cols(seg)
+            built.append((text, hits))
+        for text, hits in built:
+            if text_cols(text) <= cols:
+                return text, hits
+        text, hits = built[-1]
+        return fit(text, cols), [h for h in hits if h[1] < cols]
+
     def _draw_header(self) -> None:
-        hdr = (
-            f" ⚡ AGY COMMAND CENTER (Zig {self.scan_us / 1000.0:.1f}ms + Python · Sync {self.last_refresh_clock}) — "
-            f"{len(self.live)} activas · {len(self.hib)} hibernadas (0MB) · Cuenta [{self.active_slot}] "
+        self._put(
+            0, 0,
+            f" ⚡ AGY · Zig {self.scan_us / 1000.0:.1f} ms · sync {self.last_refresh_clock} · "
+            f"{len(self.live)} activas · {len(self.hib)} hibernadas · cuenta [{self.active_slot}]",
+            curses.color_pair(1) | curses.A_BOLD, pad=True,
         )
-        self.stdscr.addstr(0, 0, hdr[: self.max_x - 1].ljust(self.max_x - 1), curses.color_pair(1) | curses.A_BOLD)
-        ram_line = (
-            f" RAM: {self.total_pss_mb} MB PSS | Shared: {self.total_shr_mb} MB + KSM: {self.total_ksm_mb} MB "
-            f"({self.ksm.get('pages_sharing', 0)} págs) | Ahorrado (💤): {self.hib_saved_mb} MB | Modelo: {self.model_disp or 'default'}"
+        self._put(
+            1, 0,
+            f" RAM {self.total_pss_mb} MB PSS · compartida {self.total_shr_mb} MB + KSM {self.total_ksm_mb} MB "
+            f"({self.ksm.get('pages_sharing', 0)} págs) · ahorrado 💤 {self.hib_saved_mb} MB · "
+            f"modelo {self.model_disp or 'default'}",
+            curses.color_pair(2) | curses.A_BOLD,
         )
-        self.stdscr.addstr(1, 0, ram_line[: self.max_x - 1], curses.color_pair(2) | curses.A_BOLD)
 
     def _draw_quota_alert(self) -> None:
         with self.quota_lock:
@@ -678,27 +825,27 @@ class Dashboard:
             pf_badge = ""
             if self.sel_for_alert:
                 pf = _accounts.baton_preflight(self.sel_for_alert, target_slot=self.quota_alert.get("target_slot", ""), model=self.model_disp)
-                pf_badge = " [Preflight OK · 0 dup]" if pf["ok"] else " [Esperando IDLE]"
+                pf_badge = " · preflight OK" if pf["ok"] else " · esperando IDLE"
             if self.quota_alert["target_slot"]:
                 tpct = f" ({self.quota_alert['target_pct']:.0f}%)" if self.quota_alert["target_pct"] >= 0 else ""
-                act_hint = f"Pulsa [B] Baton Pass -> [{self.quota_alert['target_slot']}]{tpct}{pf_badge}"
+                act_hint = f"Pulsa [B] → [{self.quota_alert['target_slot']}]{tpct}{pf_badge}"
             else:
-                act_hint = "Pulsa [u] Cuentas -> [+] para añadir 2ª Cuenta Pro"
+                act_hint = "Pulsa [u] para añadir una 2ª cuenta Pro"
             alert_txt = (
                 f" 🚨 CUOTA BAJA [{self.quota_alert['active_slot']} {self.quota_alert['active_email']}]: "
-                f"{self.quota_alert['bucket_name']} al {self.quota_alert['pct']:.0f}% — {act_hint} "
+                f"{self.quota_alert['bucket_name']} al {self.quota_alert['pct']:.0f}% · {act_hint}"
             )
             alert_attr = (curses.color_pair(1) | curses.A_BOLD) if self.quota_alert["level"] == "CRITICAL" else (curses.color_pair(4) | curses.A_REVERSE | curses.A_BOLD)
         else:
             acct_obj = self.reg.get("accounts", {}).get(self.sel_slot, {})
             fams = acct_obj.get("quota", {}).get("families", {})
             q_parts = [f"{k}:{v:.0f}%" for k, v in fams.items()]
-            q_summary = " · ".join(q_parts) if q_parts else ("consultando /usage..." if polling_now else "pulsa [u] para cuotas")
+            q_summary = " · ".join(q_parts) if q_parts else ("consultando /usage…" if polling_now else "sin datos (pulsa [u])")
             mail = acct_obj.get("email", "")
             mail_s = f" ({mail})" if mail else ""
-            alert_txt = f" 💳 Cuenta [{self.sel_slot}]{mail_s}: {q_summary}  |  [B] Baton Pass  [u] Cuentas Pro ({len(self.reg.get('accounts', {}))}) "
+            alert_txt = f" 💳 Cuenta [{self.sel_slot}]{mail_s}: {q_summary}"
             alert_attr = curses.color_pair(3) | curses.A_BOLD
-        self.stdscr.addstr(2, 0, alert_txt[: self.max_x - 1].ljust(self.max_x - 1), alert_attr)
+        self._put(2, 0, alert_txt, alert_attr, pad=True)
 
     def _compute_layout(self) -> None:
         # Layout split: Left Session List + Right Command Center Panel (if width >= 116)
@@ -711,14 +858,17 @@ class Dashboard:
         self.list_start_y = 6
         self.list_avail = 0
 
+    def _btn_rows(self) -> int:
+        return max((b.row_offset for b in self.cmd_buttons), default=-1) + 1
+
     def _draw_session_list(self) -> None:
         if self.sessions:
             self.cursor = max(0, min(self.cursor, len(self.sessions) - 1))
         self.preview_height = max(7, min(12, self.max_y // 3)) if self.max_y >= 22 else 0
         self.list_avail = max(3, self.max_y - 9 - self.preview_height)
-        col_hdr = f" {'ESTADO':<10} {'UBICACIÓN':<10} {'PSS':>6} {'SHR+KSM':>7} {'PASOS':>5}  {'TÍTULO DE SESIÓN':<28} {'WS'}"
-        self.stdscr.addstr(4, 0, col_hdr[: self.left_w], curses.A_BOLD)
-        self.stdscr.addstr(5, 0, "─" * self.left_w)
+        col_hdr = f" {'ESTADO':<10} {'UBICACIÓN':<10} {'PSS':>6} {'SHR+KSM':>7} {'PASOS':>5}  {'TÍTULO DE SESIÓN':<28} WS"
+        self._put(4, 0, col_hdr, curses.A_BOLD, self.left_w)
+        self._rule(5, 0, self.left_w)
         start_idx = max(0, self.cursor - self.list_avail + 1) if self.cursor >= self.list_avail else 0
         for idx, s in enumerate(self.sessions[start_idx : start_idx + self.list_avail], start=start_idx):
             row_y = self.list_start_y + (idx - start_idx)
@@ -734,10 +884,10 @@ class Dashboard:
             else:
                 pss_s = "0M"
                 shr_s = "-"
-            ws_name = (os.path.basename(s.workspace.rstrip("/")) or s.workspace)[:12]
+            ws_name = fit(os.path.basename(s.workspace.rstrip("/")) or s.workspace, 12)
             line = (
-                f" {st:<10} {s.location_label:<10} {pss_s:>6} {shr_s:>7} {s.step_count:>5}  "
-                f"{s.title[:28]:<28} {ws_name}"
+                f" {fit(st, 10, True)} {fit(s.location_label, 10, True)} {pss_s:>6} {shr_s:>7} {s.step_count:>5}  "
+                f"{fit(s.title, 28, True)} {ws_name}"
             )
             attr = curses.A_NORMAL
             if idx == self.cursor:
@@ -748,57 +898,57 @@ class Dashboard:
                 attr = curses.color_pair(4)
             elif st == "HIBERNATED":
                 attr = curses.color_pair(5)
-            self.stdscr.addstr(row_y, 0, line[: self.left_w].ljust(self.left_w), attr)
+            self._put(row_y, 0, line, attr, self.left_w, pad=True)
 
     def _draw_buttons(self) -> None:
         for ry in range(4, 6 + self.list_avail):
             if ry < self.max_y - 3:
-                self.stdscr.addstr(ry, self.left_w, "│")
-        self.stdscr.addstr(4, self.panel_x, " 🎛️  CENTRO DE COMANDO (Clic o Tecla)"[: self.panel_w], curses.color_pair(2) | curses.A_BOLD)
-        self.stdscr.addstr(5, self.panel_x, "─" * self.panel_w)
+                self._put(ry, self.left_w, "│", cols=1)
+        self._put(4, self.panel_x, " 🎛️ Acciones (clic o tecla)", curses.color_pair(2) | curses.A_BOLD, self.panel_w)
+        self._rule(5, self.panel_x, self.panel_w)
         for b in self.cmd_buttons:
             by = self.panel_btn_y + b.row_offset
             bx = self.panel_x + b.col_offset
-            if by < 6 + self.list_avail and bx + b.width < self.max_x:
-                btn_txt = f" {b.label} ".ljust(b.width)[: b.width]
-                btn_attr = curses.color_pair(1 if (b.action_id == "baton" and self.quota_alert) else 7) | curses.A_BOLD
-                self.stdscr.addstr(by, bx, btn_txt, btn_attr)
+            if by < 6 + self.list_avail:
+                attr = curses.color_pair(1 if (b.action_id == "baton" and self.quota_alert) else 7) | curses.A_BOLD
+                self._put(by, bx, f" {b.label}", attr, b.width, pad=True)
 
     def _draw_inspector(self, now: float) -> None:
-        insp_y = self.panel_btn_y + 9
+        insp_y = self.panel_btn_y + self._btn_rows() + 1
         if insp_y >= 6 + self.list_avail or not self.sessions or not (0 <= self.cursor < len(self.sessions)):
             return
         sel = self.sessions[self.cursor]
-        self.stdscr.addstr(insp_y - 1, self.panel_x, "─" * self.panel_w)
+        self._rule(insp_y - 1, self.panel_x, self.panel_w)
         t_sig = _sessions.transcript_sig(sel.conversation_id)
         age_s = int(max(0, now - (t_sig[0] / 1e9))) if t_sig[0] else -1
         age_txt = f"hace {age_s}s" if age_s >= 0 else "sin log"
-        kids_txt = ", ".join(sel.proc.active_children) if (sel.proc and sel.proc.active_children) else "ninguno"
+        kids = ", ".join(sel.proc.active_children) if (sel.proc and sel.proc.active_children) else ""
         pid_txt = str(sel.proc.pid) if sel.proc else "-"
-        extra_txt = f" (+{len(sel.extra_procs)} dup)" if sel.extra_procs else ""
+        extra_txt = f" +{len(sel.extra_procs)} dup" if sel.extra_procs else ""
         acct_tag = self.conv_accounts.get(sel.conversation_id, self.active_slot)
-        nv_cfg = _compact.load_nvapi_config()
-        nv_lbl = _compact.mask_api_key(str(nv_cfg.get("api_key", "")))
+        nv_lbl = _compact.mask_api_key(str(_compact.load_nvapi_config().get("api_key", "")))
         ctx_m = self.cached_context(sel)
-        ctx_tok = ctx_m["used_tokens"]
-        ctx_pct = ctx_m["pct"]
-        ctx_lvl = ctx_m["level"]
-        meta_lines = [
-            (f" 📌 {sel.title[:self.panel_w - 4]}", curses.A_BOLD),
-            (f" ID: {sel.conversation_id[:14]} PID:{pid_txt}{extra_txt} Cta:[{acct_tag}]", curses.A_NORMAL),
-            (f" Ctx: ~{ctx_tok // 1000}k ({ctx_pct:.0f}% · {ctx_lvl}) · {age_txt} | NV:{nv_lbl[:11]}", curses.color_pair(1 if "URGENT" in ctx_lvl else (4 if ("RECOMMEND" in ctx_lvl or kids_txt != "ninguno") else 3))),
-            (f" RAM: {_ram_bar(min(1.0, self.total_pss_mb / 2048.0), 18)} {self.total_pss_mb}M (KSM {self.total_ksm_mb}M)", curses.color_pair(3)),
+        lvl = str(ctx_m["level"])
+        ctx_attr = curses.color_pair(1 if "URGENT" in lvl else (4 if ("RECOMMEND" in lvl or kids) else 3)) | curses.A_BOLD
+        id_line = f" ID {sel.conversation_id[:8]} · PID {pid_txt}{extra_txt} · cuenta [{acct_tag}] · NV {nv_lbl[:11]}"
+        if kids:
+            id_line += f" · hijos: {kids}"
+        lines = [
+            (f" {sel.state_label} · ctx {ctx_m['pct']:.0f}% ({lvl}, ~{ctx_m['used_tokens'] // 1000}k) · último msg {age_txt}", ctx_attr),
+            (f" 📌 {sel.title}", curses.A_BOLD),
+            (id_line, curses.A_NORMAL),
+            (f" RAM {_ram_bar(min(1.0, self.total_pss_mb / 2048.0), 18)} {self.total_pss_mb}M (KSM {self.total_ksm_mb}M)", curses.color_pair(3)),
         ]
-        for mi, (ml, ma) in enumerate(meta_lines):
+        for mi, (ml, ma) in enumerate(lines):
             if insp_y + mi < 6 + self.list_avail:
-                self.stdscr.addstr(insp_y + mi, self.panel_x, ml[:self.panel_w], ma)
+                self._put(insp_y + mi, self.panel_x, ml, ma, self.panel_w)
 
     def _draw_preview(self, now: float) -> None:
         if self.preview_height <= 0 or not self.sessions or not (0 <= self.cursor < len(self.sessions)):
             return
         sel = self.sessions[self.cursor]
         py = self.max_y - 3 - self.preview_height
-        self.stdscr.addstr(py, 0, "─" * (self.max_x - 1))
+        self._rule(py, 0, self.max_x - 1)
         if self.pending_compact_sess is not None:
             self._draw_compaction_modal(self.pending_compact_sess, py, now)
         else:
@@ -808,42 +958,31 @@ class Dashboard:
         _, est_tok, log_kb = _compact.should_offer_compaction(pcs)
         vault_file = _compact.get_vault_handoff(pcs.conversation_id)
         nv_cfg = _compact.load_nvapi_config()
-        has_nv = bool(str(nv_cfg.get("api_key", "")).strip())
-        nv_status = (
-            f"LISTA ({_compact.mask_api_key(str(nv_cfg.get('api_key', '')))} · {nv_cfg.get('model')})"
-            if has_nv
-            else "FALTA KEY — pulsa [k] para guardarla"
+        nv_key = str(nv_cfg.get("api_key", "")).strip()
+        nv_line = (
+            f"clave lista ({_compact.mask_api_key(nv_key)} · {nv_cfg.get('model')})"
+            if nv_key else "falta la clave NVIDIA (pulsa K)"
         )
-        vault_opt = ""
         if vault_file is not None:
             v_age = int(max(0, (now - vault_file.stat().st_mtime) // 60))
-            vault_opt = f"[b] 📦 Abrir del Baúl ({v_age}m)  |  "
+            baul_line = f"Baúl: hay un handoff guardado hace {v_age} min"
+        else:
+            baul_line = "Baúl: todavía sin handoff de esta sesión"
         modal_lines = [
             (
-                f" 🗜  REACTIVACIÓN DE SESIÓN PESADA: '{pcs.title[:38]}' ({pcs.step_count} pasos · {log_kb} KB · ~{est_tok:,} tokens de entrada)",
+                f" 🗜 Sesión pesada: '{pcs.title[:38]}' · {pcs.step_count} pasos · {log_kb} KB · ~{est_tok:,} tokens",
                 curses.color_pair(1) | curses.A_BOLD,
             ),
             (
-                f"    Reabrir esta sesión completa cargará ~{est_tok:,} tokens de entrada en cada mensaje.",
+                f"    Reabrirla completa cargará ~{est_tok:,} tokens de entrada en cada mensaje.",
                 curses.color_pair(4) | curses.A_BOLD,
             ),
-            (
-                f"    🔑 NVIDIA NIM ({nv_status}): puede compactarla con Nemotron Ultra antes de abrirla.",
-                curses.color_pair(3 if has_nv else 4),
-            ),
-            (
-                f"    👉 {vault_opt}[c] ⚡ Compactar y abrir   |   [C] 📦 Compactar solo al Baúl (2º plano)",
-                curses.color_pair(3) | curses.A_BOLD,
-            ),
-            (
-                "    👉 [Enter / o] 🚀 Abrir conversación original completa   |   [k] Key NVIDIA   |   [Esc] Cancelar",
-                curses.color_pair(2) | curses.A_BOLD,
-            ),
+            (f"    Compactar con NVIDIA Nemotron: {nv_line}", curses.color_pair(3 if nv_key else 4)),
+            (f"    {baul_line}", curses.color_pair(2)),
         ]
         for mi, (ml, ma) in enumerate(modal_lines):
-            ry = py + 1 + mi
-            if ry < self.max_y - 3:
-                self.stdscr.addstr(ry, 0, ml[: self.max_x - 1].ljust(self.max_x - 1), ma)
+            if py + 1 + mi < self.max_y - 3:
+                self._put(py + 1 + mi, 0, ml, ma)
 
     def _draw_live_preview(self, sel: _sessions.AgySession, py: int, now: float) -> None:
         cur_sig = _sessions.transcript_sig(sel.conversation_id)
@@ -854,12 +993,12 @@ class Dashboard:
         age_s = int(max(0, now - (cur_sig[0] / 1e9))) if cur_sig[0] else -1
         age_lbl = f"hace {age_s}s" if age_s >= 0 else "sin log"
         phdr = (
-            f" ⚡ VISTA EN VIVO ZIG (<4ms · {age_lbl}): {sel.title[:38]} ({sel.conversation_id[:8]}) "
-            f"[{sel.state_label} · {sel.location_label}]"
+            f" ⚡ EN VIVO ({age_lbl}) · {sel.title[:38]} ({sel.conversation_id[:8]}) · "
+            f"{sel.state_label} · {sel.location_label}"
         )
-        self.stdscr.addstr(py + 1, 0, phdr[: self.max_x - 1], curses.color_pair(2) | curses.A_BOLD)
+        self._put(py + 1, 0, phdr, curses.color_pair(2) | curses.A_BOLD)
         if not self.cached_turns:
-            self.stdscr.addstr(py + 2, 0, "   (Sin transcript.jsonl local o conversación recién creada)"[: self.max_x - 1])
+            self._put(py + 2, 0, "   (Sin transcript.jsonl local o conversación recién creada)")
         else:
             for tidx, t in enumerate(self.cached_turns[-(self.preview_height - 2) :]):
                 ry = py + 2 + tidx
@@ -867,15 +1006,15 @@ class Dashboard:
                     break
                 if t["role"] == "USER":
                     txt = f"  👤 [{t['ts']} #{t['idx']}] TÚ: {t['content']}"
-                    self.stdscr.addstr(ry, 0, txt[: self.max_x - 1], curses.color_pair(4))
+                    self._put(ry, 0, txt, curses.color_pair(4))
                 elif t["role"] == "TOOL":
                     txt = f"  ⏳ [{t['ts']} #{t['idx']}] {t['content']}"
-                    self.stdscr.addstr(ry, 0, txt[: self.max_x - 1], curses.color_pair(5))
+                    self._put(ry, 0, txt, curses.color_pair(5))
                 else:
                     tools_s = f" [🔧 {', '.join(t['tools'])}]" if t["tools"] else ""
-                    body_s = t["content"] or "(ejecutando herramientas...)"
+                    body_s = t["content"] or "(ejecutando herramientas…)"
                     txt = f"  🤖 [{t['ts']} #{t['idx']}] AGY: {body_s}{tools_s}"
-                    self.stdscr.addstr(ry, 0, txt[: self.max_x - 1], curses.color_pair(3))
+                    self._put(ry, 0, txt, curses.color_pair(3))
 
     def _draw_accounts(self) -> None:
         self.acct_list = list(self.reg.get("accounts", {}).items())
@@ -885,11 +1024,16 @@ class Dashboard:
             if em:
                 email_counts[em] = email_counts.get(em, 0) + 1
         sel_s_title = self.sel_for_alert.title[:28] if self.sel_for_alert else "-"
-        ahdr = (
-            f" 💳 CUENTAS GOOGLE PRO & BATON PASS (Sesión objetivo: {sel_s_title} · Modelo: {self.model_disp or 'default'})"
+        self._put(
+            4, 0,
+            f" 💳 CUENTAS Y CUOTAS · sesión: {sel_s_title} · modelo: {self.model_disp or 'default'}",
+            curses.color_pair(2) | curses.A_BOLD,
         )
-        self.stdscr.addstr(4, 0, ahdr[: self.max_x - 1], curses.color_pair(2) | curses.A_BOLD)
-        self.stdscr.addstr(5, 0, f" {'SLOT':<12} {'ACT':<4} {'MODO':<9} {'EMAIL':<28} {'ARGON':>7} {'GEMINI':>7} {'CLAUDE/GPT':>10} {'ESTADO'}", curses.A_BOLD)
+        self._put(
+            5, 0,
+            f" {'SLOT':<12} {'ACT':<4} {'MODO':<9} {'EMAIL':<28} {'ARGON':>7} {'GEMINI':>7} {'CLAUDE/GPT':>10}  ESTADO",
+            curses.A_BOLD,
+        )
         self.cursor = max(0, min(self.cursor, max(0, len(self.acct_list) - 1)))
         for idx, (sname, adata) in enumerate(self.acct_list):
             ry = 6 + idx
@@ -908,17 +1052,17 @@ class Dashboard:
             if not adata.get("authenticated"):
                 st_txt = "FALTA LOGIN [+]"
             elif is_dup:
-                st_txt = "LISTA (DUPLICADA -> [x])"
+                st_txt = "DUPLICADA → [x]"
             else:
                 st_txt = "LISTA"
             row_txt = (
-                f" {sname:<12} {mark:<4} {adata.get('mode', '?'):<9} {mail[:28]:<28} "
+                f" {sname:<12} {mark:<4} {adata.get('mode', '?'):<9} {fit(mail, 28, True)} "
                 f"{_fp('argon'):>7} {_fp('gemini'):>7} {_fp('claude_gpt'):>10}  {st_txt}"
             )
             attr = (curses.color_pair(6) | curses.A_BOLD) if idx == self.cursor else (
                 curses.color_pair(4) if (not adata.get("authenticated") or is_dup) else curses.color_pair(3)
             )
-            self.stdscr.addstr(ry, 0, row_txt[: self.max_x - 1].ljust(self.max_x - 1), attr)
+            self._put(ry, 0, row_txt, attr, pad=True)
         if self.pending_delete_info is not None:
             self._draw_account_removal()
         elif self.acct_list and 0 <= self.cursor < len(self.acct_list) and self.max_y >= 15:
@@ -927,23 +1071,22 @@ class Dashboard:
     def _draw_account_removal(self) -> None:
         det_y = min(self.max_y - 8, 7 + len(self.acct_list))
         pdi = self.pending_delete_info
-        dup_s = f" ⚠️ Duplicada de [{', '.join(pdi['duplicate_of'])}]" if pdi["duplicate_of"] else ""
+        dup_s = f" · duplicada de [{', '.join(pdi['duplicate_of'])}]" if pdi["duplicate_of"] else ""
+        last = (
+            (f"   ❌ Bloqueado: {pdi['blocked_reason']}", curses.color_pair(1) | curses.A_BOLD)
+            if pdi["blocked_reason"]
+            else ("   ¿Confirmas el borrado? El pie indica las teclas.", curses.color_pair(4) | curses.A_BOLD)
+        )
         conf_lines = [
-            (f" 🗑 CONFIRMAR ELIMINACIÓN DE PERFIL LOCAL [{pdi['slot']}] — NADA DE OTRAS CUENTAS", curses.color_pair(1) | curses.A_BOLD),
-            (f"   Identidad : {pdi['email'] or '(sin login OAuth)'}{dup_s}", curses.color_pair(4) | curses.A_BOLD),
-            (f"   Sesiones  : {len(pdi['associated_sessions'])} asociadas  |  PIDs vivos en [{pdi['slot']}]: {len(pdi['active_pids'])}", curses.A_NORMAL),
-            (f"   Alcance   : SOLO {pdi['slot_dir']} ({pdi['local_files']} archivos locales; {pdi['shared_symlinks']} symlinks compartidos intactos)", curses.A_NORMAL),
-            (
-                f"   ❌ BLOQUEADO: {pdi['blocked_reason']}  (Esc para volver)"
-                if pdi["blocked_reason"]
-                else f"   👉 Pulsa [S] o [Y] para confirmar borrar SOLO [{pdi['slot']}]  |  [N / Esc] Cancelar",
-                curses.color_pair(1 if pdi["blocked_reason"] else 4) | curses.A_BOLD,
-            ),
+            (f" 🗑 Eliminar perfil [{pdi['slot']}] (solo ese perfil local)", curses.color_pair(1) | curses.A_BOLD),
+            (f"   Identidad: {pdi['email'] or '(sin login OAuth)'}{dup_s}", curses.color_pair(4) | curses.A_BOLD),
+            (f"   Sesiones: {len(pdi['associated_sessions'])} asociadas · PIDs vivos: {len(pdi['active_pids'])}", curses.A_NORMAL),
+            (f"   Alcance: {pdi['slot_dir']} ({pdi['local_files']} archivos; {pdi['shared_symlinks']} symlinks compartidos intactos)", curses.A_NORMAL),
+            last,
         ]
         for ci, (cl, ca) in enumerate(conf_lines):
-            cy = det_y + ci
-            if cy < self.max_y - 3:
-                self.stdscr.addstr(cy, 0, cl[: self.max_x - 1].ljust(self.max_x - 1), ca)
+            if det_y + ci < self.max_y - 3:
+                self._put(det_y + ci, 0, cl, ca, pad=True)
 
     def _draw_account_details(self) -> None:
         sname, adata = self.acct_list[self.cursor]
@@ -951,38 +1094,34 @@ class Dashboard:
         det_y = min(self.max_y - 6, 7 + len(self.acct_list))
         if det_y >= self.max_y - 4:
             return
-        self.stdscr.addstr(det_y, 0, f" 📊 Detalle [{sname}] (actualizado: {adata.get('updated_at') or 'nunca'}):"[: self.max_x - 1], curses.A_BOLD)
+        self._put(det_y, 0, f" 📊 Detalle [{sname}] · actualizado: {adata.get('updated_at') or 'nunca'}", curses.A_BOLD)
         for bi, b in enumerate(buckets[:4]):
             by = det_y + 1 + bi
             if by >= self.max_y - 3:
                 break
-            b_line = f"    • {b.get('group', '')} — {b.get('name', '')}: {b.get('pct', 0):.0f}% libre  (reset {b.get('reset_time', '')})"
+            b_line = f"    • {b.get('group', '')} — {b.get('name', '')}: {b.get('pct', 0):.0f}% libre (reset {b.get('reset_time', '')})"
             b_attr = curses.color_pair(1) if b.get("pct", 100) <= _paths.QUOTA_CRIT_PCT else (
                 curses.color_pair(4) if b.get("pct", 100) <= _paths.QUOTA_WARN_PCT else curses.color_pair(3)
             )
-            self.stdscr.addstr(by, 0, b_line[: self.max_x - 1], b_attr)
+            self._put(by, 0, b_line, b_attr)
 
     def _draw_vault(self, now: float) -> None:
         self.vault_entries = _compact.list_compacted_vault()
-        self.stdscr.addstr(
-            4,
-            0,
-            f" 🗄️ BAÚL DE HANDOFFS COMPACTADOS ({len(self.vault_entries)} guardados en compacted/ — [Enter] Abrir nueva sesión · [A] Compactar pesadas al Baúl · [V/Esc] Volver)"[
-                : self.max_x - 1
-            ],
+        self._put(
+            4, 0,
+            f" 🗄️ BAÚL DE HANDOFFS · {len(self.vault_entries)} compactados",
             curses.color_pair(2) | curses.A_BOLD,
         )
-        self.stdscr.addstr(
-            5,
-            0,
-            f" {'ID':<10} {'TÍTULO':<32} {'REDUCCIÓN / AHORRO':<36} {'HACE':<8} {'WORKSPACE'}",
+        self._put(
+            5, 0,
+            f" {'ID':<10} {'TÍTULO':<32} {'REDUCCIÓN / AHORRO':<36} {'HACE':<8} WORKSPACE",
             curses.A_BOLD,
         )
         self.cursor = max(0, min(self.cursor, max(0, len(self.vault_entries) - 1)))
         avail_rows = max(1, self.max_y - 9)
         start_idx = max(0, self.cursor - avail_rows + 1) if self.cursor >= avail_rows else 0
         if not self.vault_entries:
-            self.stdscr.addstr(6, 0, "   (Baúl vacío — pulsa [C] sobre una sesión o [A] aquí para compactar pesadas en 2º plano sin abrirlas)"[: self.max_x - 1])
+            self._put(6, 0, "   (Baúl vacío: pulsa C en una sesión o A aquí para compactar pesadas en 2º plano)")
         else:
             for idx, ve in enumerate(self.vault_entries[start_idx : start_idx + avail_rows], start=start_idx):
                 row_y = 6 + (idx - start_idx)
@@ -991,10 +1130,13 @@ class Dashboard:
                 age_m = int(max(0, (now - ve["mtime"]) // 60)) if ve["mtime"] else 0
                 age_s = f"{age_m}m" if age_m < 60 else f"{age_m // 60}h"
                 ws_s = os.path.basename(str(ve["workspace"]).rstrip("/")) or str(ve["workspace"])
-                red_s = (ve["reduction"] or f"{ve['size_bytes']} B")[:36]
-                row_txt = f" {ve['short_id']:<10} {ve['title'][:32]:<32} {red_s:<36} {age_s:<8} {ws_s}"
+                red_s = ve["reduction"] or f"{ve['size_bytes']} B"
+                row_txt = (
+                    f" {fit(str(ve['short_id']), 10, True)} {fit(ve['title'], 32, True)} "
+                    f"{fit(str(red_s), 36, True)} {fit(age_s, 8, True)} {ws_s}"
+                )
                 attr = (curses.color_pair(6) | curses.A_BOLD) if idx == self.cursor else curses.color_pair(3)
-                self.stdscr.addstr(row_y, 0, row_txt[: self.max_x - 1].ljust(self.max_x - 1), attr)
+                self._put(row_y, 0, row_txt, attr, pad=True)
 
     def _draw_memory(self) -> None:
         mem_candidates = [
@@ -1006,17 +1148,10 @@ class Dashboard:
         self.mem_lines = (
             [line for line in mem_idx.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
             if mem_idx.is_file()
-            else ["(MEMORY.md not found — run `isymem setup` in your workspace)"]
+            else ["(MEMORY.md no encontrado: ejecuta `isymem setup` en tu espacio de trabajo)"]
         )
-        self.stdscr.addstr(
-            4,
-            0,
-            f" 🧠 MEMORIA COMPARTIDA MULTI-HARNESS ({len(self.mem_lines)} entradas en MEMORY.md — m:Volver)"[
-                : self.max_x - 1
-            ],
-            curses.color_pair(3) | curses.A_BOLD,
-        )
-        self.stdscr.addstr(5, 0, "─" * (self.max_x - 1))
+        self._put(4, 0, f" 🧠 MEMORIA COMPARTIDA · {len(self.mem_lines)} entradas (MEMORY.md)", curses.color_pair(3) | curses.A_BOLD)
+        self._rule(5, 0, self.max_x - 1)
         self.cursor = max(0, min(self.cursor, max(0, len(self.mem_lines) - 1)))
         avail_rows = max(1, self.max_y - 9)
         start_idx = max(0, self.cursor - avail_rows + 1) if self.cursor >= avail_rows else 0
@@ -1025,12 +1160,22 @@ class Dashboard:
             if row_y >= self.max_y - 3:
                 break
             attr = (curses.color_pair(6) | curses.A_BOLD) if idx == self.cursor else curses.A_NORMAL
-            self.stdscr.addstr(row_y, 0, f" {mline}"[: self.max_x - 1].ljust(self.max_x - 1), attr)
+            self._put(row_y, 0, f" {mline}", attr, pad=True)
+
+    def _draw_help(self) -> None:
+        rows = self.HELP_LINES.get(self._view_name(), self.HELP_LINES["sessions"])
+        self._put(4, 0, " ❓ Atajos · cualquier tecla cierra esta ayuda", curses.color_pair(2) | curses.A_BOLD)
+        self._rule(5, 0, self.max_x - 1)
+        for i, (keys, desc) in enumerate(rows):
+            y = 6 + i
+            if y >= self.max_y - 3:
+                break
+            self._put(y, 2, f"{keys:<16}{desc}", curses.A_NORMAL)
 
     def _draw_footer(self, now: float) -> None:
         if self.max_y < 3:
             return
-        self.stdscr.addstr(self.max_y - 3, 0, "─" * (self.max_x - 1))
+        self._rule(self.max_y - 3, 0, self.max_x - 1)
         if self.running_compact:
             j0 = self.running_compact[0]
             el_s = int(max(0, now - j0["started"]))
@@ -1040,23 +1185,9 @@ class Dashboard:
             )
         else:
             banner_line = self.status_banner
-        self.stdscr.addstr(self.max_y - 2, 0, f" {banner_line}"[: self.max_x - 1], curses.color_pair(4))
-        if self.mode == "accounts":
-            keys_help = (
-                " [+] Agregar   [x/Del] Eliminar   [B] Baton Pass   [Enter/s] Activar   "
-                "[R] Cuotas   [u/Esc] Volver "
-            )
-        elif self.mode == "vault":
-            keys_help = (
-                " [Enter] Abrir del Baúl   [r] Re-compactar al Baúl   [A] Compactar pesadas al Baúl (2ºp)   "
-                "[x/Del] Borrar   [V/Esc] Volver "
-            )
-        else:
-            keys_help = (
-                " [Enter] Abrir  [c] Compactar+Ir  [C] Guardar Baúl  [V] Baúl  [t] Renombrar  "
-                "[K] Key NV  [B] Baton  [u] Cuentas  [h/H] Hibernar  [m] Memoria  [M] Ranking "
-            )
-        self.stdscr.addstr(self.max_y - 1, 0, keys_help[: self.max_x - 1], curses.A_REVERSE)
+        self._put(self.max_y - 2, 0, f" {banner_line}", curses.color_pair(4))
+        text, self.footer_hits = self._footer(self._view_name(), self.max_x - 1)
+        self._put(self.max_y - 1, 0, text, curses.A_REVERSE, pad=True)
 
     def draw(self, now: float | None = None) -> None:
         """Dibuja una iteración completa respetando el orden de las vistas."""
@@ -1068,9 +1199,14 @@ class Dashboard:
         self._prepare_frame(now)
         self._draw_header()
         self._draw_quota_alert()
-        self.stdscr.addstr(3, 0, "─" * (self.max_x - 1))
+        if self.scan_failed:
+            self._put(3, 0, self.SCAN_FAILED_MSG, curses.color_pair(1) | curses.A_BOLD, self.max_x - 1)
+        else:
+            self._rule(3, 0, self.max_x - 1)
         self._compute_layout()
-        if self.mode == "sessions":
+        if self.show_help:
+            self._draw_help()
+        elif self.mode == "sessions":
             self._draw_session_list()
             if self.show_cmd_panel:
                 self._draw_buttons()
@@ -1103,6 +1239,11 @@ class Dashboard:
         if not (bstate & click_mask):
             return None
         is_dbl_click = bool(bstate & curses.BUTTON1_DOUBLE_CLICKED)
+        if my == self.max_y - 1:  # clic en una tecla del pie = la misma tecla
+            for x0, x1, code in self.footer_hits:
+                if x0 <= mx <= x1:
+                    return code
+            return None
         if self.show_cmd_panel and mx >= self.panel_x:
             act = hit_test_button(self.cmd_buttons, self.panel_x, self.panel_btn_y, mx, my)
             if act:
@@ -1130,24 +1271,18 @@ class Dashboard:
             acct_list = list(self.reg.get("accounts", {}).items())
             if 6 <= my < 6 + len(acct_list):
                 self.cursor = my - 6
-            elif my == self.max_y - 1:
-                if mx < 14:
-                    return ord("+")
-                if mx < 32:
-                    return ord("x")
-                if mx < 49:
-                    return ord("B")
-                if mx < 69:
-                    return ord("s")
-                if mx < 82:
-                    return ord("R")
-                return ord("u")
         return None
 
     def handle_key(self, ch: int | str) -> None:
         """Despacha una tecla según la vista activa."""
         if isinstance(ch, str) and len(ch) == 1:
             ch = ord(ch)
+        if self.show_help:
+            self.show_help = False  # cualquier tecla cierra la ayuda
+            return
+        if ch == ord("?"):
+            self.show_help = True
+            return
         if self.mode == "accounts":
             self._handle_account_key(ch)
             return
@@ -1265,7 +1400,7 @@ class Dashboard:
                         self.status_banner = msg_s
                         break
                 if started:
-                    self.status_banner = f"📦 Compactando {started} sesiones pesadas en 2º plano al Baúl NV (sin abrir pestañas)."
+                    self.status_banner = f"📦 Compactando {started} sesiones pesadas en 2º plano al Baúl (sin abrir pestañas)."
         elif ch in (ord("x"), curses.KEY_DC, 127) and vault_entries and 0 <= self.cursor < len(vault_entries):
             ve = vault_entries[self.cursor]
             if _compact.delete_vault_handoff(Path(ve["path"])):
