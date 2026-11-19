@@ -107,6 +107,111 @@ CRASH_LOG = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
 CRASH_LOG_MAX_BYTES = 1 << 20  # past 1 MiB the log is rotated once to tui-errors.log.1
 
 
+@dataclass
+class Confirm:
+    """The one open confirmation (or the compaction modal). `kind` is also its key view: the
+    name used by KEYMAP, FOOTER_VARIANTS and HELP_LINES. It only applies while the dashboard is in
+    `mode`; with `any_key_cancels`, a key with no binding in that view cancels it (and every key
+    closes it before its action runs)."""
+    kind: str
+    mode: str
+    payload: Any
+    any_key_cancels: bool
+    cancel_msg: str
+
+
+# kind -> (mode, any_key_cancels, message when cancelled)
+CONFIRM_SPECS: dict[str, tuple[str, bool, str]] = {
+    "modal": ("sessions", False, "Reactivación cancelada."),
+    "dedup_confirm": ("sessions", True, "Cierre de copias duplicadas cancelado."),
+    "pending_delete": ("accounts", False, "Eliminación de perfil cancelada."),
+    "vault_confirm": ("vault", True, "Borrado cancelado."),
+    "bulk_confirm": ("vault", True, "Compactación en lote cancelada."),
+}
+
+# Key names used in KEYMAP, FOOTER_VARIANTS and HELP_LINES; any other name is a single character.
+TOKEN_CODES: dict[str, tuple[int, ...]] = {
+    "↵": (10, 13, curses.KEY_ENTER),
+    "Esc": (27,),
+    "Tab": (9,),
+    "Supr": (curses.KEY_DC,),
+    "↑": (curses.KEY_UP,),
+    "↓": (curses.KEY_DOWN,),
+    "↑↓": (curses.KEY_UP, curses.KEY_DOWN),
+}
+
+
+def key_codes(spec: str) -> tuple[int, ...]:
+    """Codes for a space-separated key spec: "q Esc Tab" -> (113, 27, 9)."""
+    out: list[int] = []
+    for tok in spec.split():
+        out.extend(TOKEN_CODES.get(tok) or (ord(tok),))
+    return tuple(out)
+
+
+def _keymap(**views: dict[str, str]) -> dict[str, dict[int, str]]:
+    built: dict[str, dict[int, str]] = {}
+    for view, specs in views.items():
+        table: dict[int, str] = {}
+        for spec, action in specs.items():
+            for code in key_codes(spec):
+                assert code not in table, (view, spec)  # one action per key and view
+                table[code] = action
+        built[view] = table
+    return built
+
+
+# Action ids that execute_action knows; any other KEYMAP action is the method `_k_<action>`.
+EXEC_ACTIONS = frozenset((
+    "refresh", "refresh_quota", "open", "open_full", "open_vault", "mirror", "reload", "new",
+    "hibernate", "hib_all", "dedup", "baton", "accounts", "compact", "rename", "vault_compact",
+    "vault", "nvapi_key", "memory", "ranking",
+))
+# In the compaction modal these act on the session it shows, not on the row under the cursor.
+MODAL_TARGETED = frozenset(("compact", "vault_compact", "open_vault", "open_full"))
+
+# Every key of every view (key view = mode, or the kind of the open Confirm). The help sheet
+# (HELP_LINES) lists all of them and the footer a subset; test_tui_keys checks both ways.
+KEYMAP = _keymap(
+    sessions={
+        "q Esc Tab": "next_window", "D": "detach", "↑ k": "up", "↓ j": "down",
+        "r": "refresh", "m": "memory", "u": "accounts", "U": "refresh_quota", "V": "vault",
+        "↵": "open", "c": "compact", "C": "vault_compact", "t": "rename", "K": "nvapi_key",
+        "v": "mirror", "R": "reload", "n": "new", "h": "hibernate", "H a": "hib_all",
+        "x": "ask_dedup", "M": "ranking", "b B": "baton",
+    },
+    modal={
+        "c": "compact", "C": "vault_compact", "b B": "open_vault", "o O ↵": "open_full",
+        "k K": "nvapi_key", "q n N Esc": "cancel",
+    },
+    dedup_confirm={"x S Y": "dedup"},
+    accounts={
+        "u m Esc": "back", "↑ k": "up", "↓ j": "down", "r R": "refresh_quota", "+": "acct_add",
+        "x Supr": "acct_ask_delete", "s ↵": "acct_activate", "b B": "acct_baton", "q Tab": "next_window",
+    },
+    # Lower-case `s` is "activate" in the accounts view: only upper case confirms a deletion.
+    pending_delete={"S Y": "acct_delete_yes", "n N Esc u q": "cancel"},
+    pending_blocked={"n N Esc u q": "cancel"},
+    vault={
+        "v V Esc": "back", "↑ k": "up", "↓ j": "down", "↵": "vault_open", "r": "vault_recompact",
+        "A a": "vault_ask_bulk", "x Supr": "vault_ask_delete", "q Tab": "next_window",
+    },
+    vault_confirm={"S Y": "vault_delete_yes"},
+    bulk_confirm={"A a": "bulk_yes"},
+    memory={"m Esc": "back", "u": "accounts", "↑ k": "up", "↓ j": "down", "q Tab": "next_window"},
+)
+
+# Keys handled before KEYMAP, in every view (shown in the footer, not repeated in each help sheet).
+GLOBAL_KEYS = frozenset((ord("?"),))
+
+VIEW_BANNERS = {
+    "sessions": "Vista: Command Center AGY",
+    "memory": "Vista: Memoria compartida (isymem)",
+    "accounts": "Vista: Cuentas y cuotas",
+    "vault": "Vista: Baúl de handoffs compactados",
+}
+
+
 def model_board_command(exe: str | None = None) -> list[str] | None:
     exe = exe or shutil.which("swarm-ext")
     return [exe, "board", "--providers", BOARD_PROVIDERS] if exe else None
@@ -259,8 +364,7 @@ class Dashboard:
         self.led_worker_busy = {"running": False}
         self.quota_lock = threading.Lock()
         self.quota_worker_state = {"running": False, "last_poll": 0.0, "msg": ""}
-        self.pending_delete_info: dict | None = None
-        self.pending_compact_sess: _sessions.AgySession | None = None
+        self.confirm: Confirm | None = None  # the open confirmation or compaction modal, if any
         self.compact_lock = threading.Lock()
         self.compact_jobs: dict[str, dict] = {}
         self.compact_results: list[tuple[_sessions.AgySession, bool, str, Path | None, bool]] = []
@@ -303,10 +407,7 @@ class Dashboard:
         # Escaneo de procesos fallido: lo pone _adopt_scan_snapshot desde el resultado del scan.
         self.scan_failed = False
         self.scan_error = ""  # excepción del último load_sessions, si falló
-        self.pending_vault_delete: dict | None = None  # entrada del Baúl a la espera de [S]
-        self.pending_bulk_compact: list[_sessions.AgySession] | None = None  # [A] a la espera de [A] otra vez
         self.dup_notice = ""  # aviso permanente de sesiones abiertas varias veces
-        self.pending_dedup = False  # [x] en sesiones a la espera de [x] otra vez (mata procesos)
         self.compact_slots = threading.Semaphore(COMPACT_PARALLEL)
         self.forget_tab_names: set[str] = set()  # renombradas: el hilo LED olvida su nombre viejo
         self.crash_streak = 0
@@ -516,11 +617,9 @@ class Dashboard:
         sel = target or self.current_session()
         if action == "baton" and sel:
             ok, msg = _accounts.baton_pass_session(sel)
-            if not ok and "No hay otra cuenta" in msg:
+            if not ok and "No hay otra cuenta" in msg and self.mode == "sessions":
                 # Sin cuenta destino: se abre la vista de cuentas para añadir una ([+]).
-                self.saved_session_cursor = self.cursor
-                self.mode = "accounts"
-                self.cursor = 0
+                self._switch_view("accounts")
             self.force_scan = True
             return msg
         if self.mode != "sessions":
@@ -553,35 +652,8 @@ class Dashboard:
             return "Consultando cuotas (/usage) de todas las cuentas en segundo plano..."
         if action == "ranking":
             return open_model_board()
-        if action == "memory":
-            if self.mode == "sessions":
-                self.saved_session_cursor = self.cursor
-                self.mode = "memory"
-                self.cursor = 0
-                return "Vista: Memoria compartida (isymem)"
-            self.mode = "sessions"
-            self.cursor = self.saved_session_cursor
-            return "Vista: Command Center AGY"
-        if action == "accounts":
-            if self.mode == "sessions":
-                self.saved_session_cursor = self.cursor
-                self.mode = "accounts"
-                self.cursor = 0
-                self.trigger_quota_poll(force=False)
-                return "Vista: Cuentas y cuotas"
-            self.mode = "sessions"
-            self.cursor = self.saved_session_cursor
-            return "Vista: Command Center AGY"
-        if action == "vault":
-            if self.mode != "vault":
-                if self.mode == "sessions":
-                    self.saved_session_cursor = self.cursor
-                self.mode = "vault"
-                self.cursor = 0
-                return "Vista: Baúl de handoffs compactados"
-            self.mode = "sessions"
-            self.cursor = self.saved_session_cursor
-            return "Vista: Command Center AGY"
+        if action in ("memory", "accounts", "vault"):
+            return self._toggle_view(action)
         if action == "nvapi_key":
             cur_cfg = _compact.load_nvapi_config()
             masked = _compact.mask_api_key(str(cur_cfg.get("api_key", "")))
@@ -882,23 +954,74 @@ class Dashboard:
         except OSError:
             pass
 
+    # ---- Confirmaciones: un único self.confirm (ver Confirm y CONFIRM_SPECS) ----
+    def _ask(self, kind: str, payload: Any, banner: str) -> None:
+        mode, any_key, cancel_msg = CONFIRM_SPECS[kind]
+        self.confirm = Confirm(kind, mode, payload, any_key, cancel_msg)
+        self.status_banner = banner
+
+    def _confirm_payload(self, kind: str) -> Any:
+        c = self.confirm
+        return c.payload if c is not None and c.kind == kind else None
+
+    def _set_confirm_payload(self, kind: str, payload: Any) -> None:
+        if payload is None or payload is False:
+            if self.confirm is not None and self.confirm.kind == kind:
+                self.confirm = None
+        else:
+            mode, any_key, cancel_msg = CONFIRM_SPECS[kind]
+            self.confirm = Confirm(kind, mode, payload, any_key, cancel_msg)
+
+    # Vistas por tipo de self.confirm (los dibujos y los tests leen y fijan estos nombres).
+    pending_compact_sess = property(lambda self: self._confirm_payload("modal"),
+                                    lambda self, v: self._set_confirm_payload("modal", v))
+    pending_delete_info = property(lambda self: self._confirm_payload("pending_delete"),
+                                   lambda self, v: self._set_confirm_payload("pending_delete", v))
+    pending_vault_delete = property(lambda self: self._confirm_payload("vault_confirm"),
+                                    lambda self, v: self._set_confirm_payload("vault_confirm", v))
+    pending_bulk_compact = property(lambda self: self._confirm_payload("bulk_confirm"),
+                                    lambda self, v: self._set_confirm_payload("bulk_confirm", v))
+    pending_dedup = property(lambda self: self._confirm_payload("dedup_confirm") is not None,
+                             lambda self, v: self._set_confirm_payload("dedup_confirm", True if v else None))
+
     def _clear_pending(self) -> None:
-        self.pending_compact_sess = None
-        self.pending_delete_info = None
-        self.pending_vault_delete = None
-        self.pending_bulk_compact = None
-        self.pending_dedup = False
+        self.confirm = None
 
     def _any_pending(self) -> bool:
-        return (self.pending_compact_sess is not None or self.pending_delete_info is not None
-                or self.pending_vault_delete is not None or self.pending_bulk_compact is not None
-                or self.pending_dedup)
+        return self.confirm is not None
 
-    def _reset_to_sessions(self) -> None:
+    def _active_confirm(self) -> Confirm | None:
+        """La confirmación abierta si pertenece a la vista actual (una de otra vista no cuenta)."""
+        c = self.confirm
+        return c if c is not None and c.mode == self.mode else None
+
+    # ---- Vistas: un solo sitio cambia de modo y guarda/restaura la sesión seleccionada ----
+    def _switch_view(self, mode: str) -> str:
+        """Va a `mode`. Al salir de sesiones se guarda la fila; entre otras vistas se conserva la
+        guardada. Cambiar de vista cierra cualquier confirmación abierta."""
+        if mode == "sessions":
+            return self._back_to_sessions()
+        if self.mode == "sessions":
+            self.saved_session_cursor = self.cursor
+        self.mode = mode
+        self.cursor = 0
+        self.confirm = None
+        if mode == "accounts":
+            self.trigger_quota_poll(force=False)
+        return VIEW_BANNERS[mode]
+
+    def _toggle_view(self, mode: str) -> str:
+        return self._back_to_sessions() if self.mode == mode else self._switch_view(mode)
+
+    def _back_to_sessions(self) -> str:
         if self.mode != "sessions":
             self.cursor = self.saved_session_cursor
         self.mode = "sessions"
-        self._clear_pending()
+        self.confirm = None
+        return VIEW_BANNERS["sessions"]
+
+    def _reset_to_sessions(self) -> None:
+        self._back_to_sessions()
         self.crash_streak = 0
 
     def _put_raw_banner(self) -> None:
@@ -961,7 +1084,7 @@ class Dashboard:
     # vista de cuentas se bloquean en _handle_account_key.
     SCAN_BLOCKED_ACTIONS = ("open", "open_full", "open_vault", "reload", "hibernate", "hib_all", "dedup",
                             "baton")
-    KEY_CODES = {"↵": 10, "Esc": 27}
+    KEY_CODES = {"↵": 10, "Esc": 27, "Tab": 9}  # código que manda un clic en esa tecla del pie
 
     # Pie de teclas por vista. Cada variante va de la más completa a la más corta; se usa la
     # primera que cabe en el ancho. Siempre empieza por la tecla que sale o cierra la vista.
@@ -1029,23 +1152,23 @@ class Dashboard:
         "modal": (
             ("c", "compactar con Nemotron y abrir"),
             ("C", "compactar solo al Baúl (2º plano)"),
-            ("b", "abrir la versión del Baúl"),
-            ("o / ↵", "abrir la conversación completa"),
-            ("k", "clave NVIDIA"),
-            ("q / n", "cancelar"),
+            ("b / B", "abrir la versión del Baúl"),
+            ("o / O / ↵", "abrir la conversación completa"),
+            ("k / K", "clave NVIDIA"),
+            ("q / n / N / Esc", "cancelar"),
         ),
         "accounts": (
             ("+", "añadir cuenta Pro"),
             ("x / Supr", "eliminar perfil (pide confirmación con S)"),
             ("s / ↵", "activar como cuenta por defecto"),
-            ("B", "baton pass de la sesión a esta cuenta"),
+            ("B / b", "baton pass de la sesión a esta cuenta"),
             ("R / r", "consultar cuotas"),
             ("↑↓ / j k", "mover (ratón: clic)"),
             ("u / m / Esc", "volver"),
             ("q / Tab", "siguiente ventana tmux"),
         ),
-        "pending_delete": (("S / Y", "confirmar: borra SOLO ese perfil local"), ("N / Esc / u / q", "cancelar")),
-        "pending_blocked": (("Esc / q", "volver"),),
+        "pending_delete": (("S / Y", "confirmar: borra SOLO ese perfil local"), ("n / N / Esc / u / q", "cancelar")),
+        "pending_blocked": (("Esc / q / n / N / u", "volver"),),
         "vault": (
             ("↵", "abrir del Baúl en una pestaña"),
             ("r", "re-compactar la sesión"),
@@ -1057,7 +1180,7 @@ class Dashboard:
         ),
         "vault_confirm": (("S / Y", "confirmar"), ("otra tecla", "cancelar")),
         "bulk_confirm": (("A / a", "confirmar"), ("otra tecla", "cancelar")),
-        "dedup_confirm": (("x / S", "cerrar las copias duplicadas inactivas"), ("otra tecla", "cancelar")),
+        "dedup_confirm": (("x / S / Y", "cerrar las copias duplicadas inactivas"), ("otra tecla", "cancelar")),
         "memory": (("↑↓ / j k", "mover"), ("m / Esc", "volver"), ("u", "cuentas"), ("q / Tab", "siguiente ventana tmux")),
     }
 
@@ -1074,19 +1197,13 @@ class Dashboard:
         put(self.stdscr, y, x, "─" * width, width, attr)
 
     def _view_name(self) -> str:
-        if self.mode == "accounts":
-            if self.pending_delete_info is not None:
-                return "pending_blocked" if self.pending_delete_info.get("blocked_reason") else "pending_delete"
-            return "accounts"
-        if self.mode == "vault":
-            if self.pending_vault_delete is not None:
-                return "vault_confirm"
-            return "bulk_confirm" if self.pending_bulk_compact is not None else "vault"
-        if self.mode == "memory":
-            return "memory"
-        if self.pending_dedup:
-            return "dedup_confirm"
-        return "modal" if self.pending_compact_sess is not None else "sessions"
+        """Vista de teclas: el modo, o el tipo de la confirmación abierta en ese modo."""
+        c = self._active_confirm()
+        if c is None:
+            return self.mode
+        if c.kind == "pending_delete" and (c.payload or {}).get("blocked_reason"):
+            return "pending_blocked"
+        return c.kind
 
     def _footer(self, view: str, cols: int) -> tuple[str, list[tuple[int, int, int]]]:
         """Texto del pie para `view` en `cols` columnas, y su mapa de clics (x0, x1, código)."""
@@ -1231,9 +1348,9 @@ class Dashboard:
 
     def _draw_inspector(self, now: float) -> None:
         insp_y = self.panel_btn_y + self._btn_rows() + 1
-        if insp_y >= HEADER_ROWS + self.list_avail or not self.sessions or not (0 <= self.cursor < len(self.sessions)):
+        sel = self.current_session()
+        if insp_y >= HEADER_ROWS + self.list_avail or sel is None:
             return
-        sel = self.sessions[self.cursor]
         self._rule(insp_y - 1, self.panel_x, self.panel_w)
         t_sig = _sessions.transcript_sig(sel.conversation_id)
         age_s = int(max(0, now - (t_sig[0] / 1e9))) if t_sig[0] else -1
@@ -1264,9 +1381,9 @@ class Dashboard:
                 and 0 <= self.cursor < len(self.sessions))
 
     def _draw_preview(self, now: float) -> None:
-        if not self._preview_visible():
+        sel = self.current_session()
+        if not self._preview_visible() or sel is None:
             return
-        sel = self.sessions[self.cursor]
         py = self.max_y - 3 - self.preview_height
         self._rule(py, 0, self.max_x - 1)
         if self.pending_compact_sess is not None:
@@ -1634,191 +1751,192 @@ class Dashboard:
         return _compact.open_vault_entry_in_tab(ve, switch_to=True)
 
     def handle_key(self, ch: int | str) -> None:
-        """Despacha una tecla según la vista activa."""
-        if isinstance(ch, str) and len(ch) == 1:
+        """Despacha una tecla con KEYMAP[vista de teclas]. Con una confirmación de
+        `any_key_cancels` abierta, cualquier tecla la cierra; si no tiene acción, la cancela."""
+        if isinstance(ch, str):
+            if len(ch) != 1:
+                return
             ch = ord(ch)
         if self.show_help:
             self.show_help = False  # cualquier tecla cierra la ayuda
             return
-        if ch == ord("?"):
+        if ch in GLOBAL_KEYS:  # "?"
             self.show_help = True
             return
-        if self.mode == "accounts":
-            self._handle_account_key(ch)
-            return
-        if self.mode == "vault":
-            self._handle_vault_key(ch)
-            return
-        if self.mode == "memory":
-            self._handle_memory_key(ch)
-            return
-        if self.mode == "sessions" and self.pending_compact_sess is not None:
-            self._handle_pending_compaction_key(ch)
-            return
-        self._handle_session_key(ch)
-
-    def _handle_account_key(self, ch: int) -> None:
-        self.acct_list = list(self.reg.get("accounts", {}).items())
-        if self.pending_delete_info is not None:
-            # Solo mayúsculas: `s` minúscula es "activar" en esta misma vista y no debe borrar nada.
-            if ch in (ord("Y"), ord("S")) and self.scan_failed:
-                # Los "PIDs vivos" del perfil salen del mismo escaneo que falló.
-                self.pending_delete_info = None
-                self.status_banner = self.SCAN_BLOCKED_MSG
-            elif ch in (ord("Y"), ord("S")) and not self.pending_delete_info.get("blocked_reason"):
-                ok, self.status_banner = _accounts.remove_account_slot(
-                    self.pending_delete_info["slot"],
-                    confirmed=True,
-                    sessions=self.sessions,
-                )
-                self.pending_delete_info = None
-                if ok and self.cursor > 0:
-                    self.cursor -= 1
-            elif ch in (ord("n"), ord("N"), 27, ord("u"), ord("q")):
-                self.pending_delete_info = None
-                self.status_banner = "Eliminación de perfil cancelada."
-            return
-        if ch in (ord("u"), ord("m"), 27):
-            self.mode = "sessions"
-            self.cursor = self.saved_session_cursor
-            self.status_banner = "Vista: Command Center AGY"
-        elif ch in (curses.KEY_UP, ord("k")):
-            self.cursor = max(0, self.cursor - 1)
-        elif ch in (curses.KEY_DOWN, ord("j")):
-            self.cursor += 1
-        elif ch in (ord("r"), ord("R")):
-            self.status_banner = self.execute_action("refresh_quota")
-        elif ch == ord("+"):
-            idx = 2
-            existing_accts = self.reg.get("accounts", {})
-            while f"pro{idx}" in existing_accts:
-                idx += 1
-            default_name = f"pro{idx}"
-            chosen = _prompt_curses_text(self.stdscr, "Nombre de nueva cuenta Pro aislada", default_name)
-            if not chosen:
-                self.status_banner = "Alta de cuenta cancelada."
+        conf = self._active_confirm()
+        action = KEYMAP.get(self._view_name(), {}).get(ch)
+        if conf is not None and conf.any_key_cancels:
+            self.confirm = None
+            if action is None:
+                self.status_banner = conf.cancel_msg
                 return
-            try:
-                self.status_banner = _tmuxctl.launch_account_login_tab(chosen)
-            except ValueError as ve:
-                self.status_banner = f"Nombre inválido: {ve}"
+        if action is None:
+            return
+        if action in EXEC_ACTIONS:
+            target = conf.payload if (conf is not None and conf.kind == "modal" and action in MODAL_TARGETED) else None
+            self.status_banner = self.execute_action(action, target) if target is not None else self.execute_action(action)
+            return
+        getattr(self, f"_k_{action}")(conf)
+
+    # ---- Acciones de tecla que no son de execute_action (KEYMAP -> _k_<acción>) ----
+    def _k_next_window(self, conf: Confirm | None) -> None:
+        _tmuxctl.tmux_cmd("next-window")
+
+    def _k_detach(self, conf: Confirm | None) -> None:
+        _tmuxctl.tmux_cmd("detach-client")
+
+    def _k_up(self, conf: Confirm | None) -> None:
+        self.cursor = max(0, self.cursor - 1)
+
+    def _k_down(self, conf: Confirm | None) -> None:
+        self.cursor += 1  # cada _draw_* lo acota a su lista (la del frame, no la de ahora)
+
+    def _k_back(self, conf: Confirm | None) -> None:
+        self.status_banner = self._back_to_sessions()
+
+    def _k_cancel(self, conf: Confirm | None) -> None:
+        if conf is not None:
+            self.confirm = None
+            self.status_banner = conf.cancel_msg
+
+    def _k_ask_dedup(self, conf: Confirm | None) -> None:
+        if self.scan_failed:
+            self.status_banner = self.SCAN_BLOCKED_MSG
+        elif not any(s.extra_procs for s in self.sessions):
+            self.status_banner = "No hay copias duplicadas que cerrar."
+        else:
+            n = sum(len(s.extra_procs) for s in self.sessions)
+            self._ask("dedup_confirm", True, f"¿Cerrar {n} copias duplicadas inactivas (mata sus procesos)? "
+                                             "[x] sí · otra tecla cancela")
+
+    def _selected_account(self) -> str | None:
+        self.acct_list = list(self.reg.get("accounts", {}).items())
+        return self.acct_list[self.cursor][0] if 0 <= self.cursor < len(self.acct_list) else None
+
+    def _k_acct_add(self, conf: Confirm | None) -> None:
+        idx = 2
+        existing_accts = self.reg.get("accounts", {})
+        while f"pro{idx}" in existing_accts:
+            idx += 1
+        chosen = _prompt_curses_text(self.stdscr, "Nombre de nueva cuenta Pro aislada", f"pro{idx}")
+        if not chosen:
+            self.status_banner = "Alta de cuenta cancelada."
+            return
+        try:
+            self.status_banner = _tmuxctl.launch_account_login_tab(chosen)
+        except ValueError as ve:
+            self.status_banner = f"Nombre inválido: {ve}"
+
+    def _k_acct_ask_delete(self, conf: Confirm | None) -> None:
         # 127 (Backspace en casi todas las terminales) no borra: solo `x` y Supr.
-        elif ch in (ord("x"), curses.KEY_DC) and self.acct_list and 0 <= self.cursor < len(self.acct_list):
-            del_slot = self.acct_list[self.cursor][0]
-            info = _accounts.inspect_account_removal(del_slot, sessions=self.sessions)
-            if info["blocked_reason"]:
-                self.status_banner = f"⚠️ {info['blocked_reason']}"
-            else:
-                self.pending_delete_info = info
-                self.status_banner = f"Revisa identidad/alcance de [{del_slot}] arriba: [S/Y] Confirmar | [N/Esc] Cancelar"
-        elif ch in (10, 13, curses.KEY_ENTER, ord("s")) and self.acct_list and 0 <= self.cursor < len(self.acct_list):
-            chosen_slot = self.acct_list[self.cursor][0]
-            # Leer-modificar-escribir con lock: el hilo de cuotas y Baton Pass escriben el mismo
-            # archivo, y guardar la copia del frame pisaría lo que escribieron entretanto.
-            self.reg = _accounts.update_accounts_registry(lambda r: r.__setitem__("active_slot", chosen_slot))
-            self._invalidate_io("reg")
-            self.status_banner = f"Cuenta por defecto cambiada a [{chosen_slot}]."
-        elif ch in (ord("b"), ord("B")) and self.acct_list and 0 <= self.cursor < len(self.acct_list):
-            chosen_slot = self.acct_list[self.cursor][0]
-            target_sess = self.sessions[self.saved_session_cursor] if (self.sessions and 0 <= self.saved_session_cursor < len(self.sessions)) else None
-            if not target_sess:
-                self.status_banner = "Selecciona una sesión primero antes de hacer Baton Pass."
-            elif self.scan_failed:
-                self.status_banner = self.SCAN_BLOCKED_MSG
-            else:
-                ok, msg = _accounts.baton_pass_session(target_sess, target_slot=chosen_slot)
-                self.status_banner = msg
-                if ok:
-                    self.mode = "sessions"
-                    self.cursor = self.saved_session_cursor
-        elif ch in (ord("q"), 9):
-            _tmuxctl.tmux_cmd("next-window")
+        del_slot = self._selected_account()
+        if del_slot is None:
+            return
+        info = _accounts.inspect_account_removal(del_slot, sessions=self.sessions)
+        if info["blocked_reason"]:
+            self.status_banner = f"⚠️ {info['blocked_reason']}"
+        else:
+            self._ask("pending_delete", info,
+                      f"Revisa identidad/alcance de [{del_slot}] arriba: [S/Y] Confirmar | [N/Esc] Cancelar")
 
-    def _handle_memory_key(self, ch: int) -> None:
-        if ch in (ord("m"), 27):
-            self.status_banner = self.execute_action("memory")  # desde memoria = volver
-        elif ch == ord("u"):
-            self.mode = "accounts"  # directo; saved_session_cursor ya guarda la sesión
-            self.cursor = 0
-            self.trigger_quota_poll(force=False)
-            self.status_banner = "Vista: Cuentas y cuotas"
-        elif ch in (curses.KEY_UP, ord("k")):
-            self.cursor = max(0, self.cursor - 1)
-        elif ch in (curses.KEY_DOWN, ord("j")):
-            self.cursor += 1
-            self._clamp_cursor()
-        elif ch in (ord("q"), 9):
-            _tmuxctl.tmux_cmd("next-window")
+    def _k_acct_delete_yes(self, conf: Confirm | None) -> None:
+        self.confirm = None
+        if conf is None:
+            return
+        if self.scan_failed:  # los "PIDs vivos" del perfil salen del mismo escaneo que falló
+            self.status_banner = self.SCAN_BLOCKED_MSG
+            return
+        ok, self.status_banner = _accounts.remove_account_slot(conf.payload["slot"], confirmed=True,
+                                                               sessions=self.sessions)
+        if ok and self.cursor > 0:
+            self.cursor -= 1
 
-    def _handle_vault_key(self, ch: int) -> None:
+    def _k_acct_activate(self, conf: Confirm | None) -> None:
+        chosen_slot = self._selected_account()
+        if chosen_slot is None:
+            return
+        # Leer-modificar-escribir con lock: el hilo de cuotas y Baton Pass escriben el mismo
+        # archivo, y guardar la copia del frame pisaría lo que escribieron entretanto.
+        self.reg = _accounts.update_accounts_registry(lambda r: r.__setitem__("active_slot", chosen_slot))
+        self._invalidate_io("reg")
+        self.status_banner = f"Cuenta por defecto cambiada a [{chosen_slot}]."
+
+    def _k_acct_baton(self, conf: Confirm | None) -> None:
+        chosen_slot = self._selected_account()
+        if chosen_slot is None:
+            return
+        target_sess = self.current_session()
+        if not target_sess:
+            self.status_banner = "Selecciona una sesión primero antes de hacer Baton Pass."
+        elif self.scan_failed:
+            self.status_banner = self.SCAN_BLOCKED_MSG
+        else:
+            ok, self.status_banner = _accounts.baton_pass_session(target_sess, target_slot=chosen_slot)
+            if ok:
+                self._back_to_sessions()
+
+    def _selected_vault_entry(self) -> dict | None:
         # La lista del último dibujo (la que ve el usuario); vacía solo antes del primer dibujo.
-        vault_entries = self.vault_entries or _compact.list_compacted_vault()
-        if self.pending_vault_delete is not None:
-            ve = self.pending_vault_delete
-            self.pending_vault_delete = None
-            if ch in (ord("S"), ord("Y")):
-                self._invalidate_io("vault")
-                if _compact.delete_vault_handoff(Path(ve["path"])):
-                    self.status_banner = f"🗑️ Eliminado '{ve['title'][:28]}' del Baúl."
-                    if self.cursor > 0:
-                        self.cursor -= 1
-                else:
-                    self.status_banner = f"No se pudo borrar '{ve['title'][:28]}'."
-            else:
-                self.status_banner = "Borrado cancelado."
-            return
-        if self.pending_bulk_compact is not None:
-            batch = self.pending_bulk_compact
-            self.pending_bulk_compact = None
-            if ch in (ord("A"), ord("a")):
-                self.status_banner = self._bulk_compact(batch)
-            else:
-                self.status_banner = "Compactación en lote cancelada."
-            return
-        if ch in (ord("v"), ord("V"), 27):
-            self.mode = "sessions"
-            self.cursor = self.saved_session_cursor
-            self.status_banner = "Vista: Command Center AGY"
-        elif ch in (curses.KEY_UP, ord("k")):
-            self.cursor = max(0, self.cursor - 1)
-        elif ch in (curses.KEY_DOWN, ord("j")):
-            self.cursor += 1
-        elif ch in (10, 13, curses.KEY_ENTER) and vault_entries and 0 <= self.cursor < len(vault_entries):
-            self.status_banner = self._open_vault_entry(vault_entries[self.cursor])
+        entries = self.vault_entries or _compact.list_compacted_vault()
+        return entries[self.cursor] if 0 <= self.cursor < len(entries) else None
+
+    def _k_vault_open(self, conf: Confirm | None) -> None:
+        ve = self._selected_vault_entry()
+        if ve is not None:
+            self.status_banner = self._open_vault_entry(ve)
             curses.flushinp()
-        elif ch == ord("r") and vault_entries and 0 <= self.cursor < len(vault_entries):
-            ve = vault_entries[self.cursor]
-            match_s = next((s for s in self.sessions if s.conversation_id == str(ve["conv_id"])), None)
-            if match_s is None:
-                match_s = _sessions.AgySession(
-                    conversation_id=str(ve["conv_id"]),
-                    title=str(ve["title"]),
-                    preview="",
-                    step_count=0,
-                    last_modified="",
-                    workspace=str(ve["workspace"]),
-                    db_status="CASCADE_RUN_STATUS_IDLE",
-                    not_fully_idle=False,
-                )
-            self.status_banner = self._start_compaction(match_s, open_when_done=False)[1]
-        elif ch in (ord("A"), ord("a")):
-            # Solo las pesadas que aún no tienen handoff en el Baúl (re-compactar una cuesta otra
-            # llamada a la API: para eso está [r] sobre la entrada). Pide confirmación con A.
-            heavy = [s for s in self.sessions
-                     if (_compact.should_offer_compaction(s)[0] or s.step_count >= _paths.COMPACT_MIN_STEPS)
-                     and _compact.get_vault_handoff(s.conversation_id) is None][:BULK_COMPACT_MAX]
-            if not heavy:
-                self.status_banner = "No hay sesiones pesadas sin handoff en el Baúl."
-            else:
-                self.pending_bulk_compact = heavy
-                self.status_banner = (f"¿Compactar {len(heavy)} sesiones pesadas con NVIDIA al Baúl? "
-                                      f"[A] sí · otra tecla cancela (máx. {BULK_COMPACT_MAX} por lote)")
+
+    def _k_vault_recompact(self, conf: Confirm | None) -> None:
+        ve = self._selected_vault_entry()
+        if ve is None:
+            return
+        match_s = next((s for s in self.sessions if s.conversation_id == str(ve["conv_id"])), None)
+        if match_s is None:
+            match_s = _sessions.AgySession(
+                conversation_id=str(ve["conv_id"]),
+                title=str(ve["title"]),
+                preview="",
+                step_count=0,
+                last_modified="",
+                workspace=str(ve["workspace"]),
+                db_status="CASCADE_RUN_STATUS_IDLE",
+                not_fully_idle=False,
+            )
+        self.status_banner = self._start_compaction(match_s, open_when_done=False)[1]
+
+    def _k_vault_ask_bulk(self, conf: Confirm | None) -> None:
+        # Solo las pesadas que aún no tienen handoff en el Baúl (re-compactar una cuesta otra
+        # llamada a la API: para eso está [r] sobre la entrada). Pide confirmación con A.
+        heavy = [s for s in self.sessions
+                 if (_compact.should_offer_compaction(s)[0] or s.step_count >= _paths.COMPACT_MIN_STEPS)
+                 and _compact.get_vault_handoff(s.conversation_id) is None][:BULK_COMPACT_MAX]
+        if not heavy:
+            self.status_banner = "No hay sesiones pesadas sin handoff en el Baúl."
+        else:
+            self._ask("bulk_confirm", heavy, f"¿Compactar {len(heavy)} sesiones pesadas con NVIDIA al Baúl? "
+                                             f"[A] sí · otra tecla cancela (máx. {BULK_COMPACT_MAX} por lote)")
+
+    def _k_bulk_yes(self, conf: Confirm | None) -> None:
+        if conf is not None:
+            self.status_banner = self._bulk_compact(conf.payload)
+
+    def _k_vault_ask_delete(self, conf: Confirm | None) -> None:
         # 127 (Backspace) no borra: solo `x` y Supr, y siempre con confirmación.
-        elif ch in (ord("x"), curses.KEY_DC) and vault_entries and 0 <= self.cursor < len(vault_entries):
-            self.pending_vault_delete = vault_entries[self.cursor]
-            self.status_banner = f"¿Borrar '{self.pending_vault_delete['title'][:28]}' del Baúl? [S] sí · otra tecla cancela"
-        elif ch in (ord("q"), 9):
-            _tmuxctl.tmux_cmd("next-window")
+        ve = self._selected_vault_entry()
+        if ve is not None:
+            self._ask("vault_confirm", ve, f"¿Borrar '{ve['title'][:28]}' del Baúl? [S] sí · otra tecla cancela")
+
+    def _k_vault_delete_yes(self, conf: Confirm | None) -> None:
+        if conf is None:
+            return
+        ve = conf.payload
+        self._invalidate_io("vault")
+        if _compact.delete_vault_handoff(Path(ve["path"])):
+            self.status_banner = f"🗑️ Eliminado '{ve['title'][:28]}' del Baúl."
+            if self.cursor > 0:
+                self.cursor -= 1
+        else:
+            self.status_banner = f"No se pudo borrar '{ve['title'][:28]}'."
 
     def _bulk_compact(self, batch: list[_sessions.AgySession]) -> str:
         started = 0
@@ -1831,84 +1949,6 @@ class Dashboard:
         if started:
             return f"📦 Compactando {started} sesiones pesadas en 2º plano al Baúl (sin abrir pestañas)."
         return "Esas sesiones ya se estaban compactando."
-
-    def _handle_pending_compaction_key(self, ch: int) -> None:
-        # Sobre la sesión que muestra el modal, no sobre la fila bajo el cursor.
-        pcs = self.pending_compact_sess
-        if ch == ord("c"):
-            self.status_banner = self.execute_action("compact", pcs)
-        elif ch == ord("C"):
-            self.status_banner = self.execute_action("vault_compact", pcs)
-        elif ch in (ord("b"), ord("B")):
-            self.status_banner = self.execute_action("open_vault", pcs)
-        elif ch in (10, 13, curses.KEY_ENTER, ord("o"), ord("O")):
-            self.status_banner = self.execute_action("open_full", pcs)
-        elif ch in (ord("k"), ord("K")):
-            self.status_banner = self.execute_action("nvapi_key")
-        elif ch in (27, ord("n"), ord("N"), ord("q")):
-            self.pending_compact_sess = None
-            self.status_banner = "Reactivación cancelada."
-
-    def _handle_session_key(self, ch: int) -> None:
-        if self.pending_dedup:
-            self.pending_dedup = False
-            if ch in (ord("x"), ord("S"), ord("Y")):
-                self.status_banner = self.execute_action("dedup")
-            else:
-                self.status_banner = "Cierre de copias duplicadas cancelado."
-            return
-        if ch in (ord("q"), 27, 9):
-            _tmuxctl.tmux_cmd("next-window")
-        elif ch == ord("D"):
-            _tmuxctl.tmux_cmd("detach-client")
-        elif ch in (curses.KEY_UP, ord("k")):
-            self.cursor = max(0, self.cursor - 1)
-        elif ch in (curses.KEY_DOWN, ord("j")):
-            self.cursor += 1
-        elif ch == ord("r"):
-            self.status_banner = self.execute_action("refresh")
-        elif ch == ord("m"):
-            self.status_banner = self.execute_action("memory")
-        elif ch == ord("u"):
-            self.status_banner = self.execute_action("accounts")
-        elif ch == ord("U"):
-            self.status_banner = self.execute_action("refresh_quota")
-        elif ch == ord("V"):
-            self.status_banner = self.execute_action("vault")
-        elif ch in (10, 13, curses.KEY_ENTER):
-            self.status_banner = self.execute_action("open")
-        elif ch == ord("c"):
-            self.status_banner = self.execute_action("compact")
-        elif ch == ord("C"):
-            self.status_banner = self.execute_action("vault_compact")
-        elif ch == ord("t"):
-            self.status_banner = self.execute_action("rename")
-        elif ch == ord("K"):
-            self.status_banner = self.execute_action("nvapi_key")
-        elif ch == ord("v"):
-            self.status_banner = self.execute_action("mirror")
-        elif ch == ord("R"):
-            self.status_banner = self.execute_action("reload")
-        elif ch == ord("n"):
-            self.status_banner = self.execute_action("new")
-        elif ch == ord("h"):
-            self.status_banner = self.execute_action("hibernate")
-        elif ch in (ord("H"), ord("a")):
-            self.status_banner = self.execute_action("hib_all")
-        elif ch == ord("x"):
-            if self.scan_failed:
-                self.status_banner = self.SCAN_BLOCKED_MSG
-            elif not any(s.extra_procs for s in self.sessions):
-                self.status_banner = "No hay copias duplicadas que cerrar."
-            else:
-                n = sum(len(s.extra_procs) for s in self.sessions)
-                self.pending_dedup = True
-                self.status_banner = (f"¿Cerrar {n} copias duplicadas inactivas (mata sus procesos)? "
-                                      "[x] sí · otra tecla cancela")
-        elif ch == ord("M"):
-            self.status_banner = self.execute_action("ranking")
-        elif ch in (ord("b"), ord("B")):
-            self.status_banner = self.execute_action("baton")
 
 
 def run_curses_tui(stdscr) -> None:
