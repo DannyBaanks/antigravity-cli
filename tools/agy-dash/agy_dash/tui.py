@@ -1,15 +1,21 @@
 """agy_dash.tui — the curses dashboard that runs in the tmux window named `0:⚡DASH` (tmux is required).
 
 Views (`Dashboard.mode`): sessions (default, with the compaction modal on top when a heavy session is
-opened), accounts (OAuth slots and quota), vault, memory; `?` overlays the key sheet of the current view.
+opened; terminals under 22 rows have no room for it, so its question goes to the bottom banner and the
+same keys answer it), accounts (OAuth slots and quota), vault, memory; `?` overlays the key sheet of the current view.
 
 Terms used in the UI:
 * AGY: the Antigravity CLI. A conversation (`conversation_id`) is what AGY stores; a session is one
   row here (a conversation plus its live process, if any); a tab is the tmux window that shows it.
-* Process scan: every ~0.6 s `sessions.load_sessions` matches AGY processes (Zig scanner) to
-  conversations. It fails when the scanner cannot read /proc or raises; the next good scan clears it.
+* Process scan: every ~0.6 s `sessions.load_sessions` matches AGY processes to conversations with
+  the Zig scanner (the `agy-fast-core` binary, built/located by `procs.ensure_zig_core`). It fails
+  when the scanner cannot read /proc or raises, or when tmux does not answer within
+  `tmuxctl.TMUX_TIMEOUT_SEC` (rc 124); the banner shows the reason and the next good scan clears it.
+  Only the SCAN_SESSION_LIMIT most recent conversations are listed (older ones stay on disk).
 * States: RUNNING (a turn in progress), BG-TASK (a tool still running), IDLE (waiting for you),
-  HIBERNATED (process killed to free RAM; its tab shows a wake stub that reopens it on Enter).
+  HIBERNATED (process killed to free RAM; its tab shows a wake stub that reopens it on Enter),
+  SAVED (no process, nothing to wake: reopening starts AGY on it), UNKNOWN (a live process with no
+  DB row yet: never treated as idle, so it is never hibernated, killed or deduplicated).
 * Accounts: a slot (primary, pro2, …) is an isolated AGY profile with its own OAuth login; the
   ARGON/GEMINI/CLAUDE/GPT columns are the free quota left per model family.
 * handoff: the summary NVIDIA Nemotron writes when a long conversation is compacted; reopening it
@@ -21,12 +27,16 @@ Terms used in the UI:
 
 Invariants: every draw goes through `_put`/`termtext.put` (terminal columns, never the last cell);
 while the process scan failed (`scan_failed`) nothing that opens, reloads or kills an AGY process of
-an existing conversation runs (open, reload, hibernate, dedup, Baton Pass, removing an account slot),
-because process state is unknown and a second writer could corrupt a conversation. Exceptions:
+an existing conversation runs (`Dashboard.SCAN_BLOCKED_ACTIONS`, plus removing an account slot and the
+accounts-view Baton Pass, gated in their own handlers), because process state is unknown and a second writer could corrupt a conversation. Exceptions:
 `n` (a brand-new conversation) and `+` (a login tab) touch no existing conversation. Selection
 follows the conversation id, not the row index, so a re-sorted scan never retargets a key.
-Environment: AGY_IDLE_HIBERNATE_SEC (auto-hibernate after N s IDLE; 0 = off, the default),
-ISYMEM_DIR, XDG_STATE_HOME (crash log), `swarm-ext` on PATH (model ranking, optional).
+Environment (read here): ISYMEM_DIR, XDG_STATE_HOME (crash log), `swarm-ext` on PATH (model ranking,
+optional). Read once in `paths.py` and used here through `_paths`: AGY_IDLE_HIBERNATE_SEC
+(auto-hibernate after N s IDLE; 0 = off, the default), AGY_QUOTA_WARN_PCT / AGY_QUOTA_CRIT_PCT /
+AGY_QUOTA_POLL_SEC (quota alert), AGY_COMPACT_MIN_STEPS / AGY_COMPACT_MIN_BYTES (what counts as
+heavy), AGY_NVAPI_BASE_URL / AGY_NVAPI_MODEL (compaction), AGY_REAL_HOME, AGY_BIN, AGY_LED_TICK_SEC,
+AGY_GOGC / AGY_GOMEMLIMIT, AGY_HB_*; `paths.py` is the full list with defaults.
 History: split from agy_dashboard.py @ f255869, then redesigned (see git log of this file).
 """
 from __future__ import annotations
@@ -95,7 +105,7 @@ def build_command_buttons(panel_w: int) -> list[CommandButton]:
 # claude-dash (the sibling dashboard for Claude Code). Providers: agy = Antigravity, nvapi = NVIDIA
 # NIM, codex = OpenAI Codex CLI, opencode = OpenCode, freellm = FreeLLMAPI gateway, qwen = Qwen Desktop.
 BOARD_PROVIDERS = "agy,nvapi,codex,opencode,freellm,qwen"
-SCAN_SESSION_LIMIT = 35  # most recent conversations loaded per scan
+SCAN_SESSION_LIMIT = 35  # most recent conversations listed per scan; destructive helpers rescan with 200
 BULK_COMPACT_MAX = 12  # [A] in the vault: at most this many NVIDIA compactions per batch
 COMPACT_PARALLEL = 2  # NVIDIA calls in flight at once; the rest of a batch waits its turn (no 429 storm)
 HEADER_ROWS = 6  # rows 0-5: header, RAM, quota, notice, title, column header; lists start here
@@ -111,7 +121,9 @@ CRASH_LOG_MAX_BYTES = 1 << 20  # past 1 MiB the log is rotated once to tui-error
 @dataclass
 class Confirm:
     """The one open confirmation (or the compaction modal). `kind` is also its key view: the
-    name used by KEYMAP, FOOTER_VARIANTS and HELP_LINES. It only applies while the dashboard is in
+    name used by KEYMAP, FOOTER_VARIANTS and HELP_LINES (a CONFIRM_SPECS key, no exceptions).
+    In the modal, [c]/[C]/[o]/[b] close it before acting; [k] (set the NVIDIA key) leaves it open
+    so the next key can compact with the new key. It only applies while the dashboard is in
     `mode`; with `any_key_cancels`, a key with no binding in that view cancels it (and every key
     closes it before its action runs)."""
     kind: str
@@ -192,7 +204,6 @@ KEYMAP = _keymap(
     },
     # Lower-case `s` is "activate" in the accounts view: only upper case confirms a deletion.
     pending_delete={"S Y": "acct_delete_yes", "n N Esc u q": "cancel"},
-    pending_blocked={"n N Esc u q": "cancel"},
     vault={
         "v V Esc": "back", "↑ k": "up", "↓ j": "down", "↵": "vault_open", "r": "vault_recompact",
         "A a": "vault_ask_bulk", "x Supr": "vault_ask_delete", "q Tab": "next_window",
@@ -227,8 +238,10 @@ def open_model_board() -> str:
 
     def _popup() -> None:
         try:
+            # timeout=None: display-popup bloquea hasta que cierras el popup; con el límite por
+            # defecto (2 s) tmux_cmd mataría el cliente y el ranking se cerraría solo.
             _tmuxctl.tmux_cmd("display-popup", "-E", "-w", "96%", "-h", "90%",
-                              "-T", " 🏆 Ranking de modelos · ping / bench ", line)
+                              "-T", " 🏆 Ranking de modelos · ping / bench ", line, timeout=None)
         except Exception:  # noqa: BLE001 — un traceback en stderr rompería la pantalla curses
             pass
     threading.Thread(target=_popup, daemon=True).start()
@@ -263,7 +276,9 @@ def _ram_bar(ratio: float, width: int = 20) -> str:
 
 
 def _prompt_curses_text(stdscr, prompt: str, default_val: str = "", max_len: int = 96, secret: bool = False) -> str:
-    """Pide una línea en el banner inferior; Esc / Ctrl+C cancela. Bloquea el bucle mientras dura
+    """Pide una línea en el banner inferior; Esc / Ctrl+C / Ctrl+G cancela (Ctrl+G es el cancelar
+    de readline/emacs). Esc espera ESC_SEQ_WAIT_MS por si es una secuencia (flechas, F-keys): una
+    letra tecleada en ese margen justo tras Esc se descarta con ella. Bloquea el bucle mientras dura
     (el panel no se repinta). `secret` muestra `•` en vez de lo tecleado (claves API: el texto
     quedaría en el scrollback de tmux)."""
     max_y, max_x = stdscr.getmaxyx()
@@ -336,7 +351,6 @@ def _prompt_curses_text(stdscr, prompt: str, default_val: str = "", max_len: int
     return val or default_val
 
 
-
 class Dashboard:
     """Estado y ciclo interactivo de la interfaz curses del dashboard."""
 
@@ -379,6 +393,7 @@ class Dashboard:
         self.conv_accounts: dict = {}
         self.model_disp = ""
         self.sel_for_alert: _sessions.AgySession | None = None
+        self.preflight_memo: tuple[tuple, float, bool] | None = None  # (clave, cuándo, ok)
         self.sel_slot = "primary"
         self.quota_alert: dict | None = None
         self.live: list[_sessions.AgySession] = []
@@ -420,7 +435,10 @@ class Dashboard:
         self.io_cache: dict[str, tuple[tuple, Any]] = {}  # clave -> (firma mtime, valor)
 
     def _configure_curses(self) -> None:
-        curses.curs_set(0)
+        try:
+            curses.curs_set(0)
+        except curses.error:  # terminal sin control de visibilidad del cursor
+            pass
         curses.use_default_colors()
         mouse_mask = (
             curses.BUTTON1_CLICKED
@@ -502,6 +520,9 @@ class Dashboard:
         open_when_done: bool = False,
         prompt_if_missing_key: bool = True,
     ) -> str:
+        """Lanza la compactación de `target_sess` en 2º plano y devuelve solo el mensaje para el
+        banner. Quien necesite saber si arrancó (started | running | nokey | cancelled) usa
+        `_start_compaction`, que devuelve (estado, mensaje)."""
         return self._start_compaction(target_sess, open_when_done=open_when_done,
                                       prompt_if_missing_key=prompt_if_missing_key)[1]
 
@@ -995,7 +1016,6 @@ class Dashboard:
 
     # ---- Confirmaciones: un único self.confirm (ver Confirm y CONFIRM_SPECS) ----
     def _ask(self, kind: str, payload: Any, banner: str) -> None:
-        # "pending_blocked" es solo una vista de teclas (un pending_delete con blocked_reason).
         if kind not in CONFIRM_SPECS:
             raise ValueError(f"_ask: {kind!r} no es una confirmación (CONFIRM_SPECS)")
         mode, any_key, cancel_msg = CONFIRM_SPECS[kind]
@@ -1156,7 +1176,6 @@ class Dashboard:
             (("q", "cancelar"), ("S", "confirmar borrado"), ("N", "cancelar")),
             (("q", "cancelar"), ("S", "confirmar")),
         ),
-        "pending_blocked": ((("q", "volver"),),),
         "vault": (
             (("q", "ventana"), ("↵", "abrir"), ("r", "re-compactar"), ("A", "compactar pesadas"),
              ("x", "borrar"), ("V", "volver")),
@@ -1211,7 +1230,6 @@ class Dashboard:
             ("q / Tab", "siguiente ventana tmux"),
         ),
         "pending_delete": (("S / Y", "confirmar: borra SOLO ese perfil local"), ("n / N / Esc / u / q", "cancelar")),
-        "pending_blocked": (("Esc / q / n / N / u", "volver"),),
         "vault": (
             ("↵", "abrir del Baúl en una pestaña"),
             ("r", "re-compactar la sesión"),
@@ -1244,8 +1262,6 @@ class Dashboard:
         c = self._active_confirm()
         if c is None:
             return self.mode
-        if c.kind == "pending_delete" and (c.payload or {}).get("blocked_reason"):
-            return "pending_blocked"
         return c.kind
 
     def _footer(self, view: str, cols: int) -> tuple[str, list[tuple[int, int, int]]]:
@@ -1293,8 +1309,7 @@ class Dashboard:
         if self.quota_alert:
             pf_badge = ""
             if self.sel_for_alert:
-                pf = _accounts.baton_preflight(self.sel_for_alert, target_slot=self.quota_alert.get("target_slot", ""), model=self.model_disp)
-                pf_badge = " · preflight OK" if pf["ok"] else " · esperando IDLE"
+                pf_badge = " · preflight OK" if self._preflight_ok(time.time()) else " · esperando IDLE"
             if self.quota_alert["target_slot"]:
                 tpct = f" ({self.quota_alert['target_pct']:.0f}%)" if self.quota_alert["target_pct"] >= 0 else ""
                 act_hint = f"Pulsa [B] → [{self.quota_alert['target_slot']}]{tpct}{pf_badge}"
@@ -1315,6 +1330,20 @@ class Dashboard:
             alert_txt = f" 💳 Cuenta [{self.sel_slot}]{mail_s}: {q_summary}"
             alert_attr = curses.color_pair(3) | curses.A_BOLD
         self._put(2, 0, alert_txt, alert_attr, pad=True)
+
+    PREFLIGHT_TTL_SEC = 1.0  # el preflight relee registro y settings.json: no en cada frame (~4 Hz)
+
+    def _preflight_ok(self, now: float) -> bool:
+        """`baton_preflight` de la sesión de la alerta, memorizado PREFLIGHT_TTL_SEC por
+        (conversación, estado, cuenta destino, modelo): cambiar cualquiera lo recalcula ya."""
+        sel = self.sel_for_alert
+        key = (sel.conversation_id, sel.state_label, self.quota_alert.get("target_slot", ""), self.model_disp)
+        hit = self.preflight_memo
+        if hit is not None and hit[0] == key and now - hit[1] < self.PREFLIGHT_TTL_SEC:
+            return hit[2]
+        ok = bool(_accounts.baton_preflight(sel, target_slot=key[2], model=self.model_disp)["ok"])
+        self.preflight_memo = (key, now, ok)
+        return ok
 
     def _compute_layout(self) -> None:
         # Layout split: Left Session List + Right Command Center Panel (if width >= 116)

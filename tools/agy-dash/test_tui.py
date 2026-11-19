@@ -24,7 +24,7 @@ KEY_FOR = {
     "baton": "B", "accounts": "u", "compact": "c", "rename": "t", "vault_compact": "C",
     "vault": "V", "nvapi_key": "K", "memory": "m", "ranking": "M",
 }
-VIEWS = ("sessions", "modal", "accounts", "pending_delete", "pending_blocked", "vault", "memory")
+VIEWS = ("sessions", "modal", "accounts", "pending_delete", "vault", "memory")
 
 
 class FakeWin:
