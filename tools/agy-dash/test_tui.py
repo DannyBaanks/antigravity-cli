@@ -136,11 +136,20 @@ class FooterAndButtonTests(unittest.TestCase):
         for action in ORIGINAL_ACTIONS:
             with self.subTest(action=action):
                 dash, _ = _dash()
+                pcs = None
                 if action in ("open_full", "open_vault"):
-                    dash.pending_compact_sess = mock.Mock()
+                    pcs = dash.pending_compact_sess = mock.Mock()
+                if action == "dedup":  # mata procesos: pide [x] otra vez (EGM r3)
+                    dash.sessions = [mock.Mock(extra_procs=[mock.Mock()])]
                 with mock.patch.object(dash, "execute_action", return_value="") as ea:
                     dash.handle_key(KEY_FOR[action])
-                ea.assert_called_once_with(action)
+                    if action == "dedup":
+                        ea.assert_not_called()
+                        dash.handle_key(KEY_FOR[action])
+                if pcs is not None:  # el modal actúa sobre la sesión que muestra (EGM r3)
+                    ea.assert_called_once_with(action, pcs)
+                else:
+                    ea.assert_called_once_with(action)
 
     def test_question_mark_opens_help_and_any_key_closes_it(self) -> None:
         dash, _ = _dash()

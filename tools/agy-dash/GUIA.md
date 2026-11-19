@@ -125,8 +125,8 @@ El panel `0:⚡DASH` muestra la lista de sesiones a la izquierda, la **Vista en 
 | `R` (`[R] ♻ Recargar Tab`) | `0:⚡DASH` | Recarga una pestaña ya abierta para sincronizar su último estado en disco |
 | `n` / `Alt+N` (`[n] ➕ Nueva`) | Global / `0:⚡DASH` | Abre nueva sesión `agy` optimizada (`KSM` + `GOMEMLIMIT=180MiB`) |
 | `h` (`[h] 💤 Hibernar 0MB`) | `0:⚡DASH` | Hiberna la sesión `IDLE` seleccionada a `0 MB RAM` |
-| `H` / `a` / `Alt+H` (`[H] ⚡ Hibernar IDLE`) | Global / `0:⚡DASH` | Hiberna todas las sesiones `IDLE` y adopta sus pestañas `💤`. **Antes cierra también las copias duplicadas inactivas** (lo mismo que `x`) |
-| `x` (`[x] 🧹 Deduplicar`) | `0:⚡DASH` | Cierra copias duplicadas: las externas sin hijos si la conversación está quieta, y la copia de dentro del dash sin hijos cuando una externa tiene la tarea en 2º plano (nunca a mitad de turno) |
+| `H` / `a` / `Alt+H` (`[H] ⚡ Hibernar IDLE`) | Global / `0:⚡DASH` | Hiberna todas las sesiones `IDLE` y adopta sus pestañas `💤`. **No cierra copias duplicadas** (eso mata procesos: es `x`) |
+| `x` (`[x] 🧹 Deduplicar`) | `0:⚡DASH` | Pide `x` otra vez (cualquier otra tecla cancela) y entonces cierra copias duplicadas: las externas sin hijos si la conversación está quieta, y la copia de dentro del dash sin hijos cuando una externa tiene la tarea en 2º plano (nunca a mitad de turno) |
 | `B` (`[B] 🔀 Baton Pass`) | `0:⚡DASH` / `👁️ Espejo` | Pasa la estafeta de la conversación + mismo modelo a otra cuenta Pro sin hacer logout |
 | `u` (`[u] 💳 Cuentas`) | `0:⚡DASH` | Abre gestor de cuentas Pro, cuotas `/usage` (`+`: login aislado, `B`: baton, `R`: refrescar) |
 | `U` | `0:⚡DASH` | Refresca en segundo plano las cuotas (`/usage`) de todas las cuentas |
@@ -162,7 +162,7 @@ El panel `0:⚡DASH` muestra la lista de sesiones a la izquierda, la **Vista en 
    - Abrir en el panel una sesión que corre en otra terminal: si esa copia está ocupada, o no se cierra, se abre el espejo (`👁`) en vez de un segundo `agy` escribiendo la misma conversación.
    - `self-compact` espera a que el turno termine de verdad (`--wait`, 900 s por defecto) antes de reemplazar la pestaña. Si sigue ocupada, deja el handoff en el Baúl sin cortar nada. `self` se resuelve por la pestaña del propio agente (`$TMUX_PANE`), no por la que estás mirando, y si hay ambigüedad pide el `conv_id`.
    - Eliminar una cuenta aislada: si AGY reemplazó un symlink compartido por un archivo real (pasa con `conversation_summaries.db`, y también con `.cache`, `.local`, `.config/gh`…), ese archivo se **mueve** a `accounts/.rescued/<cuenta>-<fecha>/` antes de purgar; nunca se borra.
-   - Si el escaneo de procesos (`agy-fast-core scan`) falla o tarda >1.5 s, el panel lo avisa en rojo y **bloquea abrir (también desde el Baúl), recargar, hibernar (también el auto-hibernate) y deduplicar** hasta el siguiente escaneo bueno; una compactación que termina entonces se queda en el Baúl sin abrir pestaña: un fallo no se confunde con "no hay ningún agy" (abrir ahí crearía un segundo escritor). Un `zig build` fallido no se reintenta en 10 min.
+   - Si el escaneo de procesos (`agy-fast-core scan`) falla o tarda >1.5 s, el panel lo avisa en rojo y **bloquea abrir (también desde el Baúl), recargar, hibernar (también el auto-hibernate), deduplicar, Baton Pass (también desde Cuentas) y borrar un perfil de cuenta** hasta el siguiente escaneo bueno (`n` nueva sesión y `+` login siguen: no tocan ninguna conversación existente); una compactación que termina entonces se queda en el Baúl sin abrir pestaña: un fallo no se confunde con "no hay ningún agy" (abrir ahí crearía un segundo escritor). Un `zig build` fallido no se reintenta en 10 min.
    - Una sesión viva sin fila en `conversation_summaries.db` sale como `UNKNOWN`: no se hiberna (no se puede demostrar que esté quieta).
    - Baton Pass espera a que la copia vieja de la pestaña termine antes de arrancar la nueva (máx. 10 s; si no, no abre otra).
    - Texto del transcript y títulos se limpian de caracteres de control antes de pintarse; tmux usa `set-clipboard external` y `allow-passthrough off`, así que un programa dentro de una pestaña no puede escribir tu portapapeles por OSC 52. Copiar con el ratón / `y` sigue yendo al portapapeles (xclip).
@@ -173,6 +173,9 @@ El panel `0:⚡DASH` muestra la lista de sesiones a la izquierda, la **Vista en 
    - La clave NVIDIA se teclea enmascarada (`•••`): no queda en el scrollback de tmux.
    - Con la ayuda (`?`) o una confirmación abiertas, el ratón no actúa sobre lo de debajo; solo valen las teclas del pie. En la vista Memoria, `m`/`Esc` vuelven y `u` abre Cuentas.
    - Una sesión abierta varias veces se avisa siempre en la línea 4 (amarillo) hasta que `[x]` cierre las copias inactivas.
+   - La selección sigue a la conversación, no al número de fila: si un escaneo reordena la lista, la tecla que pulses cae en la sesión que tenías marcada. El modal de compactación actúa sobre la sesión que muestra.
+   - Como mucho 2 compactaciones NVIDIA a la vez (`[A]` en el Baúl encola el resto). En el pie, `[q] ventana` salta a la siguiente ventana tmux: no cierra el panel.
+   - Si el panel falla al dibujarse, las teclas siguen funcionando; tras 3 fallos seguidos vuelve a la vista de sesiones. Cada error distinto se anota una vez en `~/.local/state/agy-dash/tui-errors.log` (se rota al pasar de 1 MiB).
 
 ## Variables de entorno
 
