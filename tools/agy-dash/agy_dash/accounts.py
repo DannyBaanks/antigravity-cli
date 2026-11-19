@@ -750,6 +750,8 @@ def baton_pass_session(
 
     # The caller's snapshot can be seconds old: re-read, and never cut a turn in progress.
     session = _sessions.refresh_session(session.conversation_id) or session
+    if _procs.scan_failed():  # the re-read itself failed: its process list cannot be trusted for kills
+        return False, f"⚠️ Baton Pass cancelado: el escaneo de procesos falló ({_procs.SCAN_STATE.get('reason')})."
     if session.db_status == "CASCADE_RUN_STATUS_RUNNING" or session.transcript_busy:
         return False, "⚠️ Baton Pass cancelado: la sesión tiene un turno en curso; espera a que termine."
     # Ensure zero duplicate writers: stop live external copies (verified) BEFORE the new account opens it.

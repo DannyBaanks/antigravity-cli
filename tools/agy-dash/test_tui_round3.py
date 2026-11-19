@@ -192,7 +192,8 @@ class Round3(unittest.TestCase):
         d.pending_compact_sess = s
         with mock.patch.object(tui.Dashboard, "_prepare_frame", lambda self, now: None):
             d.draw(0.0)
-        self.assertIn("[o] abrir completa", d.status_banner)
+        banner = "".join(t for y, _, t in win.writes if y == win.h - 2)
+        self.assertIn("[c] compactar", banner)  # se dibuja en el banner (ronda 6: sin pisar status_banner)
 
     def test_footer_q_no_longer_says_salir(self) -> None:
         for variants in tui.Dashboard.FOOTER_VARIANTS.values():

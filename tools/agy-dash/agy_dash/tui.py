@@ -11,7 +11,8 @@ Terms used in the UI:
   the Zig scanner (the `agy-fast-core` binary, built/located by `procs.ensure_zig_core`). It fails
   when the scanner cannot read /proc or raises, or when tmux does not answer within
   `tmuxctl.TMUX_TIMEOUT_SEC` (rc 124); the banner shows the reason and the next good scan clears it.
-  Only the SCAN_SESSION_LIMIT most recent conversations are listed (older ones stay on disk).
+  At most SCAN_SESSION_LIMIT rows are listed: live and hibernated sessions first (RUNNING, then
+  BG-TASK/UNKNOWN, other live, hibernated; each group newest first), saved ones fill what is left.
 * States: RUNNING (a turn in progress), BG-TASK (a tool still running), IDLE (waiting for you),
   HIBERNATED (process killed to free RAM; its tab shows a wake stub that reopens it on Enter),
   SAVED (no process, nothing to wake: reopening starts AGY on it), UNKNOWN (a live process with no
@@ -27,12 +28,14 @@ Terms used in the UI:
 
 Invariants: every draw goes through `_put`/`termtext.put` (terminal columns, never the last cell);
 while the process scan failed (`scan_failed`) nothing that opens, reloads or kills an AGY process of
-an existing conversation runs (`Dashboard.SCAN_BLOCKED_ACTIONS`, plus removing an account slot and the
-accounts-view Baton Pass, gated in their own handlers), because process state is unknown and a second writer could corrupt a conversation. Exceptions:
+an existing conversation runs (`Dashboard.SCAN_BLOCKED_ACTIONS`; plus, gated in their own handlers,
+the vault view's open, the dedup question, removing an account slot and the accounts-view Baton
+Pass), because process state is unknown and a second writer could corrupt a conversation. Exceptions:
 `n` (a brand-new conversation) and `+` (a login tab) touch no existing conversation. Selection
 follows the conversation id, not the row index, so a re-sorted scan never retargets a key.
 Environment (read here): ISYMEM_DIR, XDG_STATE_HOME (crash log), `swarm-ext` on PATH (model ranking,
-optional). Read once in `paths.py` and used here through `_paths`: AGY_IDLE_HIBERNATE_SEC
+optional). Read once in `paths.py` and used by this module or the ones it calls (sessions,
+compact, accounts, tmuxctl): AGY_IDLE_HIBERNATE_SEC
 (auto-hibernate after N s IDLE; 0 = off, the default), AGY_QUOTA_WARN_PCT / AGY_QUOTA_CRIT_PCT /
 AGY_QUOTA_POLL_SEC (quota alert), AGY_COMPACT_MIN_STEPS / AGY_COMPACT_MIN_BYTES (what counts as
 heavy), AGY_NVAPI_BASE_URL / AGY_NVAPI_MODEL (compaction), AGY_REAL_HOME, AGY_BIN, AGY_LED_TICK_SEC,
@@ -105,10 +108,10 @@ def build_command_buttons(panel_w: int) -> list[CommandButton]:
 # claude-dash (the sibling dashboard for Claude Code). Providers: agy = Antigravity, nvapi = NVIDIA
 # NIM, codex = OpenAI Codex CLI, opencode = OpenCode, freellm = FreeLLMAPI gateway, qwen = Qwen Desktop.
 BOARD_PROVIDERS = "agy,nvapi,codex,opencode,freellm,qwen"
-SCAN_SESSION_LIMIT = 35  # most recent conversations listed per scan; destructive helpers rescan with 200
+SCAN_SESSION_LIMIT = 35  # rows listed per scan (live first, see the docstring); destructive helpers rescan with 200
 BULK_COMPACT_MAX = 12  # [A] in the vault: at most this many NVIDIA compactions per batch
 COMPACT_PARALLEL = 2  # NVIDIA calls in flight at once; the rest of a batch waits its turn (no 429 storm)
-HEADER_ROWS = 6  # rows 0-5: header, RAM, quota, notice, title, column header; lists start here
+HEADER_ROWS = 6  # rows 0-5: header, RAM, quota, notice, column header, rule; lists start here
 FOOTER_ROWS = 3  # rule, banner, key footer
 RAM_BAR_FULL_MB = 2048  # the inspector's RAM bar is full at this PSS total
 CRASH_STREAK_RESET = 3  # this many failing frames in a row drop back to the sessions view
@@ -229,12 +232,17 @@ def model_board_command(exe: str | None = None) -> list[str] | None:
     return [exe, "board", "--providers", BOARD_PROVIDERS] if exe else None
 
 
+_BOARD_OPEN = threading.Lock()  # tomado mientras el popup del ranking está abierto: [M] no apila otro
+
+
 def open_model_board() -> str:
     """Open the interactive model ranking board in a tmux popup without blocking the TUI."""
     cmd = model_board_command()
     if not cmd:
         return "swarm-ext no está en el PATH (ISyCo tools/swarm_models): sin ranking de modelos"
     line = " ".join(shlex.quote(c) for c in cmd)
+    if not _BOARD_OPEN.acquire(blocking=False):
+        return "🏆 El ranking de modelos ya está abierto (ciérralo con Esc/q)"
 
     def _popup() -> None:
         try:
@@ -244,6 +252,8 @@ def open_model_board() -> str:
                               "-T", " 🏆 Ranking de modelos · ping / bench ", line, timeout=None)
         except Exception:  # noqa: BLE001 — un traceback en stderr rompería la pantalla curses
             pass
+        finally:
+            _BOARD_OPEN.release()
     threading.Thread(target=_popup, daemon=True).start()
     return "🏆 Ranking de modelos abierto (popup: ping/bench por modelo, Esc/q cierra)"
 
@@ -756,7 +766,7 @@ class Dashboard:
             return _compact.reload_session_tab(sel)
         if action == "new":
             _cli.cmd_open_new_tab(argparse.Namespace(cwd=str(Path.cwd())))
-            return "Creada nueva pestaña AGY optimizada (KSM + GOMEMLIMIT=180MiB)."
+            return f"Creada nueva pestaña AGY optimizada (KSM + GOMEMLIMIT={os.environ.get('GOMEMLIMIT', _paths.DEFAULT_GOMEMLIMIT)})."
         if action == "hibernate" and sel:
             ok, msg = _sessions.hibernate_session(sel)
             if ok:
@@ -835,19 +845,28 @@ class Dashboard:
             self.running_compact = list(self.compact_jobs.values())
         if done_compact_batch:
             self._invalidate_io("vault")
+        msgs: list[str] = []
+        fails: list[str] = []
         for c_sess, c_ok, c_msg, c_hfile, c_open in done_compact_batch:
             if c_ok and c_hfile is not None:
                 if c_open and self.scan_failed:
-                    self.status_banner = (f"✅ '{c_sess.title[:26]}' compactada y guardada en el Baúl; no se abre "
+                    msg = (f"✅ '{c_sess.title[:26]}' compactada y guardada en el Baúl; no se abre "
                                           "pestaña porque el escaneo de procesos falló (ábrela desde V).")
                 elif c_open:
                     open_msg = _compact.open_compacted_session_in_tab(c_sess, c_hfile, switch_to=True)
-                    self.status_banner = f"{c_msg} · {open_msg}"
+                    msg = f"{c_msg} · {open_msg}"
                 else:
-                    self.status_banner = f"✅ Guardado en el Baúl: '{c_sess.title[:26]}' — {c_msg} (V abre el Baúl)"
+                    msg = f"✅ Guardado en el Baúl: '{c_sess.title[:26]}' — {c_msg} (V abre el Baúl)"
+                msgs.append(msg)
                 self.force_scan = True
             else:
-                self.status_banner = f"❌ {c_msg}"
+                fails.append(f"❌ {c_msg}")
+        if len(msgs) + len(fails) == 1:
+            self.status_banner = (msgs + fails)[0]
+        elif msgs or fails:
+            # Varios resultados en el mismo frame: uno a uno solo se vería el último.
+            first_err = f" · {fails[0]}" if fails else ""
+            self.status_banner = f"🗜 Compactaciones: {len(msgs)} ok · {len(fails)} fallos{first_err} (V abre el Baúl)"
 
     def _adopt_scan_snapshot(self) -> None:
         if self.force_scan:
@@ -1335,13 +1354,15 @@ class Dashboard:
 
     def _preflight_ok(self, now: float) -> bool:
         """`baton_preflight` de la sesión de la alerta, memorizado PREFLIGHT_TTL_SEC por
-        (conversación, estado, cuenta destino, modelo): cambiar cualquiera lo recalcula ya."""
+        (conversación, estado, PIDs de sus procesos, cuenta destino, modelo): cambiar cualquiera lo
+        recalcula ya. Solo es el aviso del banner: la acción B vuelve a pasar el preflight."""
         sel = self.sel_for_alert
-        key = (sel.conversation_id, sel.state_label, self.quota_alert.get("target_slot", ""), self.model_disp)
+        pids = tuple(p.pid for p in ([sel.proc] if sel.proc else []) + list(sel.extra_procs))
+        key = (sel.conversation_id, sel.state_label, pids, self.quota_alert.get("target_slot", ""), self.model_disp)
         hit = self.preflight_memo
         if hit is not None and hit[0] == key and now - hit[1] < self.PREFLIGHT_TTL_SEC:
             return hit[2]
-        ok = bool(_accounts.baton_preflight(sel, target_slot=key[2], model=self.model_disp)["ok"])
+        ok = bool(_accounts.baton_preflight(sel, target_slot=key[3], model=self.model_disp)["ok"])
         self.preflight_memo = (key, now, ok)
         return ok
 
@@ -1715,19 +1736,21 @@ class Dashboard:
         if self.max_y < 3:
             return
         self._rule(self.max_y - 3, 0, self.max_x - 1)
+        status = self.status_banner
         if self.pending_compact_sess is not None and not self._preview_visible():
-            # Sin sitio para el modal (terminal bajo): sus teclas siguen activas, así que se dicen aquí.
-            self.status_banner = (f"🗜 '{self.pending_compact_sess.title[:30]}' es pesada: [c] compactar+ir · "
-                                  "[C] solo Baúl · [o] abrir completa · [Esc] cancelar")
+            # Sin sitio para el modal (terminal bajo): sus teclas siguen activas, así que se dicen aquí
+            # (solo en este frame: no pisa status_banner, que sigue siendo el de la última acción).
+            status = (f"🗜 '{self.pending_compact_sess.title[:30]}' es pesada: [c] compactar+ir · "
+                      "[C] solo Baúl · [o] abrir completa · [b] abrir del Baúl · [k] key NV · [Esc] cancelar")
         if self.running_compact:
             j0 = self.running_compact[0]
             el_s = int(max(0, now - j0["started"]))
             spin = _tmuxctl._SPINNER_FRAMES[self.led_tick % len(_tmuxctl._SPINNER_FRAMES)]
             banner_line = (
-                f"{spin} Compactando 2º plano ({len(self.running_compact)}): '{j0['title'][:26]}' ({el_s}s) | {self.status_banner}"
+                f"{spin} Compactando 2º plano ({len(self.running_compact)}): '{j0['title'][:26]}' ({el_s}s) | {status}"
             )
         else:
-            banner_line = self.status_banner
+            banner_line = status
         self._put(self.max_y - 2, 0, f" {banner_line}", curses.color_pair(4))
         text, self.footer_hits = self._footer(self._view_name(), self.max_x - 1)
         self._put(self.max_y - 1, 0, text, curses.A_REVERSE, pad=True)
@@ -1869,7 +1892,12 @@ class Dashboard:
         if action is None:
             return
         if action in EXEC_ACTIONS:
-            target = conf.payload if (conf is not None and conf.kind == "modal" and action in MODAL_TARGETED) else None
+            target = None
+            if conf is not None and conf.kind == "modal" and action in MODAL_TARGETED:
+                # La identidad viene del modal; el estado de procesos, del último escaneo: si entretanto
+                # arrancó un AGY externo, abrir con el snapshot viejo crearía un segundo escritor.
+                cid = conf.payload.conversation_id
+                target = next((s for s in self.sessions if s.conversation_id == cid), conf.payload)
             self.status_banner = self.execute_action(action, target) if target is not None else self.execute_action(action)
             return
         getattr(self, f"_k_{action}")(conf)
