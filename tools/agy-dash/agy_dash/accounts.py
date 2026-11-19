@@ -228,13 +228,24 @@ def save_accounts_registry(data: dict, registry_path: Path | None = None) -> Non
         os.chmod(reg_file.parent, 0o700)
     except OSError:
         pass
-    tmp = reg_file.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
-    os.replace(tmp, reg_file)
+    _paths.atomic_write_text(reg_file, json.dumps(data, indent=2, ensure_ascii=False), mode=0o600)
+
+
+def update_accounts_registry(mutate, registry_path: Path | None = None) -> dict:
+    """Reload + mutate + save under a lock: a slow caller never writes back a registry it read long ago."""
+    reg_file = registry_path or _paths.ACCOUNTS_REGISTRY
+    with _paths.file_lock(reg_file):
+        reg = load_accounts_registry(registry_path=registry_path)
+        mutate(reg)
+        save_accounts_registry(reg, registry_path=registry_path)
+    return reg
+
+
+def _mark_unauthenticated(slot: str) -> None:
+    def _m(reg: dict) -> None:
+        if slot in reg.get("accounts", {}):  # a slot removed meanwhile is not resurrected
+            reg["accounts"][slot]["authenticated"] = False
+    update_accounts_registry(_m)
 
 
 def model_to_quota_family(model_name: str) -> str:
@@ -308,7 +319,13 @@ def parse_usage_output(raw_stdout: str) -> dict:
         for grp in groups:
             gname = str(grp.get("name", ""))
             for b in grp.get("buckets", []) or []:
-                frac = float(b.get("remaining_fraction", 0.0))
+                raw_frac = b.get("remaining_fraction")
+                if raw_frac is None:
+                    continue  # unknown quota is not exhausted quota: no false CRITICAL / Baton Pass advice
+                try:
+                    frac = float(raw_frac)
+                except (TypeError, ValueError):
+                    continue
                 pct = round(max(0.0, min(100.0, frac * 100.0)), 1)
                 bid = str(b.get("id", ""))
                 buckets.append({
@@ -388,15 +405,16 @@ def refresh_account_quota(slot: str, timeout_sec: float = 15.0, *, allow_unauthe
     if slot not in reg["accounts"]:
         return False, f"Cuenta '{slot}' no existe en el registro."
     acct_info = reg["accounts"][slot]
-    if acct_info.get("mode") == "isolated" and not acct_info.get("authenticated", False) and not allow_unauthenticated:
+    is_isolated = acct_info.get("mode", "system" if slot == "primary" else "isolated") == "isolated"
+    if is_isolated and not acct_info.get("authenticated", False) and not allow_unauthenticated:
         return False, f"[{slot}] Pendiente de login OAuth (sin abrir navegador)."
 
     env = build_agy_env(slot)
     # Never trigger interactive browser tabs during background /usage checks
     env["AGY_NO_BROWSER"] = "1"
     env["BROWSER"] = "/bin/true"
-    no_browser_bin = ensure_isolated_home(slot).parent / "bin" if acct_info.get("mode") == "isolated" else (_paths.ACCOUNTS_DIR / "_nobrowser_bin")
-    if acct_info.get("mode") != "isolated":
+    no_browser_bin = ensure_isolated_home(slot).parent / "bin" if is_isolated else (_paths.ACCOUNTS_DIR / "_nobrowser_bin")
+    if not is_isolated:
         no_browser_bin.mkdir(parents=True, exist_ok=True)
         xo = no_browser_bin / "xdg-open"
         if not xo.exists():
@@ -404,6 +422,11 @@ def refresh_account_quota(slot: str, timeout_sec: float = 15.0, *, allow_unauthe
             os.chmod(xo, 0o755)
         env["PATH"] = f"{no_browser_bin}:{env.get('PATH', '')}"
     home_for_log = Path(env.get("HOME", str(_paths.HOME)))
+    log_path = home_for_log / ".gemini" / "antigravity-cli" / "cli.log"
+    try:
+        log_start = log_path.stat().st_size  # only lines written after the probe started count
+    except OSError:
+        log_start = 0
     try:
         proc = subprocess.Popen(
             [_paths.AGY_BIN, "-p", "/usage", "--output-format", "json"],
@@ -422,36 +445,35 @@ def refresh_account_quota(slot: str, timeout_sec: float = 15.0, *, allow_unauthe
                 proc.kill()
                 stdout_text, stderr_text = proc.communicate()
                 if "Authentication required" in stderr_text or "https://accounts.google.com/o/oauth2" in stderr_text:
-                    reg["accounts"][slot]["authenticated"] = False
-                    save_accounts_registry(reg)
+                    _mark_unauthenticated(slot)
                     return False, f"[{slot}] Sin sesión iniciada (requiere login OAuth)."
                 return False, f"[{slot}] Timeout consultando /usage."
             try:
                 stdout_text, stderr_text = proc.communicate(timeout=min(0.6, rem))
                 break
             except subprocess.TimeoutExpired:
-                log_path = home_for_log / ".gemini" / "antigravity-cli" / "cli.log"
-                if log_path.is_file() and (time.time() - log_path.stat().st_mtime) < 15:
-                    try:
+                # Isolated slots only: primary shares cli.log with every live agy, so its tail proves nothing.
+                if not is_isolated:
+                    continue
+                try:
+                    st = log_path.stat()
+                    if st.st_size > log_start and (time.time() - st.st_mtime) < 15:
                         with log_path.open("rb") as lf:
-                            lf.seek(0, os.SEEK_END)
-                            lf.seek(max(0, lf.tell() - 8192), os.SEEK_SET)
+                            lf.seek(max(log_start, st.st_size - 8192), os.SEEK_SET)
                             tail = lf.read().decode("utf-8", errors="replace")
                         if "starting OAuth flow" in tail and proc.poll() is None:
                             proc.kill()
                             stdout_text, stderr_text = proc.communicate()
-                            reg["accounts"][slot]["authenticated"] = False
-                            save_accounts_registry(reg)
+                            _mark_unauthenticated(slot)
                             return False, f"[{slot}] Sin sesión iniciada (requiere login OAuth)."
-                    except OSError:
-                        pass
+                except OSError:
+                    pass
                 continue
     except OSError as e:
         return False, f"[{slot}] Error ejecutando agy: {e}"
 
     if "Authentication required" in stderr_text:
-        reg["accounts"][slot]["authenticated"] = False
-        save_accounts_registry(reg)
+        _mark_unauthenticated(slot)
         return False, f"[{slot}] Sin sesión iniciada (requiere login OAuth)."
 
     parsed = parse_usage_output(stdout_text)
@@ -459,14 +481,18 @@ def refresh_account_quota(slot: str, timeout_sec: float = 15.0, *, allow_unauthe
         return False, f"[{slot}] /usage falló: {parsed.get('error', stderr_text[:100])}"
 
     email = extract_email_from_cli_log(home_for_log)
-    reg = load_accounts_registry()
-    acct = reg["accounts"].setdefault(slot, {"slot": slot, "mode": "isolated" if slot != "primary" else "system"})
-    if email:
-        acct["email"] = email
-    acct["authenticated"] = True
-    acct["quota"] = parsed
-    acct["updated_at"] = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    save_accounts_registry(reg)
+
+    def _store(reg: dict) -> None:
+        acct = reg["accounts"].get(slot)
+        if acct is None:
+            return  # removed while /usage ran: do not resurrect it
+        if email:
+            acct["email"] = email
+        acct["authenticated"] = True
+        acct["quota"] = parsed
+        acct["updated_at"] = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    update_accounts_registry(_store)
     return True, f"[{slot}] Cuota actualizada (mín {parsed['min_pct']}%)."
 
 
@@ -517,7 +543,8 @@ def compute_quota_alert(
                 best_target = sname
                 best_target_email = sdata.get("email", "")
             continue
-        other_pct = float(q.get("families", {}).get(check_fam, q.get("min_pct") or 100.0))
+        fallback = q.get("min_pct")
+        other_pct = float(q.get("families", {}).get(check_fam, 0.0 if fallback is None else fallback))
         if other_pct > best_target_pct:
             best_target = sname
             best_target_email = sdata.get("email", "")
@@ -554,7 +581,8 @@ def choose_baton_target(reg: dict, current_slot: str, model_name: str = "") -> s
             continue
         q = sdata.get("quota", {})
         if q.get("ok"):
-            score = float(q.get("families", {}).get(fam, q.get("min_pct") or 0.0))
+            fallback = q.get("min_pct")
+            score = float(q.get("families", {}).get(fam, 0.0 if fallback is None else fallback))
         else:
             score = -0.5
         if score > best_score:
@@ -662,7 +690,7 @@ def baton_preflight(
             "target_authorized": bool(chosen_slot and target_acct.get("authenticated", False)),
             "distinct_identity": not (source_email and target_email and source_email.lower() == target_email.lower()),
             "credentials_isolated": creds_isolated,
-            "target_has_quota": target_pct is None or target_pct > min_target_pct,
+            "target_has_quota": target_pct is None or target_pct > min_target_pct,  # unknown quota != exhausted
             "no_duplicate_operation": no_dup_ok,
             "state_preserved": state_ok,
         },
@@ -695,7 +723,10 @@ def exec_agy_optimized(
 
     if _procs.ensure_zig_core():
         cmd = [str(_paths.ZIG_CORE_BIN), "ksm-exec", _paths.AGY_BIN] + final_args
-        os.execvpe(str(_paths.ZIG_CORE_BIN), cmd, env)
+        try:
+            os.execvpe(str(_paths.ZIG_CORE_BIN), cmd, env)
+        except OSError as exc:
+            print(f"  agy-fast-core ksm-exec falló ({exc}); lanzando agy directo")
     cmd = [_paths.AGY_BIN] + final_args
     os.execvpe(_paths.AGY_BIN, cmd, env)
     return 0
@@ -717,6 +748,12 @@ def baton_pass_session(
     model_disp = pf["model_display"]
     model_slug = pf["model_slug"]
 
+    # The caller's snapshot can be seconds old: re-read, and never cut a turn in progress.
+    session = _sessions.refresh_session(session.conversation_id) or session
+    if _procs.scan_failed():  # the re-read itself failed: its process list cannot be trusted for kills
+        return False, f"⚠️ Baton Pass cancelado: el escaneo de procesos falló ({_procs.SCAN_STATE.get('reason')})."
+    if session.db_status == "CASCADE_RUN_STATUS_RUNNING" or session.transcript_busy:
+        return False, "⚠️ Baton Pass cancelado: la sesión tiene un turno en curso; espera a que termine."
     # Ensure zero duplicate writers: stop live external copies (verified) BEFORE the new account opens it.
     for p in ([session.proc] if session.proc else []) + list(session.extra_procs):
         if p and not p.in_dash:
@@ -871,8 +908,11 @@ def diverged_shared_items(slot: str, *, accounts_dir: Path | None = None) -> lis
     safe = validate_slot_name(slot)
     slot_home = (accounts_dir or _paths.ACCOUNTS_DIR) / safe / "home"
     found = []
+    # _SHARED_HOME_ITEMS too (.cache, .local, .config/gh...): a real dir there is user data (AGENTS §0c).
     for base, names in ((slot_home / ".gemini" / "antigravity-cli", _SHARED_AGY_DATA_ITEMS),
-                        (slot_home / ".gemini", _SHARED_GEMINI_ITEMS)):
+                        (slot_home / ".gemini", _SHARED_GEMINI_ITEMS),
+                        (slot_home, _SHARED_HOME_ITEMS),
+                        (slot_home / ".config", ("gh",))):
         for name in names:
             fp = base / name
             if fp.exists() and not fp.is_symlink():

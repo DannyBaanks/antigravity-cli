@@ -1,6 +1,7 @@
 """agy_dash.tmuxctl — split verbatim from agy_dashboard.py @ f255869 (Phase 1, no behaviour change)."""
 from __future__ import annotations
 
+import copy as _copy
 import re
 import shutil
 import subprocess
@@ -104,7 +105,7 @@ def write_tmux_config(self_path: Path) -> None:
     copy_action = f"send-keys -X copy-pipe-no-clear {tmux_dquote(clip_cmd)}" if clip_cmd else "send-keys -X copy-selection-no-clear"
     copy_exit_action = f"send-keys -X copy-pipe-and-cancel {tmux_dquote(clip_cmd)}" if clip_cmd else "send-keys -X copy-selection-and-cancel"
     passive_keys = passive_copy_bindings(copy_exit_action)
-    close_btn = " #[range=user|x_#{window_index} fg=#ff5555 bold]×#[range=window|#{window_index}]"
+    close_btn = " #[range=user|x_#{window_id} fg=#ff5555 bold]×#[range=window|#{window_index}]"
     py_self = f'python3 "{self_path}"'
     win_fmt = f"#{{?#{{m:*DASH*,#W}},,#[fg=#6272a4] #I:#W{close_btn} }}"
     win_cur_fmt = f"#{{?#{{m:*DASH*,#W}},,#[bg=#282a36,fg=#50fa7b,bold] ▸ #I:#W{close_btn} #[default]}}"
@@ -124,8 +125,8 @@ setw -g mode-keys vi
 set -g history-limit 50000
 set -g escape-time 10
 set -g focus-events on
-set -g set-clipboard on
-set -g allow-passthrough on
+set -g set-clipboard external
+set -g allow-passthrough off
 set -g base-index 0
 setw -g pane-base-index 0
 set -g renumber-windows on
@@ -155,7 +156,7 @@ bind -n M-c set -p @passive_copy 0 \\; copy-mode
 # Red ⚡ AGY DASH button (top-left) toggles Command Center; × closes tabs keeping busy agents alive
 bind -T root MouseDown1StatusLeft run-shell {tmux_dquote(py_self + " show-dash --toggle")}
 bind -T root MouseDown1Status if -F '#{{m:x_*,#{{mouse_status_range}}}}' {{ run-shell {tmux_dquote(py_self + " close-tab #{s/x_//:#{mouse_status_range}}")} }} {{ if -F '#{{==:#{{mouse_status_range}},keys}}' {{ display-popup -E -w 96% -h 33 -T " ⌨ Atajos " {tmux_dquote(py_self + " keys")} }} {{ if -F '#{{==:#{{mouse_status_range}},isymcp}}' {{ run-shell {tmux_dquote(py_self + " isymcp-tab")} }} {{ select-window -t = }} }} }}
-bind -T root MouseDown2Status run-shell {tmux_dquote(py_self + " close-tab #{window_index}")}
+bind -T root MouseDown2Status run-shell {tmux_dquote(py_self + " close-tab #{window_id}")}
 
 # Top dashboard bar powered by Zig `agy-fast-core statusbar` (<7ms)
 set -g status-position top
@@ -203,21 +204,22 @@ def passive_copy_bindings(copy_exit_action: str) -> str:
     return "\n".join(lines)
 
 
-def tmux_cmd(*args: str, capture: bool = False) -> subprocess.CompletedProcess:
-    if capture:
-        return subprocess.run(
-            ["tmux", "-L", _paths.TMUX_SOCKET, "-f", str(_paths.TMUX_CONF), *args],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-        )
-    return subprocess.run(
-        ["tmux", "-L", _paths.TMUX_SOCKET, "-f", str(_paths.TMUX_CONF), *args],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        text=True,
-    )
+# A hung tmux server must not hang the scanner thread: a stuck scan would keep showing the last
+# session list as live with scan_failed False. load_sessions turns a timeout into a failed scan.
+TMUX_TIMEOUT_SEC = 2.0
+TMUX_STATE: dict[str, int] = {"timeouts": 0}
+
+
+def tmux_cmd(*args: str, capture: bool = False, timeout: float | None = TMUX_TIMEOUT_SEC) -> subprocess.CompletedProcess:
+    """Run tmux on the agy-dash socket. `timeout=None` only for calls that block on purpose
+    (display-popup). On timeout returns rc 124 and counts it in TMUX_STATE["timeouts"]."""
+    argv = ["tmux", "-L", _paths.TMUX_SOCKET, "-f", str(_paths.TMUX_CONF), *args]
+    out = subprocess.PIPE if capture else subprocess.DEVNULL
+    try:
+        return subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=out, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        TMUX_STATE["timeouts"] += 1
+        return subprocess.CompletedProcess(argv, 124, "", f"tmux no respondió en {timeout:g} s")
 
 
 def ensure_dash_window_zero() -> None:
@@ -239,10 +241,15 @@ def ensure_dash_window_zero() -> None:
             tmux_cmd("swap-window", "-d", "-s", f"{_paths.TMUX_SESSION}:{new_idx}", "-t", f"{_paths.TMUX_SESSION}:0")
 
 
+def _no_dash_marker(name: str) -> str:
+    """Only the Command Center window may contain `DASH` (tmux formats and lookups match `*DASH*`)."""
+    return re.sub(r"DASH", "Dash", name)
+
+
 def _short_tab_title(title: str, prefix: str = "") -> str:
     clean = re.sub(r"[^A-Za-z0-9áéíóúÁÉÍÓÚñÑ_-]+", "-", title.strip()).strip("-")
     clean = clean[:15] or "session"
-    return f"{prefix}{clean}"
+    return _no_dash_marker(f"{prefix}{clean}")
 
 
 def _find_dash_window_idx() -> str:
@@ -290,6 +297,12 @@ def open_session_in_dashboard_tab(
     model: str = "",
 ) -> str:
     self_path = _paths.SELF_PATH
+    if _procs.scan_failed() and not as_stub and not force_live_mirror:
+        # Without a trustworthy scan, "no process" may be a live agy: opening one more would be a second writer.
+        return (
+            f"⚠ No se abre '{session.title[:30]}': el escaneo de procesos falló "
+            f"({_procs.SCAN_STATE.get('reason')}). Pulsa [r] para reintentar."
+        )
     # If this session was parked in hidden background `agy-bg`, pop the live window right back into view!
     bg_info = _get_bg_window_map().get(session.conversation_id)
     if bg_info is not None:
@@ -313,12 +326,15 @@ def open_session_in_dashboard_tab(
     if not as_stub and not use_mirror and session.proc is not None and not session.proc.in_dash:
         # Migrate an idle external copy into the dash: it must be verifiably gone BEFORE the new agy
         # opens the same conversation (two writers on one conversation corrupt its state).
-        if not session.external_busy:
+        session = _sessions.refresh_session(session.conversation_id) or session  # snapshot may be seconds old
+        if session.proc is not None and not session.proc.in_dash and not session.external_busy:
             ok, _why = _procs.terminate_verified(session.proc)
             if ok:
                 migrated_ext = True
-            elif not force_interactive:
-                use_mirror = True
+            else:
+                use_mirror = True  # never a second writer, even with force_interactive
+        elif session.proc is not None and not session.proc.in_dash:
+            use_mirror = True
 
     model_disp, model_slug = _accounts.resolve_model_arg(model)
     slot_flag = f" --account {sh_quote(chosen_slot)}" if chosen_slot else ""
@@ -355,6 +371,15 @@ def open_session_in_dashboard_tab(
             if session.conversation_id in hib_reg:
                 del hib_reg[session.conversation_id]
                 _sessions.save_hibernated_registry(hib_reg)
+            old = session.proc if (session.proc is not None and session.proc.in_dash) else None
+            if old is not None and not as_stub and not use_mirror:
+                # respawn-pane -k only sends SIGHUP and returns: wait for the old agy to be gone before the new
+                # one opens the same conversation (max 10 s), so the two writers never overlap.
+                cmd = (
+                    f"for _ in $(seq 100); do kill -0 {old.pid} 2>/dev/null || break; sleep 0.1; done; "
+                    f"kill -0 {old.pid} 2>/dev/null && {{ echo 'agy anterior (PID {old.pid}) sigue vivo; no se abre otra copia'; "
+                    f"sleep 30; exit 1; }}; {cmd}"
+                )
             tmux_cmd("respawn-pane", "-k", "-t", f"{_paths.TMUX_SESSION}:{existing_idx}.0", cmd)
             tmux_cmd("rename-window", "-t", f"{_paths.TMUX_SESSION}:{existing_idx}", tab_name)
             tmux_cmd("set-window-option", "-t", f"{_paths.TMUX_SESSION}:{existing_idx}", "@agy_account", chosen_slot)
@@ -366,12 +391,11 @@ def open_session_in_dashboard_tab(
             return f"Espejo en vivo tiempo real abierto en pestaña #{existing_idx} (<3MB, sin duplicar AGY)."
         return f"Pestaña #{existing_idx} ('{session.title}') lista."
 
-    args = ["new-window", "-t", _paths.TMUX_SESSION, "-n", tab_name, "-c", cwd]
+    args = ["new-window", "-P", "-F", "#{window_id}", "-t", _paths.TMUX_SESSION, "-n", tab_name, "-c", cwd]
     if not switch_to:
         args.insert(1, "-d")
     args.append(cmd)
-    tmux_cmd(*args)
-    cp = tmux_cmd("list-windows", "-t", _paths.TMUX_SESSION, "-F", "#{window_index}", capture=True)
+    cp = tmux_cmd(*args, capture=True)  # -P prints the new window's id: no guessing "the last index"
     if cp.returncode == 0 and cp.stdout and cp.stdout.strip():
         last_win = cp.stdout.strip().splitlines()[-1]
         tmux_cmd("set-window-option", "-t", f"{_paths.TMUX_SESSION}:{last_win}", "@agy_conv_id", session.conversation_id)
@@ -482,6 +506,8 @@ def format_led_tab_title(
 ) -> str:
     """Build a compact LED-marquee tab label with left-side Braille spinner dots when busy."""
     clean_title = re.sub(r"[^A-Za-z0-9áéíóúÁÉÍÓÚñÑ_-]+", "-", session.title.strip()).strip("-") or "session"
+    clean_title = _no_dash_marker(clean_title)
+    activity_text = _no_dash_marker(activity_text)
     if session.hibernated:
         return f"💤{clean_title[:width - 2]}"
     is_mirror = "👁" in session.dash_win_name
@@ -513,32 +539,40 @@ def sync_led_tmux_tabs(
     tick_idx: int,
     last_tab_names: dict[str, str],
     activity_cache: dict[str, tuple[tuple[int, int], str]],
-) -> None:
-    """Update open tmux tab names with animated spinner + LED action marquee, respecting user rename-window."""
+) -> list[tuple[str, str]]:
+    """Update open tmux tab names with animated spinner + LED action marquee, respecting user rename-window.
+
+    Runs on the LED thread: it never mutates the sessions it gets (they are the UI's objects) nor
+    writes titles to disk. A tab the user renamed by hand (`Ctrl+B ,`) is returned as
+    (conversation_id, title); the caller persists it and updates its sessions on its own thread."""
     cmds: list[str] = []
+    renames: list[tuple[str, str]] = []
     for s in sessions:
         if s.dash_win_idx is None:
             continue
         if s.dash_win_name.startswith("🔑"):
             continue
         prev = last_tab_names.get(s.dash_win_idx)
-        # If the user manually renamed the window in tmux (`Ctrl+B ,`), adopt and persist their custom title!
+        view = s
         if (
             prev is not None
             and s.dash_win_name
             and s.dash_win_name != prev
             and not _is_led_generated_name(s.dash_win_name)
         ):
-            _sessions.save_custom_title(s.conversation_id, s.dash_win_name)
-            s.title = s.dash_win_name.strip()
+            title = s.dash_win_name.strip()
+            renames.append((s.conversation_id, title))
+            view = _copy.copy(s)  # this tick's label already shows the new title
+            view.title = title
 
-        busy, act_txt = session_live_activity(s, activity_cache)
-        new_name = format_led_tab_title(s, tick_idx, act_txt, busy)
+        busy, act_txt = session_live_activity(view, activity_cache)
+        new_name = format_led_tab_title(view, tick_idx, act_txt, busy)
         if prev != new_name:
             last_tab_names[s.dash_win_idx] = new_name
             cmds.extend(["rename-window", "-t", f"{_paths.TMUX_SESSION}:{s.dash_win_idx}", new_name, ";"])
     if cmds:
         tmux_cmd(*cmds[:-1])
+    return renames
 
 
 def _ensure_bg_session() -> None:
@@ -553,13 +587,15 @@ def close_tab_safely(win_idx: str) -> str:
         "display-message",
         "-p",
         "-t",
-        f"{_paths.TMUX_SESSION}:{win_idx}",
-        "#{window_name}|#{@agy_conv_id}|#{pane_current_command}|#{pane_pid}",
+        win_idx if win_idx.startswith("@") else f"{_paths.TMUX_SESSION}:{win_idx}",
+        "#{window_index}|#{window_name}|#{@agy_conv_id}|#{pane_current_command}|#{pane_pid}",
         capture=True,
     )
     if cp.returncode != 0 or not cp.stdout.strip():
         return f"Pestaña #{win_idx} ya no existe."
-    parts = cp.stdout.strip().split("|", 3)
+    # The status bar passes a stable window id (@N): with renumber-windows on, an index could name another tab.
+    win_idx, _, rest = cp.stdout.strip().partition("|")
+    parts = rest.split("|", 3)
     win_name = parts[0] if len(parts) > 0 else ""
     conv_id = parts[1].strip() if len(parts) > 1 else ""
     pane_cmd = parts[2].strip() if len(parts) > 2 else ""
@@ -584,7 +620,7 @@ def close_tab_safely(win_idx: str) -> str:
         ),
         None,
     )
-    is_busy = bool(sess and sess.state_label in ("RUNNING", "BG-TASK"))
+    is_busy = bool(sess and sess.state_label in ("RUNNING", "BG-TASK", "UNKNOWN"))
     if is_busy:
         if sess and not conv_id:
             tmux_cmd("set-window-option", "-t", f"{_paths.TMUX_SESSION}:{win_idx}", "@agy_conv_id", sess.conversation_id)

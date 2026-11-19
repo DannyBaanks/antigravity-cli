@@ -129,6 +129,8 @@ OWNER: dict[str, str] = {
 "format_led_tab_title": "tmuxctl",
 "get_vault_handoff": "compact",
 "hibernate_session": "sessions",
+"hibernate_batch": "sessions",
+"hibernate_all_idle": "sessions",
 "hit_test_button": "tui",
 "inspect_account_removal": "accounts",
 "is_ancestor_pid": "procs",
