@@ -22,7 +22,7 @@ isymem list            # muestra la Memoria Compartida Multi-Harness (Claude/AGY
    - **Panel único en una sola ventana de consola (`tmux -L agy-dash`)** con barra superior de pestañas (`0:⚡DASH`, `1:● Sesión`, `2:💤 Sesión [0MB]`) y atajos directos (`Alt+0`/`Alt+D` para el Command Center, `Alt+1..9` para cambiar de sesión, `Alt+N` nueva sesión, `Alt+H` hibernar ociosas).
    - **KSM del kernel Linux 7.0 (`prctl(PR_SET_MEMORY_MERGE, 1)`) + tope del GC de Go (`GOGC=35 GOMEMLIMIT=180MiB`):** heredado tras `execve`, fusiona páginas anónimas idénticas entre procesos y frena el crecimiento del heap de Go.
    - **Auto-Hibernate a 0 MB de RAM:** las pestañas en reposo (`IDLE`, `not_fully_idle=0`) se hibernan liberando ~250–369 MB por sesión a **0 MB** y quedan representadas por un stub ligero (`<2 MB`) que despierta instantáneamente en el mismo lugar al pulsar `Enter` (`agy --conversation <uuid>`).
-3. **`isymem` (`tools/isymem/agent_memory.py`)** unifica la memoria nativa de Claude Code (`~/.claude/projects/<workspace>/memory/MEMORY.md`) con `docs/agent/memory/` e inyecta las reglas globales (`~/.gemini/GEMINI.md`, `~/.codex/AGENTS.md`, `~/.claude/CLAUDE.md`, `~/.qwen/QWEN.md`, `~/.config/opencode/AGENTS.md`) para que todas las TUIs compartan la misma memoria.
+3. **`isymem` (`tools/agent_memory.py` del monorepo ISyCo)** unifica la memoria nativa de Claude Code (`~/.claude/projects/<workspace>/memory/MEMORY.md`) con `docs/agent/memory/` e inyecta las reglas globales (`~/.gemini/GEMINI.md`, `~/.codex/AGENTS.md`, `~/.claude/CLAUDE.md`, `~/.qwen/QWEN.md`, `~/.config/opencode/AGENTS.md`) para que todas las TUIs compartan la misma memoria.
 
 ## Comandos (salida real ejecutada, 2026-11-17 22:49 -06:00)
 
@@ -52,8 +52,7 @@ $ agy-dash status
 
 ```
 $ agy-dash --detach
-Dashboard preparado en servidor tmux `agy-dash` (sesión `agy`).
-Para adjuntarte en tu ventana de consola ejecuta: `agy-dash`
+Dashboard listo en servidor tmux `agy-dash` (sesión `agy`).
 ```
 
 Para entrar desde tu consola interactiva:
@@ -126,8 +125,8 @@ El panel `0:⚡DASH` muestra la lista de sesiones a la izquierda, la **Vista en 
 | `R` (`[R] ♻ Recargar Tab`) | `0:⚡DASH` | Recarga una pestaña ya abierta para sincronizar su último estado en disco |
 | `n` / `Alt+N` (`[n] ➕ Nueva`) | Global / `0:⚡DASH` | Abre nueva sesión `agy` optimizada (`KSM` + `GOMEMLIMIT=180MiB`) |
 | `h` (`[h] 💤 Hibernar 0MB`) | `0:⚡DASH` | Hiberna la sesión `IDLE` seleccionada a `0 MB RAM` |
-| `H` / `a` / `Alt+H` (`[H] ⚡ Hibernar IDLE`) | Global / `0:⚡DASH` | Hiberna todas las sesiones `IDLE` y adopta sus pestañas `💤` |
-| `x` (`[x] 🧹 Deduplicar`) | `0:⚡DASH` | Cierra copias duplicadas inactivas fuera de `agy-dash` |
+| `H` / `a` / `Alt+H` (`[H] ⚡ Hibernar IDLE`) | Global / `0:⚡DASH` | Hiberna todas las sesiones `IDLE` y adopta sus pestañas `💤`. **Antes cierra también las copias duplicadas inactivas** (lo mismo que `x`) |
+| `x` (`[x] 🧹 Deduplicar`) | `0:⚡DASH` | Cierra copias duplicadas: las externas sin hijos si la conversación está quieta, y la copia de dentro del dash sin hijos cuando una externa tiene la tarea en 2º plano (nunca a mitad de turno) |
 | `B` (`[B] 🔀 Baton Pass`) | `0:⚡DASH` / `👁️ Espejo` | Pasa la estafeta de la conversación + mismo modelo a otra cuenta Pro sin hacer logout |
 | `u` (`[u] 💳 Cuentas`) | `0:⚡DASH` | Abre gestor de cuentas Pro, cuotas `/usage` (`+`: login aislado, `B`: baton, `R`: refrescar) |
 | `U` | `0:⚡DASH` | Refresca en segundo plano las cuotas (`/usage`) de todas las cuentas |
@@ -142,11 +141,11 @@ El panel `0:⚡DASH` muestra la lista de sesiones a la izquierda, la **Vista en 
 ### Multi-Cuenta Google Pro, Alertas LED, Compactación NVIDIA NIM y Baton Pass sin Logout
 
 1. **`primary`** usa automáticamente tu sesión actual en el keyring del sistema (`agy-dash quota --refresh`).
-2. **Agregar 2ª+ cuenta Pro sin cerrar la actual:** pulsa `u` -> `+` en el dashboard (o corre `agy-dash account add pro2`). Abre una pestaña aislada (`DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent` + `HOME` aislado con symlinks a tus conversaciones/MCP) para completar OAuth una sola vez sin tocar `primary`.
+2. **Agregar 2ª+ cuenta Pro sin cerrar la actual:** pulsa `u` -> `+` en el dashboard (o corre `agy-dash account add pro2`). Abre una pestaña aislada (`DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent` + `HOME` aislado) para completar OAuth una sola vez sin tocar `primary`. **Lo único aislado son los tokens OAuth**: el `HOME` aislado enlaza (symlink) tus conversaciones/MCP y también `.ssh`, `.gitconfig`, `.git-credentials`, `.local`, `.cargo`, `.rustup`, `.nvm`, `.npm`, `.bun`, `.cache` y `.config/gh`. Si en ese sitio ya hay un archivo real, se deja tal cual (no se reemplaza).
 3. **Baton Pass (`[B]` o `agy-dash baton <conv> [--to <slot>]`):** cuando la alerta de cuota baja (`🚨 <=5%` / `⚠️ <=15%`) avise en el banner del dashboard, pulsa `B` para relanzar exactamente `--conversation <uuid> --model <modelo>` bajo la cuenta con mayor cuota restante.
 4. **Compactador Externo con NVIDIA NIM (`[c]` / `[K]` / `agy-dash nvapi set-key <nvapi-...>`):**
    - Guarda tu API key de NVIDIA una sola vez (`~/.gemini/antigravity-cli/nvapi_config.json`, `0600`).
-   - Antes de reabrir una conversación `SAVED` o `HIBERNATED` pesada (`>=80` pasos o `>=120 KB`), aparece una pantalla que ofrece compactarla con **NVIDIA Nemotron Ultra** (`nvidia/llama-3.1-nemotron-ultra-253b-v1` / `nemotron-3-ultra-550b`), generando `compacted/<id>_handoff.md` y abriendo una sesión `agy` ligera con todo el estado técnico en ~1,000 tokens en lugar de >100,000 tokens de entrada.
+   - Antes de reabrir una conversación `SAVED` o `HIBERNATED` pesada (`>=40` pasos o `>=48 KB` de transcript; `AGY_COMPACT_MIN_STEPS` / `AGY_COMPACT_MIN_BYTES`), aparece una pantalla que ofrece compactarla con **NVIDIA Nemotron** (por defecto `nvidia/nemotron-3-ultra-550b-a55b`, `AGY_NVAPI_MODEL`; el slug viejo `llama-3_1-nemotron-ultra-253b-v1` se cambia solo al de por defecto), generando `compacted/<id>_handoff.md` y abriendo una sesión `agy` ligera con todo el estado técnico en ~1,000 tokens en lugar de >100,000 tokens de entrada.
 5. **Pestañas tipo letrero LED y Renombrado Persistente (`[t]` / `agy-dash rename` / `Ctrl+B ,`):**
    - Las pestañas en `RUNNING` / `BG-TASK` muestran un spinner Braille animándose a la izquierda (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`) junto con el título + la acción actual desplazándose estilo marquee (`Editing files...`, `Running cmd...`).
    - Si renombras una sesión con `[t]`, `agy-dash rename <id> "<nombre>"` o directamente en tmux (`Ctrl+B ,`), el nombre personalizado se guarda en `custom_titles.json` y en todas las `conversation_summaries.db` (incluyendo cuentas aisladas) sin regresar nunca al nombre anterior.
@@ -162,8 +161,29 @@ El panel `0:⚡DASH` muestra la lista de sesiones a la izquierda, la **Vista en 
    - Las copias duplicadas **ya no se cierran solas**: el panel avisa ("está abierta N veces") y tú decides con `[x]`. Antes se cerraba cada 10 s cualquier copia externa sin hijos, aunque fuera la terminal donde estabas escribiendo.
    - Abrir en el panel una sesión que corre en otra terminal: si esa copia está ocupada, o no se cierra, se abre el espejo (`👁`) en vez de un segundo `agy` escribiendo la misma conversación.
    - `self-compact` espera a que el turno termine de verdad (`--wait`, 900 s por defecto) antes de reemplazar la pestaña. Si sigue ocupada, deja el handoff en el Baúl sin cortar nada. `self` se resuelve por la pestaña del propio agente (`$TMUX_PANE`), no por la que estás mirando, y si hay ambigüedad pide el `conv_id`.
-   - Eliminar una cuenta aislada: si AGY reemplazó un symlink compartido por un archivo real (pasa con `conversation_summaries.db`), ese archivo se **mueve** a `accounts/.rescued/<cuenta>-<fecha>/` antes de purgar; nunca se borra.
+   - Eliminar una cuenta aislada: si AGY reemplazó un symlink compartido por un archivo real (pasa con `conversation_summaries.db`, y también con `.cache`, `.local`, `.config/gh`…), ese archivo se **mueve** a `accounts/.rescued/<cuenta>-<fecha>/` antes de purgar; nunca se borra.
+   - Si el escaneo de procesos (`agy-fast-core scan`) falla o tarda >1.5 s, el panel lo avisa en rojo y **bloquea abrir, hibernar y deduplicar** hasta el siguiente escaneo bueno: un fallo no se confunde con "no hay ningún agy" (abrir ahí crearía un segundo escritor). Un `zig build` fallido no se reintenta en 10 min.
+   - Una sesión viva sin fila en `conversation_summaries.db` sale como `UNKNOWN`: no se hiberna (no se puede demostrar que esté quieta).
+   - Baton Pass espera a que la copia vieja de la pestaña termine antes de arrancar la nueva (máx. 10 s; si no, no abre otra).
+   - Texto del transcript y títulos se limpian de caracteres de control antes de pintarse; tmux usa `set-clipboard external` y `allow-passthrough off`, así que un programa dentro de una pestaña no puede escribir tu portapapeles por OSC 52. Copiar con el ratón / `y` sigue yendo al portapapeles (xclip).
+   - **La compactación NVIDIA envía la conversación (tus mensajes, comandos y salidas resumidas) a `base_url`**: solo `https://`, sin seguir redirecciones (la key no viaja a otro host). Los "% de ahorro" son estimaciones (`max(pasos×140, bytes/4)` tokens), no medidas.
    - El escaneo de sesiones (~50 ms) corre en su propio hilo: las teclas ya no esperan. El spinner de pestañas va cada 0.9 s (`AGY_LED_TICK_SEC`).
+
+## Variables de entorno
+
+| Variable | Por defecto | Qué cambia |
+|---|---|---|
+| `AGY_BIN` | `~/.local/bin/agy` | binario de AGY que se lanza |
+| `AGY_GOGC` / `AGY_GOMEMLIMIT` | `35` / `180MiB` | tope del GC de Go inyectado a cada `agy` (menos RAM por proceso) |
+| `AGY_IDLE_HIBERNATE_SEC` | `0` (apagado) | hibernar por temporizador las sesiones IDLE con pestaña en el dash; con `0` solo se hiberna a mano |
+| `AGY_LED_TICK_SEC` | `0.9` | cadencia del spinner de las pestañas |
+| `AGY_QUOTA_WARN_PCT` / `AGY_QUOTA_CRIT_PCT` | `15` / `5` | % de cuota restante que pone la alerta en amarillo / rojo |
+| `AGY_QUOTA_POLL_SEC` | `120` | cada cuánto se consulta `/usage` en la vista de cuentas |
+| `AGY_HB_INTERVAL_SEC` | `300` | latido de contexto (hook) |
+| `AGY_HB_WARN_TOKENS` / `_RECOMMEND_` / `_URGENT_` | `100000` / `150000` / `200000` | umbrales absolutos del latido; además cuentan 20/45/70 % de la ventana (200k para claude/gpt/oss, 1M para el resto). Solo se leen los últimos 64 KB del transcript; si el último `PLANNER_RESPONSE` no cabe, se estima |
+| `AGY_COMPACT_MIN_STEPS` / `AGY_COMPACT_MIN_BYTES` | `40` / `49152` | a partir de cuándo se ofrece compactar al reabrir |
+| `AGY_NVAPI_BASE_URL` / `AGY_NVAPI_MODEL` | `https://integrate.api.nvidia.com/v1` / `nvidia/nemotron-3-ultra-550b-a55b` | destino y modelo de la compactación. La key sale de `nvapi_config.json` y, si no hay, de `NVIDIA_API_KEY` / `NVAPI_KEY` (la del archivo manda; guardar solo el modelo no copia la key del entorno al archivo) |
+| `AGY_REAL_HOME` / `AGY_REAL_DBUS` / `AGY_REAL_XDG_CONFIG` | — | los pone `agy-dash` al lanzar una cuenta aislada; no los toques a mano |
 
 ## Pestaña ISyMCP
 

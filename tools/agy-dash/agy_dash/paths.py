@@ -1,8 +1,39 @@
 """agy_dash.paths — split verbatim from agy_dashboard.py @ f255869 (Phase 1, no behaviour change)."""
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import os
+import tempfile
 from pathlib import Path
+
+
+@contextlib.contextmanager
+def file_lock(target: Path):
+    """Exclusive advisory lock beside `target` (TUI, Alt+H hotkey, hooks and the quota thread share files)."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with open(str(target) + ".lock", "a") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+def atomic_write_text(target: Path, text: str, *, mode: int | None = None) -> None:
+    """Write via a unique temp file in the same dir + os.replace: two writers never share one `.tmp`."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        if mode is not None:
+            os.chmod(tmp, mode)
+        os.replace(tmp, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def _resolve_real_home() -> Path:

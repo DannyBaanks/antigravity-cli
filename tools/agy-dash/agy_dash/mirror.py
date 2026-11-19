@@ -18,7 +18,8 @@ from . import tmuxctl as _tmuxctl
 
 def latest_active_task_log(conv_id: str, max_lines: int = 4) -> tuple[str, tuple[int, int], list[str]]:
     """Return (filename, (mtime_ns, size), tail_lines) for the newest task-*.log of conv_id."""
-    tasks_dir = _paths.BRAIN_DIR / conv_id / ".system_generated" / "tasks"
+    # Same roots as transcript_path_for (isolated account homes included): <brain>/<conv>/.system_generated/
+    tasks_dir = _sessions.transcript_path_for(conv_id).parent.parent / "tasks"
     if not tasks_dir.is_dir():
         return "", (0, 0), []
     newest_path: Path | None = None

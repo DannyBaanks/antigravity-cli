@@ -40,6 +40,21 @@ def mask_api_key(key: str) -> str:
     return f"{k[:6]}...{k[-4:]}"
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """urllib keeps the Authorization header across redirects: never follow one with the bearer key."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _nvapi_url_ok(base_url: str) -> bool:
+    parsed = urllib.parse.urlparse(base_url)
+    return parsed.scheme == "https" and bool(parsed.hostname)
+
+
 def load_nvapi_config(
     config_path: Path | None = None,
     *,
@@ -77,22 +92,21 @@ def save_nvapi_config(
     cfg_path: Path | None = None,
 ) -> dict:
     p = cfg_path or config_path or _paths.NVAPI_CONFIG_FILE
-    cur = load_nvapi_config(config_path=p)
+    # Start from the FILE, not load_nvapi_config(): that merges NVIDIA_API_KEY from the environment, and
+    # saving only --model must not copy an env key to disk.
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
+    except Exception:
+        raw = {}
+    cur = {k: raw[k] for k in ("api_key", "base_url", "model") if isinstance(raw, dict) and raw.get(k)}
     if api_key.strip():
         cur["api_key"] = api_key.strip()
     if model.strip():
         cur["model"] = model.strip()
     if base_url.strip():
         cur["base_url"] = base_url.strip().rstrip("/")
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(cur, indent=2, ensure_ascii=False), encoding="utf-8")
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
-    os.replace(tmp, p)
-    return cur
+    _paths.atomic_write_text(p, json.dumps(cur, indent=2, ensure_ascii=False), mode=0o600)
+    return load_nvapi_config(config_path=p)
 
 
 def estimate_session_tokens(conv_or_session: str | _sessions.AgySession, step_count: int = 0) -> tuple[int, int]:
@@ -222,6 +236,13 @@ def compact_conversation_with_nvapi(
     digest, orig_bytes = build_compaction_digest(session.conversation_id, session.title, session.workspace)
     orig_tokens = max(session.step_count * 140, orig_bytes // 4)
     base_url = cfg["base_url"]
+    if not _nvapi_url_ok(base_url):
+        return (
+            False,
+            f"❌ base_url NVAPI rechazada ({base_url}): debe ser https:// (la key y la conversación viajan ahí). "
+            "Para otro host https ponlo explícito con `agy-dash nvapi --base-url`.",
+            None,
+        )
     chosen_model = cfg["model"]
     if chosen_model.lower() == "auto":
         chosen_model = _discover_nvapi_nemotron_model(base_url, api_key)
@@ -238,12 +259,12 @@ def compact_conversation_with_nvapi(
     )
 
     candidates = [chosen_model] + [m for m in _NEMOTRON_CANDIDATE_MODELS if m != chosen_model]
-    url_open = opener or urllib.request.urlopen
+    url_open = opener or _NO_REDIRECT_OPENER.open
     summary_text = ""
     used_model = chosen_model
     last_err = ""
 
-    for cand in candidates[:4]:
+    for cand in candidates:
         payload = json.dumps({
             "model": cand,
             "messages": [
@@ -282,6 +303,14 @@ def compact_conversation_with_nvapi(
             last_err = f"HTTP {he.code}: {err_body or he.reason}"
             if he.code in (401, 403):
                 return (False, f"❌ NVIDIA API Key rechazada ({last_err}). Revisa con [K].", None)
+            continue
+        except urllib.error.URLError as ue:
+            last_err = str(ue.reason)
+            if isinstance(ue.reason, (TimeoutError, OSError)) and "timed out" in str(ue.reason):
+                continue  # a slow model: the next candidate may answer
+            break  # host unreachable / DNS: every candidate shares the host
+        except (TimeoutError, json.JSONDecodeError) as e:
+            last_err = str(e)
             continue
         except Exception as e:
             last_err = str(e)

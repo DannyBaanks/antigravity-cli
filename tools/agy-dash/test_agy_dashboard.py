@@ -219,7 +219,7 @@ class AgyDashboardTests(unittest.TestCase):
                 conf_txt = ad.TMUX_CONF.read_text(encoding="utf-8")
                 self.assertIn("MouseDrag1Pane", conf_txt)
                 self.assertIn("copy-pipe-no-clear" if "copy-pipe-no-clear" in conf_txt else "copy-selection-no-clear", conf_txt)
-                self.assertIn("range=user|x_#{window_index}", conf_txt)
+                self.assertIn("range=user|x_#{window_id}", conf_txt)
                 self.assertIn("close-tab", conf_txt)
                 self.assertIn("{ run-shell", conf_txt)
                 self.assertIn("#[bg=#{?#{m:*DASH*,#{window_name}},#50fa7b,#e94560}", conf_txt)

@@ -15,11 +15,31 @@ from . import paths as _paths
 from . import tmuxctl as _tmuxctl
 
 
+_ZIG_BUILD_FAILED_AT = 0.0  # negative cache: a failed `zig build` is not retried on every ~0.5 s refresh
+_ZIG_BUILD_RETRY_SEC = 600.0
+
+# Last process-scan outcome. A failed scan must never look like "no agy running": callers that would open
+# a second writer or kill something check `scan_failed()` first.
+SCAN_STATE: dict[str, object] = {"failed": False, "reason": ""}
+
+
+def scan_failed() -> bool:
+    return bool(SCAN_STATE.get("failed"))
+
+
+def _mark_scan(failed: bool, reason: str = "") -> None:
+    SCAN_STATE["failed"] = failed
+    SCAN_STATE["reason"] = reason
+
+
 def ensure_zig_core() -> bool:
     """Return True if `agy-fast-core` exists, compiling via `zig build` if missing."""
+    global _ZIG_BUILD_FAILED_AT
     if _paths.ZIG_CORE_BIN.is_file() and os.access(_paths.ZIG_CORE_BIN, os.X_OK):
         return True
     if not shutil.which("zig") or not (_paths.ZIG_CORE_DIR / "build.zig").is_file():
+        return False
+    if _ZIG_BUILD_FAILED_AT and time.time() - _ZIG_BUILD_FAILED_AT < _ZIG_BUILD_RETRY_SEC:
         return False
     try:
         cp = subprocess.run(
@@ -39,6 +59,7 @@ def ensure_zig_core() -> bool:
             return True
     except Exception:
         pass
+    _ZIG_BUILD_FAILED_AT = time.time()
     return False
 
 
@@ -97,7 +118,9 @@ def _proc_is_agy(pid: int) -> bool:
         argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
     except OSError:
         return False
-    return any(Path(a.decode("utf-8", "replace")).name.startswith("agy") for a in argv[:2] if a)
+    # Exact basename: `agy-dash`, `agy-fast-core`, `agy-limited`, `agy_dashboard.py` are NOT agy.
+    names = {"agy", Path(_paths.AGY_BIN).name}
+    return any(Path(a.decode("utf-8", "replace")).name in names for a in argv[:2] if a)
 
 
 def terminate_verified(proc: "ProcMemInfo", *, timeout_s: float = 8.0) -> tuple[bool, str]:
@@ -111,7 +134,9 @@ def terminate_verified(proc: "ProcMemInfo", *, timeout_s: float = 8.0) -> tuple[
     cur = proc_start_ticks(pid)
     if cur == 0:
         return True, f"PID {pid} ya no existía"
-    if proc.start_ticks and cur != proc.start_ticks:
+    if not proc.start_ticks:
+        return False, f"PID {pid}: hora de arranque desconocida en el escaneo; no se toca"
+    if cur != proc.start_ticks:
         return False, f"PID {pid} fue reutilizado por otro proceso; no se toca"
     if not _proc_is_agy(pid):
         return False, f"PID {pid} ya no es agy; no se toca"
@@ -130,6 +155,7 @@ def terminate_verified(proc: "ProcMemInfo", *, timeout_s: float = 8.0) -> tuple[
 def zig_scan() -> tuple[int, dict[str, int], dict[str, list[ProcMemInfo]]]:
     """Call `agy-fast-core scan` (Zig) and parse its JSON in Python."""
     dash_server_pids = _tmuxctl._get_tmux_dash_server_pids()
+    reason = "agy-fast-core no disponible (ni compilable)"
     if ensure_zig_core():
         try:
             cp = subprocess.run(
@@ -168,7 +194,12 @@ def zig_scan() -> tuple[int, dict[str, int], dict[str, list[ProcMemInfo]]]:
                         start_ticks=proc_start_ticks(int(p["pid"])),
                     )
                     by_conv.setdefault(cid, []).append(pinfo)
+                _mark_scan(False)
                 return scan_us, ksm, by_conv
-        except Exception:
-            pass
+            reason = f"agy-fast-core scan rc={cp.returncode}"
+        except subprocess.TimeoutExpired:
+            reason = "agy-fast-core scan tardó >1.5s"
+        except Exception as exc:
+            reason = f"agy-fast-core scan: {type(exc).__name__}"
+    _mark_scan(True, reason)
     return 0, {"run": 1, "pages_shared": 0, "pages_sharing": 0, "pages_scanned": 0}, {}
