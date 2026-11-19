@@ -1,4 +1,21 @@
-"""agy_dash.tui — split verbatim from agy_dashboard.py @ f255869 (Phase 1, no behaviour change)."""
+"""agy_dash.tui — the curses dashboard that runs in the tmux window named `0:⚡DASH` (tmux is required).
+
+Views (`Dashboard.mode`): sessions (default, with the compaction modal on top when a heavy session is
+opened), accounts (OAuth slots and quota), vault, memory; `?` overlays the key sheet of the current view.
+
+Terms used in the UI:
+* handoff: the summary NVIDIA Nemotron writes when a long conversation is compacted; reopening it
+  starts a fresh, cheap AGY conversation that continues from that summary.
+* Baúl (vault): the folder of saved handoffs (`compact.list_compacted_vault`).
+* Baton Pass: reopen the selected session under another Pro account when this one is out of quota.
+* isymem: the shared agent memory (MEMORY.md, found via $ISYMEM_DIR, ./docs/agent/memory or
+  ~/.config/isyco-memory/memory) shown read-only in the memory view.
+
+Invariants: every draw goes through `_put`/`termtext.put` (terminal columns, never the last cell);
+while the process scan failed (`scan_failed`) nothing that opens, reloads or kills an AGY process
+runs, because process state is unknown and a second writer could corrupt a conversation.
+History: split from agy_dashboard.py @ f255869, then redesigned (see git log of this file).
+"""
 from __future__ import annotations
 
 import argparse
@@ -18,7 +35,7 @@ from . import paths as _paths
 from . import procs as _procs
 from . import sessions as _sessions
 from . import tmuxctl as _tmuxctl
-from .termtext import clean, fit, put, tail, text_cols
+from .termtext import clean, ellipsize, fit, put, tail, text_cols
 
 
 # ============================================================================
@@ -59,8 +76,14 @@ def build_command_buttons(panel_w: int) -> list[CommandButton]:
     ]
 
 
-# swarm-ext (ISyCo tools/swarm_models): ping + bench + ranking of every swarm model, shared with claude-dash
+# swarm-ext (ISyCo tools/swarm_models): ping + bench + ranking of every swarm model, shared with
+# claude-dash (the sibling dashboard for Claude Code). Providers: agy = Antigravity, nvapi = NVIDIA
+# NIM, codex = OpenAI Codex CLI, opencode = OpenCode, freellm = FreeLLMAPI gateway, qwen = Qwen Desktop.
 BOARD_PROVIDERS = "agy,nvapi,codex,opencode,freellm,qwen"
+SCAN_SESSION_LIMIT = 35  # most recent conversations loaded per scan
+BULK_COMPACT_MAX = 12  # [A] in the vault: at most this many NVIDIA compactions per batch
+DEFAULT_BANNER = "Listo · ↑/↓ elige una sesión · ? muestra todas las teclas"
+CRASH_LOG = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "agy-dash" / "tui-errors.log"
 
 
 def model_board_command(exe: str | None = None) -> list[str] | None:
@@ -86,11 +109,16 @@ def hit_test_button(
     panel_y: int,
     mouse_x: int,
     mouse_y: int,
+    max_row: int | None = None,
 ) -> str | None:
+    """Botón bajo (mouse_x, mouse_y). `max_row` (exclusivo) descarta los botones que el dibujo
+    no pintó por falta de alto: un botón invisible no debe dispararse al clicar el texto de encima."""
     for b in buttons:
         bx0 = panel_x + b.col_offset
         bx1 = bx0 + b.width - 1
         by = panel_y + b.row_offset
+        if max_row is not None and by >= max_row:
+            continue
         if mouse_y == by and bx0 <= mouse_x <= bx1:
             return b.action_id
     return None
@@ -102,8 +130,10 @@ def _ram_bar(ratio: float, width: int = 20) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
-def _prompt_curses_text(stdscr, prompt: str, default_val: str = "", max_len: int = 96) -> str:
-    """Prompt cleanly for single-line input in the bottom banner; Esc / Ctrl+C cancels immediately."""
+def _prompt_curses_text(stdscr, prompt: str, default_val: str = "", max_len: int = 96, secret: bool = False) -> str:
+    """Pide una línea en el banner inferior; Esc / Ctrl+C cancela. Bloquea el bucle mientras dura
+    (el panel no se repinta). `secret` muestra `•` en vez de lo tecleado (claves API: el texto
+    quedaría en el scrollback de tmux)."""
     max_y, max_x = stdscr.getmaxyx()
     stdscr.timeout(-1)
     curses.noecho()
@@ -118,7 +148,8 @@ def _prompt_curses_text(stdscr, prompt: str, default_val: str = "", max_len: int
         while True:
             stdscr.move(max_y - 2, 0)
             stdscr.clrtoeol()
-            shown = tail(clean(msg + "".join(buf)), max_x - 2)
+            typed = "•" * len(buf) if secret else "".join(buf)
+            shown = tail(clean(msg + typed), max_x - 2)
             put(stdscr, max_y - 2, 0, shown, max_x - 2, curses.color_pair(4) | curses.A_BOLD)
             stdscr.refresh()
             try:
@@ -158,7 +189,7 @@ def _prompt_curses_text(stdscr, prompt: str, default_val: str = "", max_len: int
                 continue
             if isinstance(key, str) and key.isprintable() and len(buf) < max_len:
                 buf.append(key)
-    except Exception:
+    except curses.error:
         cancelled = True
     finally:
         curses.noecho()
@@ -182,7 +213,7 @@ class Dashboard:
         self.cursor = 0
         self.saved_session_cursor = 0
         self.mode = "sessions"
-        self.status_banner = "Listo · ↑/↓ elige una sesión · ? muestra todas las teclas"
+        self.status_banner = DEFAULT_BANNER
         self.last_auto_check = time.time()
         self.idle_seen_since: dict[str, float] = {}
         self.cached_preview_cid = ""
@@ -246,6 +277,10 @@ class Dashboard:
         self.footer_hits: list[tuple[int, int, int]] = []
         # Escaneo de procesos fallido: lo pone _adopt_scan_snapshot desde el resultado del scan.
         self.scan_failed = False
+        self.scan_error = ""  # excepción del último load_sessions, si falló
+        self.pending_vault_delete: dict | None = None  # entrada del Baúl a la espera de [S]
+        self.pending_bulk_compact: list[_sessions.AgySession] | None = None  # [A] a la espera de [A] otra vez
+        self.dup_notice = ""  # aviso permanente de sesiones abiertas varias veces
 
     def _configure_curses(self) -> None:
         curses.curs_set(0)
@@ -303,35 +338,60 @@ class Dashboard:
         open_when_done: bool = False,
         prompt_if_missing_key: bool = True,
     ) -> str:
+        return self._start_compaction(target_sess, open_when_done=open_when_done,
+                                      prompt_if_missing_key=prompt_if_missing_key)[1]
+
+    def _start_compaction(
+        self,
+        target_sess: _sessions.AgySession,
+        *,
+        open_when_done: bool = False,
+        prompt_if_missing_key: bool = True,
+    ) -> tuple[str, str]:
+        """Devuelve (estado, mensaje); estado ∈ started | running | nokey | cancelled.
+        El cid se reserva en la misma sección crítica que lo comprueba, ANTES de pedir la clave:
+        dos disparos seguidos (tecla + clic) no pueden lanzar dos compactaciones de la misma sesión."""
         cid = target_sess.conversation_id
         with self.compact_lock:
             existing = self.compact_jobs.get(cid)
-            if existing and existing.get("status") == "running":
+            if existing and existing.get("status") in ("running", "reserved"):
                 if open_when_done:
                     existing["open_when_done"] = True
-                return f"⏳ '{target_sess.title[:28]}' ya se está compactando en 2º plano..."
-        cfg = _compact.load_nvapi_config()
-        if not str(cfg.get("api_key", "")).strip():
-            if not prompt_if_missing_key:
-                return "⚠️ Falta NVIDIA API Key (`nvapi-...`). Pulsa [K] para configurarla."
-            entered = _prompt_curses_text(self.stdscr, "Ingresa tu NVIDIA API Key (nvapi-...) para compactar", "", max_len=110)
-            if not entered:
-                return "Compactación cancelada: falta NVIDIA API Key."
-            _compact.save_nvapi_config(api_key=entered)
-        with self.compact_lock:
+                return "running", f"⏳ '{target_sess.title[:28]}' ya se está compactando en 2º plano..."
             self.compact_jobs[cid] = {
                 "title": target_sess.title,
                 "started": time.time(),
-                "status": "running",
+                "status": "reserved",
                 "open_when_done": open_when_done,
             }
+
+        def _release(state: str, msg: str) -> tuple[str, str]:
+            with self.compact_lock:
+                if (self.compact_jobs.get(cid) or {}).get("status") == "reserved":
+                    self.compact_jobs.pop(cid, None)
+            return state, msg
+
+        cfg = _compact.load_nvapi_config()
+        if not str(cfg.get("api_key", "")).strip():
+            if not prompt_if_missing_key:
+                return _release("nokey", "⚠️ Falta NVIDIA API Key (`nvapi-...`). Pulsa [K] para configurarla.")
+            entered = _prompt_curses_text(self.stdscr, "Ingresa tu NVIDIA API Key (nvapi-...) para compactar", "",
+                                          max_len=110, secret=True)
+            if not entered:
+                return _release("cancelled", "Compactación cancelada: falta NVIDIA API Key.")
+            _compact.save_nvapi_config(api_key=entered)
+        with self.compact_lock:
+            job = self.compact_jobs.setdefault(cid, {"title": target_sess.title, "open_when_done": open_when_done})
+            job["status"] = "running"
+            job["started"] = time.time()
+            open_when_done = bool(job.get("open_when_done", open_when_done))
         threading.Thread(
             target=self._compact_worker,
             args=(target_sess, cid, open_when_done),
             daemon=True,
         ).start()
         dest = "y abrirá pestaña al terminar" if open_when_done else "al Baúl (sin abrir pestaña)"
-        return f"⏳ Compactando '{target_sess.title[:26]}' en 2º plano ({dest}) — el dashboard sigue libre."
+        return "started", f"⏳ Compactando '{target_sess.title[:26]}' en 2º plano ({dest}) — el dashboard sigue libre."
 
     def _compact_worker(
         self,
@@ -364,17 +424,21 @@ class Dashboard:
         threading.Thread(target=self._quota_worker, daemon=True).start()
 
     def _quota_worker(self) -> None:
+        msg = ""
         try:
             reg = _accounts.load_accounts_registry()
             msgs = []
             for sname in list(reg.get("accounts", {}).keys()):
                 _, m = _accounts.refresh_account_quota(sname, timeout_sec=14.0)
                 msgs.append(m)
-            with self.quota_lock:
-                self.quota_worker_state["last_poll"] = time.time()
-                self.quota_worker_state["msg"] = " · ".join(msgs)
+            msg = " · ".join(msgs)
+        except Exception as exc:  # noqa: BLE001 — un traceback en stderr rompería la pantalla curses
+            msg = f"error consultando cuotas: {type(exc).__name__}: {exc}"
         finally:
             with self.quota_lock:
+                # last_poll también en fallo: si no, cada frame (~4 Hz) relanzaría la consulta.
+                self.quota_worker_state["last_poll"] = time.time()
+                self.quota_worker_state["msg"] = msg
                 self.quota_worker_state["running"] = False
 
     def db_wal_sig(self) -> tuple[int, int, int]:
@@ -389,10 +453,10 @@ class Dashboard:
 
     def execute_action(self, action: str) -> str:
         if self.scan_failed and action in self.SCAN_BLOCKED_ACTIONS:
-            return "⚠ Escaneo de procesos falló: abrir/hibernar bloqueados hasta el próximo escaneo."
-        if action in ("refresh","refresh_quota", "memory", "accounts", "vault", "nvapi_key", "ranking"):
+            return self.SCAN_BLOCKED_MSG
+        if action in ("refresh", "refresh_quota", "memory", "accounts", "vault", "nvapi_key", "ranking"):
             return self._execute_global_action(action)
-        sel = self.sessions[self.saved_session_cursor if self.mode != "sessions" else self.cursor] if self.sessions else None
+        sel = self.current_session()
         if action == "baton" and sel:
             ok, msg = _accounts.baton_pass_session(sel)
             if not ok and "No hay otra cuenta" in msg:
@@ -405,6 +469,21 @@ class Dashboard:
             return ""
         sel = self.sessions[self.cursor] if (self.sessions and 0 <= self.cursor < len(self.sessions)) else None
         return self._execute_session_action(action, sel)
+
+    def current_session(self) -> _sessions.AgySession | None:
+        """La sesión seleccionada (en otras vistas, la que lo estaba al salir de sesiones), con el
+        índice comprobado: el escáner puede haber encogido la lista desde el último frame."""
+        idx = self.cursor if self.mode == "sessions" else self.saved_session_cursor
+        return self.sessions[idx] if 0 <= idx < len(self.sessions) else None
+
+    def _clamp_cursor(self) -> None:
+        n = {
+            "sessions": len(self.sessions),
+            "accounts": len(self.reg.get("accounts", {})),
+            "vault": len(self.vault_entries),
+            "memory": len(self.mem_lines),
+        }.get(self.mode, 0)
+        self.cursor = max(0, min(self.cursor, n - 1))
 
     def _execute_global_action(self, action: str) -> str:
         if action == "refresh":
@@ -454,6 +533,7 @@ class Dashboard:
                 f"NVIDIA API Key (nvapi-... · actual {masked})",
                 "",
                 max_len=110,
+                secret=True,
             )
             if not entered:
                 return f"Cancelado — NVIDIA API Key sin cambios ({masked})."
@@ -553,16 +633,27 @@ class Dashboard:
             if not forced and sig == last_sig and (time.time() - last_t) < 0.6:
                 continue
             last_sig, last_t = sig, time.time()
-            try:
-                res = _sessions.load_sessions(limit=35)
-            except Exception:
-                continue
+            self._scan_once()
+
+    def _scan_once(self) -> None:
+        """Un escaneo; su resultado, si el scan de procesos falló y el error (si lo hubo) se
+        publican juntos con la misma versión, para que la UI no mezcle datos de dos escaneos."""
+        try:
+            res = _sessions.load_sessions(limit=SCAN_SESSION_LIMIT)
+            failed = _procs.scan_failed()
+            err = ""
+        except Exception as exc:  # noqa: BLE001 — sin esto el hilo muere y la UI muestra datos viejos como vivos
             with self.scan_lock:
-                self.scan_box["data"] = res
-                self.scan_box["ver"] += 1
+                self.scan_box["error"] = f"{type(exc).__name__}: {exc}"
+                self.scan_box["error_at"] = time.time()
+                self.scan_box["ver"] = self.scan_box.get("ver", 0) + 1
+            return
+        with self.scan_lock:
+            self.scan_box.update(data=res, failed=failed, error=err, ver=self.scan_box.get("ver", 0) + 1)
 
     def _start_scanner(self) -> None:
-        self.scan_box = {"data": _sessions.load_sessions(limit=35), "ver": 1}
+        self.scan_box = {"data": (0, dict(self.ksm), []), "failed": False, "error": "", "ver": 0}
+        self._scan_once()
         self.seen_scan_ver = 0
         threading.Thread(target=self._scanner, daemon=True).start()
 
@@ -575,7 +666,10 @@ class Dashboard:
             self.running_compact = list(self.compact_jobs.values())
         for c_sess, c_ok, c_msg, c_hfile, c_open in done_compact_batch:
             if c_ok and c_hfile is not None:
-                if c_open:
+                if c_open and self.scan_failed:
+                    self.status_banner = (f"✅ '{c_sess.title[:26]}' compactada y guardada en el Baúl; no se abre "
+                                          "pestaña porque el escaneo de procesos falló (ábrela desde V).")
+                elif c_open:
                     open_msg = _compact.open_compacted_session_in_tab(c_sess, c_hfile, switch_to=True)
                     self.status_banner = f"{c_msg} · {open_msg}"
                 else:
@@ -589,11 +683,19 @@ class Dashboard:
             self.force_scan = False
             self.scan_wake.set()
         with self.scan_lock:
-            snap_ver, snap = self.scan_box["ver"], self.scan_box["data"]
-        if snap_ver != self.seen_scan_ver:
-            self.seen_scan_ver = snap_ver
-            self.scan_us, self.ksm, self.sessions = snap
-            self.scan_failed = _procs.scan_failed()  # set by zig_scan on the scan thread
+            box = dict(self.scan_box)
+        if box.get("ver") != self.seen_scan_ver:
+            self.seen_scan_ver = box.get("ver")
+            if box.get("error"):
+                # Los datos que quedan son de un escaneo anterior: no fiables para matar/abrir.
+                self.scan_error = str(box["error"])
+                self.scan_failed = True
+                return
+            self.scan_error = ""
+            if "data" in box:
+                self.scan_us, self.ksm, self.sessions = box["data"]
+            # Del mismo escaneo que los datos (lo calcula zig_scan en el hilo del escáner).
+            self.scan_failed = bool(box.get("failed", _procs.scan_failed()))
             self.last_refresh_clock = time.strftime("%H:%M:%S")
 
     def _periodic_idle_check(self, now: float) -> None:
@@ -601,11 +703,20 @@ class Dashboard:
             return
         self.last_auto_check = now
         active_idle_ids: set[str] = set()
+        # Las copias duplicadas nunca se cierran solas (el usuario puede estar escribiendo en
+        # cualquiera de ellas): solo se avisa, y [x] las cierra a mano si sobran.
+        dups = [s for s in self.sessions if s.extra_procs]
+        if dups:
+            extra_mb = sum(p.pss_kb for s in dups for p in s.extra_procs) // 1024
+            first = dups[0]
+            more = f" y {len(dups) - 1} más" if len(dups) > 1 else ""
+            self.dup_notice = (f"'{first.title[:30]}' abierta {1 + len(first.extra_procs)} veces{more} "
+                               f"(+{extra_mb} MB): [x] cierra las copias inactivas")
+        else:
+            self.dup_notice = ""
+        if self.scan_failed:
+            return  # sin estado de procesos fiable no se auto-hiberna nada
         for s in self.sessions:
-            if s.extra_procs and not self.status_banner:
-                # Never close a copy automatically: it may be the one Danny is typing in elsewhere.
-                self.status_banner = (f"'{s.title[:30]}' está abierta {1 + len(s.extra_procs)} veces "
-                                      f"(+{sum(p.pss_kb for p in s.extra_procs) // 1024} MB): pulsa [x] si sobra.")
             if s.can_hibernate and s.proc is not None and s.dash_win_idx is not None:
                 active_idle_ids.add(s.conversation_id)
                 first_t = self.idle_seen_since.setdefault(s.conversation_id, now)
@@ -637,18 +748,37 @@ class Dashboard:
         if any(not a.get("quota", {}).get("ok") for a in reg_init.get("accounts", {}).values()):
             self.trigger_quota_poll(force=True)
         while True:
-            now = time.time()
-            self.frame_now = now
-            self._advance_background(now)
-            self.draw(now)
-            ch = self.stdscr.getch()
-            if ch == -1:
-                continue
-            if ch == curses.KEY_MOUSE:
-                ch = self.handle_mouse()
-                if ch is None:
-                    continue
-            self.handle_key(ch)
+            try:
+                self._tick()
+            except Exception as exc:  # noqa: BLE001 — el DASH es la superficie de control de todas las sesiones
+                self._report_crash(exc)
+
+    def _tick(self) -> None:
+        now = time.time()
+        self.frame_now = now
+        self._advance_background(now)
+        self.draw(now)
+        ch = self.stdscr.getch()
+        if ch == -1:
+            return
+        if ch == curses.KEY_MOUSE:
+            ch = self.handle_mouse()
+            if ch is None:
+                return
+        self.handle_key(ch)
+
+    def _report_crash(self, exc: Exception) -> None:
+        """Un frame o una tecla que fallan no matan el dashboard: se anota en CRASH_LOG y en el banner."""
+        import traceback
+        try:
+            CRASH_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with CRASH_LOG.open("a", encoding="utf-8") as fh:
+                fh.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')}\n{traceback.format_exc()}\n")
+        except OSError:
+            pass
+        self.status_banner = f"⚠ error interno ({type(exc).__name__}: {exc}) — detalle en {CRASH_LOG}"
+        self.show_help = False
+        time.sleep(0.25)  # si el fallo se repite en cada frame, no quemar CPU
 
     def _prepare_frame(self, now: float) -> None:
         self.reg = _accounts.load_accounts_registry()
@@ -669,8 +799,11 @@ class Dashboard:
         self.hib_saved_mb = sum(s.hibernated_saved_kb for s in self.hib) // 1024
 
     # ---- Pintado: todo pasa por _put/_rule (columnas de terminal, nunca la última celda) ----
-    SCAN_FAILED_MSG = "⚠ escaneo de procesos falló — estados no fiables; abrir/hibernar bloqueados"
-    SCAN_BLOCKED_ACTIONS = ("open", "open_full", "hibernate", "hib_all", "dedup")
+    SCAN_FAILED_MSG = "⚠ escaneo de procesos falló — estados no fiables; abrir/recargar/hibernar bloqueados"
+    SCAN_BLOCKED_MSG = "⚠ Escaneo de procesos falló: abrir/recargar/hibernar bloqueados hasta el próximo escaneo."
+    # Todo lo que abre, recarga o mata un proceso AGY. El espejo (solo lectura) y compactar
+    # (lee el transcript) siguen permitidos; una compactación que termina no abre pestaña.
+    SCAN_BLOCKED_ACTIONS = ("open", "open_full", "open_vault", "reload", "hibernate", "hib_all", "dedup")
     KEY_CODES = {"↵": 10, "Esc": 27}
 
     # Pie de teclas por vista. Cada variante va de la más completa a la más corta; se usa la
@@ -708,6 +841,8 @@ class Dashboard:
             (("q", "salir"), ("↵", "abrir"), ("A", "compactar"), ("x", "borrar"), ("V", "volver")),
             (("q", "salir"), ("↵", "abrir"), ("V", "volver")),
         ),
+        "vault_confirm": ((("S", "confirmar"), ("Esc", "cancelar")),),
+        "bulk_confirm": ((("A", "compactar"), ("Esc", "cancelar")),),
         "memory": (
             (("q", "salir"), ("m", "volver"), ("↑↓", "mover"), ("u", "cuentas")),
             (("q", "salir"), ("m", "volver")),
@@ -743,7 +878,7 @@ class Dashboard:
         ),
         "accounts": (
             ("+", "añadir cuenta Pro"),
-            ("x / Del", "eliminar perfil (pide confirmación)"),
+            ("x / Supr", "eliminar perfil (pide confirmación con S)"),
             ("s / ↵", "activar como cuenta por defecto"),
             ("B", "baton pass de la sesión a esta cuenta"),
             ("R / r", "consultar cuotas"),
@@ -754,15 +889,22 @@ class Dashboard:
         "vault": (
             ("↵", "abrir del Baúl en una pestaña"),
             ("r", "re-compactar la sesión"),
-            ("A", "compactar las pesadas al Baúl (2º plano)"),
-            ("x / Del", "borrar el handoff"),
+            ("A", f"compactar al Baúl las pesadas sin handoff (pide A otra vez; máx. {BULK_COMPACT_MAX})"),
+            ("x / Supr", "borrar el handoff (pide confirmación con S)"),
             ("V / Esc", "volver"),
         ),
-        "memory": (("↑↓ / j k", "mover"), ("m / Esc", "volver"), ("u", "cuentas")),
+        "vault_confirm": (("S / Y", "confirmar"), ("otra tecla", "cancelar")),
+        "bulk_confirm": (("A", "confirmar"), ("otra tecla", "cancelar")),
+        "memory": (("↑↓ / j k", "mover"), ("m / Esc", "volver"), ("u", "cuentas"), ("q / Tab", "siguiente ventana tmux")),
     }
 
-    def _put(self, y: int, x: int, text: str, attr: int = 0, cols: int | None = None, pad: bool = False) -> None:
-        put(self.stdscr, y, x, clean(text), self.max_x if cols is None else cols, attr, pad)
+    def _put(self, y: int, x: int, text: str, attr: int = 0, cols: int | None = None, pad: bool = False,
+             ellipsis: bool = False) -> None:
+        cols = self.max_x if cols is None else cols
+        text = clean(text)
+        if ellipsis:
+            text = ellipsize(text, max(0, min(cols, self.max_x - x) - 1))  # put nunca usa la última celda
+        put(self.stdscr, y, x, text, cols, attr, pad)
 
     def _rule(self, y: int, x: int, width: int, attr: int = 0) -> None:
         width = max(0, width)
@@ -774,7 +916,9 @@ class Dashboard:
                 return "pending_blocked" if self.pending_delete_info.get("blocked_reason") else "pending_delete"
             return "accounts"
         if self.mode == "vault":
-            return "vault"
+            if self.pending_vault_delete is not None:
+                return "vault_confirm"
+            return "bulk_confirm" if self.pending_bulk_compact is not None else "vault"
         if self.mode == "memory":
             return "memory"
         return "modal" if self.pending_compact_sess is not None else "sessions"
@@ -815,7 +959,7 @@ class Dashboard:
             f" RAM {self.total_pss_mb} MB PSS · compartida {self.total_shr_mb} MB + KSM {self.total_ksm_mb} MB "
             f"({self.ksm.get('pages_sharing', 0)} págs) · ahorrado 💤 {self.hib_saved_mb} MB · "
             f"modelo {self.model_disp or 'default'}",
-            curses.color_pair(2) | curses.A_BOLD,
+            curses.color_pair(2) | curses.A_BOLD, ellipsis=True,
         )
 
     def _draw_quota_alert(self) -> None:
@@ -866,7 +1010,13 @@ class Dashboard:
             self.cursor = max(0, min(self.cursor, len(self.sessions) - 1))
         self.preview_height = max(7, min(12, self.max_y // 3)) if self.max_y >= 22 else 0
         self.list_avail = max(3, self.max_y - 9 - self.preview_height)
-        col_hdr = f" {'ESTADO':<10} {'UBICACIÓN':<10} {'PSS':>6} {'SHR+KSM':>7} {'PASOS':>5}  {'TÍTULO DE SESIÓN':<28} WS"
+        # El título es lo que identifica la sesión: en pantallas estrechas se quitan antes las
+        # columnas de RAM, y el título se lleva el ancho que sobre (28..60 columnas).
+        show_ram = self.left_w >= 84
+        fixed = 1 + 11 + 11 + (15 if show_ram else 0) + 5 + 2 + 1 + 12
+        title_w = max(12, min(60, self.left_w - fixed - 1))
+        ram_hdr = f"{'PSS':>6} {'SHR+KSM':>7} " if show_ram else ""
+        col_hdr = f" {'ESTADO':<10} {'UBICACIÓN':<10} {ram_hdr}{'PASOS':>5}  {fit('TÍTULO DE SESIÓN', title_w, True)} WS"
         self._put(4, 0, col_hdr, curses.A_BOLD, self.left_w)
         self._rule(5, 0, self.left_w)
         start_idx = max(0, self.cursor - self.list_avail + 1) if self.cursor >= self.list_avail else 0
@@ -885,9 +1035,10 @@ class Dashboard:
                 pss_s = "0M"
                 shr_s = "-"
             ws_name = fit(os.path.basename(s.workspace.rstrip("/")) or s.workspace, 12)
+            ram_s = f"{pss_s:>6} {shr_s:>7} " if show_ram else ""
             line = (
-                f" {fit(st, 10, True)} {fit(s.location_label, 10, True)} {pss_s:>6} {shr_s:>7} {s.step_count:>5}  "
-                f"{fit(s.title, 28, True)} {ws_name}"
+                f" {fit(st, 10, True)} {fit(s.location_label, 10, True)} {ram_s}{s.step_count:>5}  "
+                f"{fit(ellipsize(s.title, title_w), title_w, True)} {ws_name}"
             )
             attr = curses.A_NORMAL
             if idx == self.cursor:
@@ -963,8 +1114,12 @@ class Dashboard:
             f"clave lista ({_compact.mask_api_key(nv_key)} · {nv_cfg.get('model')})"
             if nv_key else "falta la clave NVIDIA (pulsa K)"
         )
-        if vault_file is not None:
-            v_age = int(max(0, (now - vault_file.stat().st_mtime) // 60))
+        try:
+            v_mtime = vault_file.stat().st_mtime if vault_file is not None else None
+        except OSError:  # borrado entre get_vault_handoff y stat
+            v_mtime = None
+        if v_mtime is not None:
+            v_age = int(max(0, (now - v_mtime) // 60))
             baul_line = f"Baúl: hay un handoff guardado hace {v_age} min"
         else:
             baul_line = "Baúl: todavía sin handoff de esta sesión"
@@ -1118,8 +1273,7 @@ class Dashboard:
             curses.A_BOLD,
         )
         self.cursor = max(0, min(self.cursor, max(0, len(self.vault_entries) - 1)))
-        avail_rows = max(1, self.max_y - 9)
-        start_idx = max(0, self.cursor - avail_rows + 1) if self.cursor >= avail_rows else 0
+        start_idx, avail_rows = self._vault_rows()
         if not self.vault_entries:
             self._put(6, 0, "   (Baúl vacío: pulsa C en una sesión o A aquí para compactar pesadas en 2º plano)")
         else:
@@ -1200,7 +1354,10 @@ class Dashboard:
         self._draw_header()
         self._draw_quota_alert()
         if self.scan_failed:
-            self._put(3, 0, self.SCAN_FAILED_MSG, curses.color_pair(1) | curses.A_BOLD, self.max_x - 1)
+            msg = self.SCAN_FAILED_MSG + (f" · {self.scan_error}" if self.scan_error else "")
+            self._put(3, 0, msg, curses.color_pair(1) | curses.A_BOLD, self.max_x - 1)
+        elif self.dup_notice:
+            self._put(3, 0, f" ⚠ {self.dup_notice}", curses.color_pair(4) | curses.A_BOLD, self.max_x - 1)
         else:
             self._rule(3, 0, self.max_x - 1)
         self._compute_layout()
@@ -1234,24 +1391,31 @@ class Dashboard:
             return None
         if btn5 and (bstate & btn5):
             self.cursor += 1
+            self._clamp_cursor()
             return None
         click_mask = curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED | curses.BUTTON1_DOUBLE_CLICKED
         if not (bstate & click_mask):
             return None
         is_dbl_click = bool(bstate & curses.BUTTON1_DOUBLE_CLICKED)
+        if self.show_help:  # un clic cierra la ayuda, como una tecla; no actúa sobre lo de debajo
+            self.show_help = False
+            return None
         if my == self.max_y - 1:  # clic en una tecla del pie = la misma tecla
             for x0, x1, code in self.footer_hits:
                 if x0 <= mx <= x1:
                     return code
             return None
+        if (self.pending_compact_sess is not None or self.pending_delete_info is not None
+                or self.pending_vault_delete is not None or self.pending_bulk_compact is not None):
+            return None  # con una confirmación abierta solo vale el pie (sus teclas)
         if self.show_cmd_panel and mx >= self.panel_x:
-            act = hit_test_button(self.cmd_buttons, self.panel_x, self.panel_btn_y, mx, my)
+            act = hit_test_button(self.cmd_buttons, self.panel_x, self.panel_btn_y, mx, my,
+                                  max_row=6 + self.list_avail)
             if act:
                 res = self.execute_action(act)
                 if res:
                     self.status_banner = res
-                if act in ("compact", "vault_compact", "open", "open_full", "new", "baton", "mirror", "reload"):
-                    curses.flushinp()
+                curses.flushinp()  # teclas pulsadas durante una acción lenta no se repiten luego
         elif self.mode == "sessions" and self.list_start_y <= my < self.list_start_y + self.list_avail and mx < self.left_w:
             clicked_idx = (max(0, self.cursor - self.list_avail + 1) if self.cursor >= self.list_avail else 0) + (my - self.list_start_y)
             if 0 <= clicked_idx < len(self.sessions):
@@ -1261,17 +1425,36 @@ class Dashboard:
                     self.status_banner = self.execute_action("open")
                     curses.flushinp()
         elif self.mode == "vault":
-            vault_entries = _compact.list_compacted_vault()
-            if 6 <= my < 6 + len(vault_entries):
-                self.cursor = my - 6
+            # Misma lista y mismo desplazamiento que el último dibujo (_draw_vault).
+            idx = self._vault_row_at(my)
+            if idx is not None:
+                self.cursor = idx
                 if is_dbl_click:
-                    self.status_banner = _compact.open_vault_entry_in_tab(vault_entries[self.cursor], switch_to=True)
+                    self.status_banner = self._open_vault_entry(self.vault_entries[idx])
                     curses.flushinp()
         elif self.mode == "accounts":
-            acct_list = list(self.reg.get("accounts", {}).items())
-            if 6 <= my < 6 + len(acct_list):
-                self.cursor = my - 6
+            idx = my - 6
+            if 0 <= idx < len(self.acct_list) and my < self.max_y - 5:  # filas que _draw_accounts pinta
+                self.cursor = idx
         return None
+
+    def _vault_rows(self) -> tuple[int, int]:
+        """(primer índice visible, filas visibles) del Baúl; lo comparten el dibujo y el ratón."""
+        avail = max(1, self.max_y - 9)  # filas 6 .. max_y-4 (las 3 últimas son regla, banner y pie)
+        start = max(0, self.cursor - avail + 1) if self.cursor >= avail else 0
+        return start, avail
+
+    def _vault_row_at(self, my: int) -> int | None:
+        start, avail = self._vault_rows()
+        idx = start + (my - 6)
+        if 6 <= my < 6 + avail and idx < len(self.vault_entries):
+            return idx
+        return None
+
+    def _open_vault_entry(self, ve: dict) -> str:
+        if self.scan_failed:
+            return self.SCAN_BLOCKED_MSG
+        return _compact.open_vault_entry_in_tab(ve, switch_to=True)
 
     def handle_key(self, ch: int | str) -> None:
         """Despacha una tecla según la vista activa."""
@@ -1289,6 +1472,9 @@ class Dashboard:
         if self.mode == "vault":
             self._handle_vault_key(ch)
             return
+        if self.mode == "memory":
+            self._handle_memory_key(ch)
+            return
         if self.mode == "sessions" and self.pending_compact_sess is not None:
             self._handle_pending_compaction_key(ch)
             return
@@ -1297,7 +1483,8 @@ class Dashboard:
     def _handle_account_key(self, ch: int) -> None:
         self.acct_list = list(self.reg.get("accounts", {}).items())
         if self.pending_delete_info is not None:
-            if ch in (ord("y"), ord("Y"), ord("s"), ord("S")) and not self.pending_delete_info.get("blocked_reason"):
+            # Solo mayúsculas: `s` minúscula es "activar" en esta misma vista y no debe borrar nada.
+            if ch in (ord("Y"), ord("S")) and not self.pending_delete_info.get("blocked_reason"):
                 ok, self.status_banner = _accounts.remove_account_slot(
                     self.pending_delete_info["slot"],
                     confirmed=True,
@@ -1327,11 +1514,15 @@ class Dashboard:
                 idx += 1
             default_name = f"pro{idx}"
             chosen = _prompt_curses_text(self.stdscr, "Nombre de nueva cuenta Pro aislada", default_name)
+            if not chosen:
+                self.status_banner = "Alta de cuenta cancelada."
+                return
             try:
                 self.status_banner = _tmuxctl.launch_account_login_tab(chosen)
             except ValueError as ve:
                 self.status_banner = f"Nombre inválido: {ve}"
-        elif ch in (ord("x"), curses.KEY_DC, 127) and self.acct_list and 0 <= self.cursor < len(self.acct_list):
+        # 127 (Backspace en casi todas las terminales) no borra: solo `x` y Supr.
+        elif ch in (ord("x"), curses.KEY_DC) and self.acct_list and 0 <= self.cursor < len(self.acct_list):
             del_slot = self.acct_list[self.cursor][0]
             info = _accounts.inspect_account_removal(del_slot, sessions=self.sessions)
             if info["blocked_reason"]:
@@ -1358,8 +1549,46 @@ class Dashboard:
         elif ch in (ord("q"), 9):
             _tmuxctl.tmux_cmd("next-window")
 
+    def _handle_memory_key(self, ch: int) -> None:
+        if ch in (ord("m"), 27):
+            self.status_banner = self.execute_action("memory")  # desde memoria = volver
+        elif ch == ord("u"):
+            self.mode = "accounts"  # directo; saved_session_cursor ya guarda la sesión
+            self.cursor = 0
+            self.trigger_quota_poll(force=False)
+            self.status_banner = "Vista: Cuentas y cuotas"
+        elif ch in (curses.KEY_UP, ord("k")):
+            self.cursor = max(0, self.cursor - 1)
+        elif ch in (curses.KEY_DOWN, ord("j")):
+            self.cursor += 1
+            self._clamp_cursor()
+        elif ch in (ord("q"), 9):
+            _tmuxctl.tmux_cmd("next-window")
+
     def _handle_vault_key(self, ch: int) -> None:
-        vault_entries = _compact.list_compacted_vault()
+        # La lista del último dibujo (la que ve el usuario); vacía solo antes del primer dibujo.
+        vault_entries = self.vault_entries or _compact.list_compacted_vault()
+        if self.pending_vault_delete is not None:
+            ve = self.pending_vault_delete
+            self.pending_vault_delete = None
+            if ch in (ord("S"), ord("Y")):
+                if _compact.delete_vault_handoff(Path(ve["path"])):
+                    self.status_banner = f"🗑️ Eliminado '{ve['title'][:28]}' del Baúl."
+                    if self.cursor > 0:
+                        self.cursor -= 1
+                else:
+                    self.status_banner = f"No se pudo borrar '{ve['title'][:28]}'."
+            else:
+                self.status_banner = "Borrado cancelado."
+            return
+        if self.pending_bulk_compact is not None:
+            batch = self.pending_bulk_compact
+            self.pending_bulk_compact = None
+            if ch == ord("A"):
+                self.status_banner = self._bulk_compact(batch)
+            else:
+                self.status_banner = "Compactación en lote cancelada."
+            return
         if ch in (ord("v"), ord("V"), 27):
             self.mode = "sessions"
             self.cursor = self.saved_session_cursor
@@ -1369,7 +1598,7 @@ class Dashboard:
         elif ch in (curses.KEY_DOWN, ord("j")):
             self.cursor += 1
         elif ch in (10, 13, curses.KEY_ENTER) and vault_entries and 0 <= self.cursor < len(vault_entries):
-            self.status_banner = _compact.open_vault_entry_in_tab(vault_entries[self.cursor], switch_to=True)
+            self.status_banner = self._open_vault_entry(vault_entries[self.cursor])
             curses.flushinp()
         elif ch == ord("r") and vault_entries and 0 <= self.cursor < len(vault_entries):
             ve = vault_entries[self.cursor]
@@ -1387,28 +1616,35 @@ class Dashboard:
                 )
             self.status_banner = self.start_async_compaction(match_s, open_when_done=False, prompt_if_missing_key=True)
         elif ch in (ord("A"), ord("a")):
-            heavy = [s for s in self.sessions if _compact.should_offer_compaction(s)[0] or s.step_count >= _paths.COMPACT_MIN_STEPS]
+            # Solo las pesadas que aún no tienen handoff en el Baúl (re-compactar una cuesta otra
+            # llamada a la API: para eso está [r] sobre la entrada). Pide confirmación con A.
+            heavy = [s for s in self.sessions
+                     if (_compact.should_offer_compaction(s)[0] or s.step_count >= _paths.COMPACT_MIN_STEPS)
+                     and _compact.get_vault_handoff(s.conversation_id) is None][:BULK_COMPACT_MAX]
             if not heavy:
-                self.status_banner = "No hay sesiones pesadas para compactar al Baúl."
+                self.status_banner = "No hay sesiones pesadas sin handoff en el Baúl."
             else:
-                started = 0
-                for hs in heavy[:12]:
-                    msg_s = self.start_async_compaction(hs, open_when_done=False, prompt_if_missing_key=(started == 0))
-                    if msg_s.startswith("⏳ Compactando"):
-                        started += 1
-                    elif "falta" in msg_s.lower():
-                        self.status_banner = msg_s
-                        break
-                if started:
-                    self.status_banner = f"📦 Compactando {started} sesiones pesadas en 2º plano al Baúl (sin abrir pestañas)."
-        elif ch in (ord("x"), curses.KEY_DC, 127) and vault_entries and 0 <= self.cursor < len(vault_entries):
-            ve = vault_entries[self.cursor]
-            if _compact.delete_vault_handoff(Path(ve["path"])):
-                self.status_banner = f"🗑️ Eliminado '{ve['title'][:28]}' del Baúl."
-                if self.cursor > 0:
-                    self.cursor -= 1
+                self.pending_bulk_compact = heavy
+                self.status_banner = (f"¿Compactar {len(heavy)} sesiones pesadas con NVIDIA al Baúl? "
+                                      f"[A] sí · otra tecla cancela (máx. {BULK_COMPACT_MAX} por lote)")
+        # 127 (Backspace) no borra: solo `x` y Supr, y siempre con confirmación.
+        elif ch in (ord("x"), curses.KEY_DC) and vault_entries and 0 <= self.cursor < len(vault_entries):
+            self.pending_vault_delete = vault_entries[self.cursor]
+            self.status_banner = f"¿Borrar '{self.pending_vault_delete['title'][:28]}' del Baúl? [S] sí · otra tecla cancela"
         elif ch in (ord("q"), 9):
             _tmuxctl.tmux_cmd("next-window")
+
+    def _bulk_compact(self, batch: list[_sessions.AgySession]) -> str:
+        started = 0
+        for hs in batch:
+            state, msg_s = self._start_compaction(hs, open_when_done=False, prompt_if_missing_key=(started == 0))
+            if state == "started":
+                started += 1
+            elif state in ("nokey", "cancelled"):
+                return msg_s
+        if started:
+            return f"📦 Compactando {started} sesiones pesadas en 2º plano al Baúl (sin abrir pestañas)."
+        return "Esas sesiones ya se estaban compactando."
 
     def _handle_pending_compaction_key(self, ch: int) -> None:
         if ch == ord("c"):

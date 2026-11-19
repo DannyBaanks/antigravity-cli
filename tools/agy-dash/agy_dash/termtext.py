@@ -92,3 +92,12 @@ def put(win, y: int, x: int, text: str, cols: int, attr: int = 0, pad: bool = Fa
         win.addstr(y, x, fit(text, cols, pad), attr)
     except curses.error:
         pass
+
+
+def ellipsize(text: str, cols: int) -> str:
+    """Como fit, pero si corta termina en `…` para que se vea que falta texto."""
+    if cols <= 0:
+        return ""
+    if text_cols(text) <= cols:
+        return text
+    return fit(text, cols - 1) + "…"

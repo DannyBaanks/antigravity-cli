@@ -162,12 +162,17 @@ El panel `0:⚡DASH` muestra la lista de sesiones a la izquierda, la **Vista en 
    - Abrir en el panel una sesión que corre en otra terminal: si esa copia está ocupada, o no se cierra, se abre el espejo (`👁`) en vez de un segundo `agy` escribiendo la misma conversación.
    - `self-compact` espera a que el turno termine de verdad (`--wait`, 900 s por defecto) antes de reemplazar la pestaña. Si sigue ocupada, deja el handoff en el Baúl sin cortar nada. `self` se resuelve por la pestaña del propio agente (`$TMUX_PANE`), no por la que estás mirando, y si hay ambigüedad pide el `conv_id`.
    - Eliminar una cuenta aislada: si AGY reemplazó un symlink compartido por un archivo real (pasa con `conversation_summaries.db`, y también con `.cache`, `.local`, `.config/gh`…), ese archivo se **mueve** a `accounts/.rescued/<cuenta>-<fecha>/` antes de purgar; nunca se borra.
-   - Si el escaneo de procesos (`agy-fast-core scan`) falla o tarda >1.5 s, el panel lo avisa en rojo y **bloquea abrir, hibernar y deduplicar** hasta el siguiente escaneo bueno: un fallo no se confunde con "no hay ningún agy" (abrir ahí crearía un segundo escritor). Un `zig build` fallido no se reintenta en 10 min.
+   - Si el escaneo de procesos (`agy-fast-core scan`) falla o tarda >1.5 s, el panel lo avisa en rojo y **bloquea abrir (también desde el Baúl), recargar, hibernar (también el auto-hibernate) y deduplicar** hasta el siguiente escaneo bueno; una compactación que termina entonces se queda en el Baúl sin abrir pestaña: un fallo no se confunde con "no hay ningún agy" (abrir ahí crearía un segundo escritor). Un `zig build` fallido no se reintenta en 10 min.
    - Una sesión viva sin fila en `conversation_summaries.db` sale como `UNKNOWN`: no se hiberna (no se puede demostrar que esté quieta).
    - Baton Pass espera a que la copia vieja de la pestaña termine antes de arrancar la nueva (máx. 10 s; si no, no abre otra).
    - Texto del transcript y títulos se limpian de caracteres de control antes de pintarse; tmux usa `set-clipboard external` y `allow-passthrough off`, así que un programa dentro de una pestaña no puede escribir tu portapapeles por OSC 52. Copiar con el ratón / `y` sigue yendo al portapapeles (xclip).
    - **La compactación NVIDIA envía la conversación (tus mensajes, comandos y salidas resumidas) a `base_url`**: solo `https://`, sin seguir redirecciones (la key no viaja a otro host). Los "% de ahorro" son estimaciones (`max(pasos×140, bytes/4)` tokens), no medidas.
    - El escaneo de sesiones (~50 ms) corre en su propio hilo: las teclas ya no esperan. El spinner de pestañas va cada 0.9 s (`AGY_LED_TICK_SEC`).
+   - Borrar algo pide confirmación con **mayúscula**: en el Baúl `x`/Supr y luego `S`; en Cuentas `x`/Supr y luego `S`/`Y` (la `s` minúscula es "activar"). Backspace ya no borra nada. `A` en el Baúl compacta solo las pesadas **sin** handoff (máx. 12) y pide `A` otra vez: cada una es una llamada a NVIDIA.
+   - Si falla la carga de sesiones o un frame, el panel no se cierra: avisa en rojo (línea 4) o en el banner y deja el traceback en `~/.local/state/agy-dash/tui-errors.log`. Si falla la consulta de cuotas, se reintenta al siguiente intervalo (no en cada frame).
+   - La clave NVIDIA se teclea enmascarada (`•••`): no queda en el scrollback de tmux.
+   - Con la ayuda (`?`) o una confirmación abiertas, el ratón no actúa sobre lo de debajo; solo valen las teclas del pie. En la vista Memoria, `m`/`Esc` vuelven y `u` abre Cuentas.
+   - Una sesión abierta varias veces se avisa siempre en la línea 4 (amarillo) hasta que `[x]` cierre las copias inactivas.
 
 ## Variables de entorno
 
