@@ -58,6 +58,7 @@ CUSTOM_TITLES_FILE = AGY_DATA_DIR / "custom_titles.json"
 NVAPI_CONFIG_FILE = AGY_DATA_DIR / "nvapi_config.json"
 COMPACTED_DIR = AGY_DATA_DIR / "compacted"
 HEARTBEATS_DIR = AGY_DATA_DIR / "heartbeats"
+SANDBOX_DIR = Path(os.environ.get("AGY_DASH_SANDBOX_DIR") or (AGY_DATA_DIR / "sandbox"))
 ACCOUNTS_DIR = AGY_DATA_DIR / "accounts"
 ACCOUNTS_REGISTRY = ACCOUNTS_DIR / "registry.json"
 TMUX_CONF = AGY_DATA_DIR / "agy-dash.tmux.conf"

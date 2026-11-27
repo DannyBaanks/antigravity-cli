@@ -103,14 +103,119 @@ def is_ancestor_pid(target_pid: int) -> bool:
     return False
 
 
-def proc_start_ticks(pid: int) -> int:
+def proc_start_ticks(pid: int, proc_root: Path = Path("/proc")) -> int:
     """Kernel start time of `pid` (field 22 of /proc/<pid>/stat); 0 if it does not exist or already exited
     (a zombie keeps its /proc entry until reaped, but it is dead)."""
     try:
-        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        fields = (proc_root / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
         return 0 if fields[0] in ("Z", "X") else int(fields[19])
     except (OSError, ValueError, IndexError):
         return 0
+
+
+def proc_identity(pid: int, proc_root: Path = Path("/proc")) -> tuple[str, str] | None:
+    """(comm, starttime) or None if the process is gone or zombie."""
+    try:
+        stat = (proc_root / str(pid) / "stat").read_text()
+    except OSError:
+        return None
+    lpar, rpar = stat.find("("), stat.rfind(")")
+    if lpar < 0 or rpar < 0:
+        return None
+    comm = stat[lpar + 1 : rpar]
+    fields = stat[rpar + 2 :].split()
+    if len(fields) < 20 or fields[0] in ("Z", "X"):
+        return None
+    return comm, fields[19]
+
+
+@dataclass
+class ShellProc:
+    pid: int
+    age_s: float
+    command: str
+
+
+def _clk_tck() -> int:
+    try:
+        return os.sysconf("SC_CLK_TCK")
+    except (ValueError, OSError):
+        return 100
+
+
+def proc_age_s(pid: int, proc_root: Path = Path("/proc")) -> float:
+    ident = proc_identity(pid, proc_root)
+    if ident is None:
+        return 0.0
+    try:
+        uptime = float((proc_root / "uptime").read_text().split()[0])
+        return max(0.0, uptime - int(ident[1]) / _clk_tck())
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
+def _extract_shell_cmd(argv: list[str]) -> str:
+    if not argv:
+        return ""
+    base = Path(argv[0]).name
+    if base in ("isymcp-hub", "agy-fast-core"):
+        return ""
+    if len(argv) >= 3 and base in ("bash", "sh", "zsh") and argv[1] in ("-c", "-lc"):
+        return " ".join(argv[2].split())
+    return " ".join(" ".join(argv).split())
+
+
+def shells_of(
+    pid: int,
+    active_children: list[str] | None = None,
+    proc_root: Path = Path("/proc"),
+) -> list[ShellProc]:
+    """Child shells/commands that `pid` (an agy process) is running right now, oldest first."""
+    kpids: set[int] = set()
+    for item in active_children or []:
+        if "(" in item and item.endswith(")"):
+            cname, _, rest = item.rpartition("(")
+            if cname in ("isymcp-hub", "agy-fast-core"):
+                continue
+            try:
+                kpids.add(int(rest[:-1]))
+            except ValueError:
+                pass
+    task_dir = proc_root / str(pid) / "task"
+    if task_dir.is_dir():
+        for cf in task_dir.glob("*/children"):
+            try:
+                for tok in cf.read_text().split():
+                    kpids.add(int(tok))
+            except (OSError, ValueError):
+                continue
+    out: list[ShellProc] = []
+    for kpid in sorted(kpids):
+        try:
+            argv = [
+                a.decode("utf-8", "replace")
+                for a in (proc_root / str(kpid) / "cmdline").read_bytes().split(b"\0")
+                if a
+            ]
+        except OSError:
+            continue
+        cmd = _extract_shell_cmd(argv)
+        if cmd:
+            out.append(ShellProc(kpid, proc_age_s(kpid, proc_root), cmd))
+    out.sort(key=lambda sp: -sp.age_s)
+    return out
+
+
+def has_blocking_children(proc: ProcMemInfo, proc_root: Path = Path("/proc")) -> bool:
+    """True if `proc` has active child processes that are NOT sandbox wrappers or viewers."""
+    if not proc.active_children:
+        return False
+    from . import sandbox as _sandbox
+    sh = shells_of(proc.pid, proc.active_children, proc_root=proc_root)
+    if not sh:
+        # Fallback if /proc/<kpid>/cmdline is synthetic/missing in unit tests: inspect active_children labels
+        return any(_sandbox.blocks_close(c) for c in proc.active_children)
+    return any(_sandbox.blocks_close(s.command) for s in sh)
 
 
 def _proc_is_agy(pid: int) -> bool:

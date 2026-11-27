@@ -844,7 +844,7 @@ def cmd_self_compact(args: argparse.Namespace) -> int:
         busy = cur is not None and cur.proc is not None and (
             cur.db_status == "CASCADE_RUN_STATUS_RUNNING"
             or _sessions.is_transcript_turn_active(sel.conversation_id, max_recent_sec=3.0)
-            or bool(cur.proc.active_children)
+            or _procs.has_blocking_children(cur.proc)
         )
         if not busy:
             quiet_since = quiet_since or time.time()
@@ -878,6 +878,96 @@ def cmd_self_compact(args: argparse.Namespace) -> int:
 
 def cmd_tui(_args: argparse.Namespace) -> int:
     curses.wrapper(_tui.run_curses_tui)
+    return 0
+
+
+def cmd_sbx_hook(_args: argparse.Namespace) -> int:
+    """AGY PreToolUse(run_command) hook: wrap background commands and swarm-ext workers in the sandbox."""
+    from . import sandbox as _sandbox
+    payload: dict = {}
+    try:
+        raw = "" if sys.stdin.isatty() else sys.stdin.read()
+        if raw.strip():
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                payload = parsed
+        out = _sandbox.hook_rewrite(payload) if payload else None
+    except Exception as exc:
+        print(f"agy-dash sbx-hook: {type(exc).__name__}: {exc}", file=sys.stderr)
+        out = None
+    if out:
+        print(json.dumps(out, ensure_ascii=False))
+    elif "toolCall" in payload or "hookEventName" in payload or not payload:
+        # AGY PreToolUse requires {"decision": "ask"} as the neutral response ({} denies the tool call)
+        print(json.dumps({"decision": "ask"}))
+    return 0
+
+
+def cmd_sbx(args: argparse.Namespace) -> int:
+    """Manage detached shell sandbox jobs (`run`, `list`, `wait`, `tail`, `kill`)."""
+    from . import sandbox as _sandbox
+    scmd = getattr(args, "sbx_cmd", "list") or "list"
+    if scmd == "run":
+        raw_cmd = list(getattr(args, "command", []) or [])
+        if raw_cmd and raw_cmd[0] == "--":
+            raw_cmd = raw_cmd[1:]
+        cmd = " ".join(raw_cmd).strip()
+        if not cmd:
+            print("uso: agy-dash sbx run [--sid ID] -- '<comando>'", file=sys.stderr)
+            return 2
+        sid = (getattr(args, "sid", "") or os.environ.get("AGY_CONVERSATION_ID", "")).strip()
+        job = _sandbox.launch(sid, cmd, os.getcwd())
+        print(
+            f"[sandbox {job['id']}] corre fuera de AGY (sobrevive a compactar) · log {job['log']}",
+            flush=True,
+        )
+        return _sandbox.follow(job["id"])
+    if scmd == "_exec":
+        return _sandbox.run_job(args.jid)
+    if scmd == "wait":
+        job = _sandbox.load_job(args.jid)
+        if not job:
+            print(f"no existe el job {args.jid} (agy-dash sbx list)", file=sys.stderr)
+            return 2
+        print(
+            f"[sandbox {args.jid}] reenganchado: `{' '.join(str(job.get('cmd', '')).split())[:200]}`",
+            flush=True,
+        )
+        rc = _sandbox.follow(args.jid, from_start=bool(getattr(args, "from_start", False)))
+        print(f"[sandbox {args.jid}] terminó rc={rc}", flush=True)
+        return rc
+    if scmd == "tail":
+        lf = _sandbox.log_file(args.jid)
+        if not lf.exists():
+            print(f"sin log para {args.jid}", file=sys.stderr)
+            return 1
+        data = lf.read_bytes()
+        nlines = int(getattr(args, "lines", 40) or 40)
+        sys.stdout.write(b"\n".join(data.splitlines()[-nlines:]).decode("utf-8", "replace") + "\n")
+        return 0
+    if scmd == "kill":
+        ok, msg = _sandbox.kill(args.jid)
+        print(msg, file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 1
+
+    js = _sandbox.jobs(
+        getattr(args, "sid", "") or "",
+        include_done_s=float(getattr(args, "done_hours", 1.0) or 1.0) * 3600.0,
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(js, ensure_ascii=False, indent=2))
+        return 0
+    if not js:
+        print("sin jobs en el sandbox")
+        return 0
+    now = time.time()
+    for j in js:
+        age = _sandbox.fmt_dur(now - float(j.get("started") or j.get("created") or now))
+        rc = f" rc={j['rc']}" if "rc" in j else ""
+        print(
+            f"{j['id']}  {j.get('status', ''):8}{rc:7} {age:>7}  "
+            f"{str(j.get('sid', ''))[:8]:8}  {' '.join(str(j.get('cmd', '')).split())[:110]}"
+        )
     return 0
 
 
@@ -1032,6 +1122,45 @@ def build_parser() -> argparse.ArgumentParser:
     p_sc.add_argument("--bg", action="store_true", help="Run detached in background")
     p_sc.add_argument("--_bg-worker", dest="bg_worker", action="store_true", help=argparse.SUPPRESS)
     p_sc.set_defaults(fn=cmd_self_compact, in_place=True)
+
+    p_sh = sub.add_parser("sbx-hook", help="AGY PreToolUse(run_command) hook: wrap background commands in the sandbox")
+    p_sh.set_defaults(fn=cmd_sbx_hook)
+
+    p_sx = sub.add_parser("sbx", help="Shell sandbox: background jobs & swarm workers that survive compaction")
+    sx_sub = p_sx.add_subparsers(dest="sbx_cmd")
+    p_sx.add_argument("--sid", default="", help="Filter by conversation ID")
+    p_sx.add_argument("--done-hours", type=float, default=1.0, help="Include finished jobs from the last N hours")
+    p_sx.add_argument("--json", action="store_true", help="Emit JSON output")
+    p_sx.set_defaults(fn=cmd_sbx, sbx_cmd="list")
+
+    p_sxl = sx_sub.add_parser("list", help="List running and recently finished sandbox jobs")
+    p_sxl.add_argument("--sid", default="", help="Filter by conversation ID")
+    p_sxl.add_argument("--done-hours", type=float, default=1.0, help="Include finished jobs from the last N hours")
+    p_sxl.add_argument("--json", action="store_true", help="Emit JSON output")
+    p_sxl.set_defaults(fn=cmd_sbx, sbx_cmd="list")
+
+    p_sxr = sx_sub.add_parser("run", help="Launch a detached command in the sandbox and follow its output")
+    p_sxr.add_argument("--sid", default="", help="Conversation ID owning this job")
+    p_sxr.add_argument("command", nargs=argparse.REMAINDER, help="Command to run (after --)")
+    p_sxr.set_defaults(fn=cmd_sbx, sbx_cmd="run")
+
+    p_sxe = sx_sub.add_parser("_exec", help=argparse.SUPPRESS)
+    p_sxe.add_argument("jid")
+    p_sxe.set_defaults(fn=cmd_sbx, sbx_cmd="_exec")
+
+    p_sxw = sx_sub.add_parser("wait", help="Re-attach to a running sandbox job until it finishes")
+    p_sxw.add_argument("jid", help="Sandbox job ID")
+    p_sxw.add_argument("--from-start", action="store_true", help="Replay the entire log from the beginning")
+    p_sxw.set_defaults(fn=cmd_sbx, sbx_cmd="wait")
+
+    p_sxt = sx_sub.add_parser("tail", help="Print the last N lines of a sandbox job log")
+    p_sxt.add_argument("jid", help="Sandbox job ID")
+    p_sxt.add_argument("-n", "--lines", type=int, default=40, help="Number of lines to show")
+    p_sxt.set_defaults(fn=cmd_sbx, sbx_cmd="tail")
+
+    p_sxk = sx_sub.add_parser("kill", help="Send SIGTERM to a running sandbox job's process group")
+    p_sxk.add_argument("jid", help="Sandbox job ID")
+    p_sxk.set_defaults(fn=cmd_sbx, sbx_cmd="kill")
 
     return ap
 

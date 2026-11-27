@@ -134,16 +134,43 @@ def should_offer_compaction(session: _sessions.AgySession) -> tuple[bool, int, i
     return (is_heavy, est_tok, size_b)
 
 
-def build_compaction_digest(conv_id: str, title: str, workspace: str, max_chars: int = 44000) -> tuple[str, int]:
+def _shells_now(conv_id: str, session: _sessions.AgySession | None = None) -> str:
+    """Sandbox jobs of `conv_id` + non-sandbox child shells running right now (those die on respawn)."""
+    try:
+        from . import sandbox as _sandbox
+        cur = session or _sessions.refresh_session(conv_id)
+        doomed: list[str] = []
+        if cur is not None and cur.proc is not None:
+            doomed = [
+                x.command
+                for x in _procs.shells_of(cur.proc.pid, cur.proc.active_children)
+                if _sandbox.blocks_close(x.command)
+            ]
+        return _sandbox.describe_for_digest(conv_id, doomed).replace(
+            "MURIÓ al compactar", "MORIRÁ al compactar"
+        )
+    except Exception:
+        return ""
+
+
+def build_compaction_digest(
+    conv_id: str,
+    title: str,
+    workspace: str,
+    max_chars: int = 44000,
+    *,
+    shells: str = "",
+) -> tuple[str, int]:
     """Extract high-signal user requests, tool actions, and recent turns from transcript.jsonl."""
     tpath = _sessions.transcript_path_for(conv_id)
+    shells_section = f"## SHELLS EN 2º PLANO\n{shells}\n\n" if shells.strip() else ""
     if not tpath.is_file():
-        return (f"Título: {title}\nWorkspace: {workspace}\n(Sin transcript.jsonl local)", 0)
+        return (f"Título: {title}\nWorkspace: {workspace}\n{shells_section}(Sin transcript.jsonl local)", 0)
 
     try:
         raw_bytes = tpath.read_bytes()
     except OSError:
-        return (f"Título: {title}\nWorkspace: {workspace}", 0)
+        return (f"Título: {title}\nWorkspace: {workspace}\n{shells_section}", 0)
 
     lines = [l for l in raw_bytes.decode("utf-8", errors="replace").splitlines() if l.strip().startswith("{")]
     user_prompts: list[str] = []
@@ -187,6 +214,7 @@ def build_compaction_digest(conv_id: str, title: str, workspace: str, max_chars:
         f"# Conversación a Compactar: {title} ({conv_id})\n"
         f"- Workspace: {workspace}\n"
         f"- Tamaño original: {len(raw_bytes) // 1024} KB (~{len(raw_bytes) // 4} tokens)\n\n"
+        f"{shells_section}"
         f"## Peticiones iniciales del usuario\n{head_users}\n\n"
         f"## Peticiones recientes del usuario\n{tail_users}\n\n"
         f"## Herramientas y archivos tocados recientemente\n{tools_sample}\n\n"
@@ -215,6 +243,20 @@ def _discover_nvapi_nemotron_model(base_url: str, api_key: str) -> str:
     return _paths.DEFAULT_NVAPI_MODEL
 
 
+SYSTEM_PROMPT = (
+    "Eres un compactador experto de contexto para sesiones de ingeniería de software (Antigravity CLI). "
+    "Resume la conversación en español en un documento Markdown ultra-denso (<1200 palabras) con estas secciones exactas:\n"
+    "1. OBJETIVO Y PETICIONES DEL USUARIO\n"
+    "2. TRABAJO COMPLETADO Y DECISIONES TÉCNICAS\n"
+    "3. ARCHIVOS MODIFICADOS / RUTAS Y COMANDOS CLAVE\n"
+    "4. ESTADO ACTUAL EXACTO\n"
+    "5. SIGUIENTE PASO ACCIONABLE INMEDIATO\n"
+    "Conserva rutas exactas, hashes de commits, nombres de funciones y errores pendientes sin inventar nada. "
+    "Si hay sección SHELLS EN 2º PLANO, en 5. SIGUIENTE PASO ordena reenganchar cada job que SIGUE CORRIENDO con "
+    "`agy-dash sbx wait <id>` en 2º plano antes de seguir; los que murieron, relanzarlos solo si hacen falta."
+)
+
+
 def compact_conversation_with_nvapi(
     session: _sessions.AgySession,
     *,
@@ -233,7 +275,10 @@ def compact_conversation_with_nvapi(
             None,
         )
 
-    digest, orig_bytes = build_compaction_digest(session.conversation_id, session.title, session.workspace)
+    shells_block = _shells_now(session.conversation_id, session)
+    digest, orig_bytes = build_compaction_digest(
+        session.conversation_id, session.title, session.workspace, shells=shells_block
+    )
     orig_tokens = max(session.step_count * 140, orig_bytes // 4)
     base_url = cfg["base_url"]
     if not _nvapi_url_ok(base_url):
@@ -247,16 +292,7 @@ def compact_conversation_with_nvapi(
     if chosen_model.lower() == "auto":
         chosen_model = _discover_nvapi_nemotron_model(base_url, api_key)
 
-    sys_prompt = (
-        "Eres un compactador experto de contexto para sesiones de ingeniería de software (Antigravity CLI). "
-        "Resume la conversación en español en un documento Markdown ultra-denso (<1200 palabras) con estas secciones exactas:\n"
-        "1. OBJETIVO Y PETICIONES DEL USUARIO\n"
-        "2. TRABAJO COMPLETADO Y DECISIONES TÉCNICAS\n"
-        "3. ARCHIVOS MODIFICADOS / RUTAS Y COMANDOS CLAVE\n"
-        "4. ESTADO ACTUAL EXACTO\n"
-        "5. SIGUIENTE PASO ACCIONABLE INMEDIATO\n"
-        "Conserva rutas exactas, hashes de commits, nombres de funciones y errores pendientes sin inventar nada."
-    )
+    sys_prompt = SYSTEM_PROMPT
 
     candidates = [chosen_model] + [m for m in _NEMOTRON_CANDIDATE_MODELS if m != chosen_model]
     url_open = opener or _NO_REDIRECT_OPENER.open
@@ -330,7 +366,12 @@ def compact_conversation_with_nvapi(
         f"- **Workspace:** `{session.workspace}`\n"
         f"- **Reducción de contexto:** `~{orig_tokens:,} tokens` -> `~{compact_tokens:,} tokens` (**{saved_pct}% ahorrado**)\n\n"
     )
-    handoff_file.write_text(header + summary_text + "\n", encoding="utf-8")
+    shells_footer = (
+        f"\n\n## SHELLS EN 2º PLANO al compactar\n{shells_block}\n"
+        if shells_block.strip()
+        else ""
+    )
+    handoff_file.write_text(header + summary_text + shells_footer + "\n", encoding="utf-8")
     try:
         os.chmod(handoff_file, 0o600)
     except OSError:
@@ -342,6 +383,41 @@ def compact_conversation_with_nvapi(
     )
 
 
+def _sandbox_clause(conv_id: str) -> str:
+    try:
+        from . import sandbox as _sandbox
+        block = _sandbox.describe_for_digest(conv_id)
+    except Exception:
+        block = ""
+    if not block.strip():
+        return ""
+    return (
+        " Antes de seguir, reengancha en 2º plano (`run_command` con `WaitMsBeforeAsync=500`) "
+        f"los shells del sandbox que siguen vivos:\n{block}"
+    )
+
+
+def continue_prompt(info: dict, resume_prompt: str = "") -> str:
+    nxt = resume_prompt.strip() or "continúa exactamente donde quedaste."
+    shells = ""
+    if info.get("shells_block"):
+        shells = (
+            " Antes de seguir, reengancha en 2º plano (`run_command` con `WaitMsBeforeAsync=500`) "
+            f"los shells que siguen vivos:\n{info['shells_block']}\n"
+        )
+    queued = ""
+    if info.get("queued"):
+        queued = (
+            " Mientras se compactaba llegaron estos mensajes (no los viste; atiéndelos):\n"
+            + "\n---\n".join(info["queued"])
+            + "\n"
+        )
+    return (
+        f"[agy-dash] {info.get('message', 'Contexto compactado con NVIDIA')}."
+        f"{shells}{queued} Sigue trabajando: {nxt}"
+    )
+
+
 def open_compacted_session_in_tab(session: _sessions.AgySession, handoff_file: Path, *, switch_to: bool = True) -> str:
     """Open a fresh lightweight AGY session tab pre-loaded with the NVAPI compacted handoff."""
     self_path = _paths.SELF_PATH
@@ -349,10 +425,11 @@ def open_compacted_session_in_tab(session: _sessions.AgySession, handoff_file: P
     reg = _accounts.load_accounts_registry()
     slot = reg.get("conv_accounts", {}).get(session.conversation_id) or reg.get("active_slot", "primary")
     tab_name = _tmuxctl._short_tab_title(session.title, prefix="🗜")
+    sbx_clause = _sandbox_clause(session.conversation_id)
     boot_prompt = (
         f"Contexto compactado de la sesión '{session.title}' ({session.conversation_id[:8]}). "
         f"Ejecuta primero la tool de ISyMCP `isymcp(action='handoff.load', arguments={{'target': '{session.conversation_id[:8]}', 'workspace': '{cwd}'}})` "
-        f"(o lee `{handoff_file}` si no está disponible) para obtener el handoff y contexto ziggrep en un solo paso y confirma que estás listo."
+        f"(o lee `{handoff_file}` si no está disponible) para obtener el handoff y contexto ziggrep en un solo paso y confirma que estás listo.{sbx_clause}"
     )
     cmd = (
         f"exec python3 {_tmuxctl.sh_quote(str(self_path))} run "
@@ -679,7 +756,7 @@ def respawn_compacted_session_in_place(
         f" y continúa inmediatamente con: {resume_prompt.strip()}"
         if resume_prompt.strip()
         else " y confirma que estás listo para continuar."
-    ) + _queued_clause(session.conversation_id)
+    ) + _queued_clause(session.conversation_id) + _sandbox_clause(session.conversation_id)
     boot_prompt = (
         f"Contexto compactado con NVIDIA Nemotron 550B de tu sesión '{session.title}' ({session.conversation_id[:8]}). "
         f"Ejecuta ÚNICAMENTE una llamada a `agy_handoff_context` (o `isymcp(action='handoff.load', arguments={{'target': '{session.conversation_id[:8]}', 'workspace': '{cwd}'}})` — si aún no está cargada en este hub, lee `{handoff_file}`){cont_clause}"

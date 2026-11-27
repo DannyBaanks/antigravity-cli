@@ -1,7 +1,7 @@
 """agy_dash — agy-dash split into modules. ``paths`` is imported first: other modules read
 its constants at import time (default args, dataclass fields)."""
 from . import paths  # noqa: F401  (must be first)
-from . import procs, sessions, tmuxctl, accounts, compact, mirror, tui, cli  # noqa: F401,E401
+from . import procs, sessions, tmuxctl, accounts, compact, mirror, sandbox, tui, cli  # noqa: F401,E401
 
 OWNER: dict[str, str] = {
 "ACCOUNTS_DIR": "paths",
@@ -37,9 +37,12 @@ OWNER: dict[str, str] = {
 "QUOTA_CRIT_PCT": "paths",
 "QUOTA_POLL_INTERVAL_SEC": "paths",
 "QUOTA_WARN_PCT": "paths",
+"SANDBOX_DIR": "paths",
 "SCRIPT_DIR": "paths",
 "SELF_PATH": "paths",
 "SUMMARIES_DB": "paths",
+"SYSTEM_PROMPT": "compact",
+"ShellProc": "procs",
 "TMUX_BG_SESSION": "paths",
 "TMUX_CONF": "paths",
 "TMUX_SESSION": "paths",
@@ -105,6 +108,8 @@ OWNER: dict[str, str] = {
 "cmd_open_new_tab": "cli",
 "cmd_quota": "cli",
 "cmd_rename": "cli",
+"cmd_sbx": "cli",
+"cmd_sbx_hook": "cli",
 "cmd_self_compact": "cli",
 "cmd_show_dash": "cli",
 "cmd_isymcp_tab": "cli",
@@ -114,6 +119,7 @@ OWNER: dict[str, str] = {
 "cmd_wake_stub": "cli",
 "compact_conversation_with_nvapi": "compact",
 "compute_quota_alert": "accounts",
+"continue_prompt": "compact",
 "deduplicate_session_procs": "sessions",
 "delete_vault_handoff": "compact",
 "detect_caller_conversation_id": "compact",
@@ -128,6 +134,7 @@ OWNER: dict[str, str] = {
 "extract_email_from_cli_log": "accounts",
 "format_led_tab_title": "tmuxctl",
 "get_vault_handoff": "compact",
+"has_blocking_children": "procs",
 "hibernate_session": "sessions",
 "hibernate_batch": "sessions",
 "hibernate_all_idle": "sessions",
@@ -154,6 +161,8 @@ OWNER: dict[str, str] = {
 "parse_usage_output": "accounts",
 "parse_workspace_uri": "sessions",
 "print_instant_zig_preview": "sessions",
+"proc_age_s": "procs",
+"proc_identity": "procs",
 "proc_start_ticks": "procs",
 "purge_isolated_slot_dir": "accounts",
 "refresh_account_quota": "accounts",
@@ -171,6 +180,7 @@ OWNER: dict[str, str] = {
 "save_nvapi_config": "compact",
 "session_live_activity": "tmuxctl",
 "sh_quote": "tmuxctl",
+"shells_of": "procs",
 "should_offer_compaction": "compact",
 "sync_led_tmux_tabs": "tmuxctl",
 "terminate_verified": "procs",
