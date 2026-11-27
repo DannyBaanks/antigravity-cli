@@ -272,6 +272,18 @@ def _find_tmux_window_by_conv(conv_id: str) -> str | None:
     return info[0] if info else None
 
 
+def close_session_tabs_for_deletion(conv_id: str) -> None:
+    """Close any tmux window (dash or background) bound to `conv_id`, never closing 0:⚡DASH."""
+    dash_info = _get_dash_window_map().get(conv_id)
+    if dash_info is not None:
+        win_idx, win_name = dash_info
+        if "DASH" not in win_name:
+            tmux_cmd("kill-window", "-t", f"{_paths.TMUX_SESSION}:{win_idx}")
+    bg_info = _get_bg_window_map().get(conv_id)
+    if bg_info is not None:
+        tmux_cmd("kill-window", "-t", f"{_paths.TMUX_BG_SESSION}:{bg_info[0]}")
+
+
 def _replace_tmux_pane_with_wake_stub(session: _sessions.AgySession) -> None:
     win_idx = _find_tmux_window_by_conv(session.conversation_id)
     if not win_idx:

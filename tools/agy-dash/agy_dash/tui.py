@@ -46,9 +46,12 @@ from __future__ import annotations
 
 import argparse
 import curses
+import datetime as dt
+import json
 import os
 import shlex
 import shutil
+import sys
 import threading
 import time
 import traceback
@@ -62,6 +65,7 @@ from . import compact as _compact
 from . import paths as _paths
 from . import procs as _procs
 from . import sessions as _sessions
+from . import swarm as _swarm
 from . import tmuxctl as _tmuxctl
 from .termtext import clean, ellipsize, first_fit, fit, put, tail, text_cols
 
@@ -80,6 +84,75 @@ class CommandButton:
     width: int
 
 
+_MONTHS_ES = ("ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic")
+
+_FRIENDLY_STATES: dict[str, str] = {
+    "RUNNING": "● Activo",
+    "BG-TASK": "⏳ En tarea",
+    "UNKNOWN": "● Activo",
+    "IDLE": "○ En espera",
+    "HIBERNATED": "💤 Pausado",
+    "SAVED": "📁 Guardado",
+}
+
+
+def format_relative_age(ts: float, now: float) -> str:
+    """Human-readable Spanish relative time ('ahora', 'hace 12m', 'ayer', '21 nov')."""
+    if ts <= 0.0:
+        return "-"
+    delta = max(0.0, now - ts)
+    if delta < 60:
+        return "ahora"
+    if delta < 3600:
+        return f"hace {int(delta // 60)}m"
+    if delta < 86400:
+        return f"hace {int(delta // 3600)}h"
+    if delta < 172800:
+        return "ayer"
+    if delta < 7 * 86400:
+        return f"hace {int(delta // 86400)}d"
+    local_dt = dt.datetime.fromtimestamp(ts, tz=_paths.display_timezone())
+    return f"{local_dt.day} {_MONTHS_ES[local_dt.month - 1]}"
+
+
+def friendly_state_label(state_label: str) -> str:
+    return _FRIENDLY_STATES.get(state_label, state_label)
+
+
+def friendly_workspace(ws: str) -> str:
+    name = os.path.basename(ws.rstrip("/")) or ws
+    return "-" if name in ("", ".", "cwd") else name
+
+
+def friendly_tool_activity(tools: list[str]) -> str:
+    """Summarize raw tool call names into a calm Spanish phrase for non-technical users."""
+    names = [t.split("(", 1)[0].strip().lower() for t in tools if t]
+    if any(n in ("edit_file", "write_file", "replace_file_content", "multi_replace_file_content") for n in names):
+        return "✏️ Editando archivos…"
+    if any(n in ("read_file", "view_file", "list_dir", "find_by_name", "grep_search") for n in names):
+        return "🔍 Revisando archivos…"
+    if any(n in ("run_command", "command_status", "send_command_input") for n in names):
+        return "⚙️ Ejecutando una tarea…"
+    if any(n in ("search_web", "read_url_content", "open_browser_url") for n in names):
+        return "🌐 Consultando información…"
+    if any("subagent" in n or "swarm" in n for n in names):
+        return "🤝 Coordinando asistentes…"
+    if any("step" in n or "task" in n for n in names):
+        return "📋 Actualizando el plan…"
+    return "⚙️ Trabajando…"
+
+
+def friendly_context_hint(level: str, pct: float, kids: str, age_txt: str) -> tuple[str, int]:
+    """Return (single-line status text, curses color_pair) for the friendly inspector."""
+    if "URGENT" in level:
+        return (f" 💬 Muy largo · ctx {pct:.0f}% · conviene resumir [c]", 4)
+    if "RECOMMEND" in level:
+        return (f" 💬 Chat largo · ctx {pct:.0f}% · puedes resumir [c]", 4)
+    if kids:
+        return (f" ⏳ Trabajando en 2º plano · ctx {pct:.0f}% · {age_txt}", 4)
+    return (f" ✓ Ligero · ctx {pct:.0f}% · {age_txt}", 3)
+
+
 def build_command_buttons(panel_w: int) -> list[CommandButton]:
     """Botones de clic del panel derecho: solo las acciones de uso frecuente, en 2 columnas.
     El resto de acciones sigue funcionando por tecla y aparece en el pie y en la ayuda (?).
@@ -88,15 +161,17 @@ def build_command_buttons(panel_w: int) -> list[CommandButton]:
     half = max(18, (panel_w - 4) // 2)
     grid = [
         ("refresh", "r", "[r] 🔄 Actualizar"),
-        ("open", "↵", "[↵] 🚀 Abrir"),
-        ("mirror", "v", "[v] 👁 Espejo"),
-        ("compact", "c", "[c] 🗜 Compactar+Ir"),
-        ("accounts", "u", "[u] 💳 Cuentas"),
-        ("baton", "B", "[B] 🔀 Baton Pass"),
-        ("vault", "V", "[V] 🗄️ Baúl"),
-        ("vault_compact", "C", "[C] 📦 Guardar Baúl"),
-        ("hibernate", "h", "[h] 💤 Hibernar"),
-        ("ranking", "M", "[M] 🏆 Ranking"),
+        ("new", "n", "[n] ✨ Nuevo chat"),
+        ("open", "↵", "[↵] 💬 Abrir chat"),
+        ("hibernate", "h", "[h] 💤 Pausar RAM"),
+        ("compact", "c", "[c] ✂ Resumir+Ir"),
+        ("vault_compact", "C", "[C] 📦 Guardar"),
+        ("vault", "V", "[V] 📁 Resúmenes"),
+        ("accounts", "u", "[u] 👤 Cuentas"),
+        ("baton", "B", "[B] 🔀 Otra cuenta"),
+        ("ranking", "M", "[M] 🏆 Modelos"),
+        ("delete", "d", "[d] 🗑 Eliminar"),
+        ("multi_select", "^D", "[^D] ☑ Varios"),
     ]
     return [
         CommandButton(aid, key, label, i // 2, 2 + (i % 2) * (half + 1), half)
@@ -116,7 +191,7 @@ FOOTER_ROWS = 3  # rule, banner, key footer
 RAM_BAR_FULL_MB = 2048  # the inspector's RAM bar is full at this PSS total
 CRASH_STREAK_RESET = 3  # this many failing frames in a row drop back to the sessions view
 ESC_SEQ_WAIT_MS = 40  # _prompt_curses_text: espera al 2º byte antes de leer Esc como "cancelar"
-DEFAULT_BANNER = "Listo · ↑/↓ elige una sesión · ? muestra todas las teclas"
+DEFAULT_BANNER = "Listo · ↑/↓ elige un chat · [↵] abrir · [/] buscar · [T] vista técnica · [?] ayuda"
 CRASH_LOG = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "agy-dash" / "tui-errors.log"
 CRASH_LOG_MAX_BYTES = 1 << 20  # past 1 MiB the log is rotated once to tui-errors.log.1
 
@@ -140,6 +215,8 @@ class Confirm:
 CONFIRM_SPECS: dict[str, tuple[str, bool, str]] = {
     "modal": ("sessions", False, "Reactivación cancelada."),
     "dedup_confirm": ("sessions", True, "Cierre de copias duplicadas cancelado."),
+    "multi_select": ("sessions", False, "Selección múltiple cancelada."),
+    "delete_confirm": ("sessions", False, "Eliminación de conversación cancelada."),
     "pending_delete": ("accounts", False, "Eliminación de perfil cancelada."),
     "vault_confirm": ("vault", True, "Borrado cancelado."),
     "bulk_confirm": ("vault", True, "Compactación en lote cancelada."),
@@ -150,10 +227,15 @@ TOKEN_CODES: dict[str, tuple[int, ...]] = {
     "↵": (10, 13, curses.KEY_ENTER),
     "Esc": (27,),
     "Tab": (9,),
+    "Esp": (32,),
+    "^D": (4,),
     "Supr": (curses.KEY_DC,),
     "↑": (curses.KEY_UP,),
     "↓": (curses.KEY_DOWN,),
     "↑↓": (curses.KEY_UP, curses.KEY_DOWN),
+    "←": (curses.KEY_LEFT,),
+    "→": (curses.KEY_RIGHT,),
+    "←→": (curses.KEY_LEFT, curses.KEY_RIGHT),
 }
 
 
@@ -180,8 +262,8 @@ def _keymap(**views: dict[str, str]) -> dict[str, dict[int, str]]:
 # Action ids that execute_action knows; any other KEYMAP action is the method `_k_<action>`.
 EXEC_ACTIONS = frozenset((
     "refresh", "refresh_quota", "open", "open_full", "open_vault", "mirror", "reload", "new",
-    "hibernate", "hib_all", "dedup", "baton", "accounts", "compact", "rename", "vault_compact",
-    "vault", "nvapi_key", "memory", "ranking",
+    "hibernate", "hib_all", "dedup", "delete", "multi_select", "baton", "accounts", "compact",
+    "rename", "vault_compact", "vault", "nvapi_key", "memory", "ranking",
 ))
 # In the compaction modal these act on the session it shows, not on the row under the cursor.
 MODAL_TARGETED = frozenset(("compact", "vault_compact", "open_vault", "open_full"))
@@ -190,17 +272,26 @@ MODAL_TARGETED = frozenset(("compact", "vault_compact", "open_vault", "open_full
 # (HELP_LINES) lists all of them and the footer a subset; test_tui_keys checks both ways.
 KEYMAP = _keymap(
     sessions={
-        "q Esc Tab": "next_window", "D": "detach", "↑ k": "up", "↓ j": "down",
+        "q Esc Tab": "next_window", "Q": "detach", "↑ k": "up", "↓ j": "down",
         "r": "refresh", "m": "memory", "u": "accounts", "U": "refresh_quota", "V": "vault",
         "↵": "open", "c": "compact", "C": "vault_compact", "t": "rename", "K": "nvapi_key",
         "v": "mirror", "R": "reload", "n": "new", "h": "hibernate", "H a": "hib_all",
-        "x": "ask_dedup", "M": "ranking", "b B": "baton",
+        "x": "ask_dedup", "d D Supr": "delete", "^D": "multi_select", "M": "ranking",
+        "b B": "baton", "/": "search", "T": "toggle_tech_mode",
     },
     modal={
         "c": "compact", "C": "vault_compact", "b B": "open_vault", "o O ↵": "open_full",
         "k K": "nvapi_key", "q n N Esc": "cancel",
     },
     dedup_confirm={"x S Y": "dedup"},
+    multi_select={
+        "↑ k": "up", "↓ j": "down", "Esp": "multi_toggle", "a A": "multi_toggle_all",
+        "/": "search", "d D Supr ↵ ^D": "multi_confirm", "Esc q": "cancel",
+    },
+    delete_confirm={
+        "← h": "delete_focus_cancel", "→ l": "delete_focus_confirm", "Tab": "delete_focus_toggle",
+        "↵": "delete_popup_activate", "S Y": "delete_yes", "Esc q n N": "cancel",
+    },
     accounts={
         "u m Esc": "back", "↑ k": "up", "↓ j": "down", "r R": "refresh_quota", "+": "acct_add",
         "x Supr": "acct_ask_delete", "s ↵": "acct_activate", "b B": "acct_baton", "q Tab": "next_window",
@@ -258,6 +349,82 @@ def open_model_board() -> str:
     return "🏆 Ranking de modelos abierto (popup: ping/bench por modelo, Esc/q cierra)"
 
 
+def open_model_picker(dash: "Dashboard | None" = None) -> str:
+    """Open the claude-dash style interactive model picker in a tmux popup without blocking the TUI."""
+    if not _BOARD_OPEN.acquire(blocking=False):
+        return "🏆 El selector de modelos ya está abierto (ciérralo con Esc/q)"
+
+    def _popup() -> None:
+        req_path: Path | None = None
+        out_path: Path | None = None
+        try:
+            rows, _note = _swarm.catalog()
+            work = _paths.AGY_DATA_DIR / "swarm"
+            work.mkdir(parents=True, exist_ok=True)
+            stamp = f"{os.getpid()}-{int(time.time() * 1000)}"
+            req_path = work / f"dash-req-{stamp}.json"
+            out_path = work / f"dash-pick-{stamp}.json"
+            current_model = dash.model_disp if dash else _accounts.resolve_model_arg()[0]
+            req_data = {
+                "workers": [{
+                    "name": "AGY",
+                    "title": "🏆 Selector de modelos · escribe para filtrar · Enter elegir · p ping · M board",
+                    "desc": f"Modelo actual: {current_model or 'por defecto'} · [AGY] actualiza settings.json",
+                    "catalog": rows,
+                }],
+                "swarm_ext": _swarm._swarm_ext(None),
+                "skip_via": True,
+                "current_model": current_model,
+            }
+            req_path.write_text(json.dumps(req_data), encoding="utf-8")
+            line = " ".join(
+                shlex.quote(c)
+                for c in [sys.executable, str(_paths.SELF_PATH), "swarm", "pick-ui", str(req_path), str(out_path)]
+            )
+            _tmuxctl.tmux_cmd(
+                "display-popup",
+                "-E",
+                "-w",
+                "92%",
+                "-h",
+                "86%",
+                "-T",
+                " 🏆 Selector de modelos · filtro / ping / board ",
+                line,
+                timeout=None,
+            )
+            if out_path.is_file():
+                res = json.loads(out_path.read_text(encoding="utf-8"))
+                if res.get("cancelled"):
+                    if dash is not None:
+                        dash.status_banner = "Selector de modelos cancelado."
+                elif res.get("picks"):
+                    pk = res["picks"][0]
+                    if pk.get("provider") == "agy":
+                        ok, msg = _swarm.set_active_model(pk.get("label") or pk.get("spec") or "")
+                        if dash is not None:
+                            if ok:
+                                dash.model_disp = msg
+                                dash.status_banner = f"✅ Modelo activo actualizado: {msg}"
+                            else:
+                                dash.status_banner = f"⚠️ {msg}"
+                    elif dash is not None:
+                        dash.status_banner = (
+                            f"ℹ Modelo externo {pk.get('spec')} (para workers swarm-ext; settings.json sin cambios)."
+                        )
+        except Exception:  # noqa: BLE001 — un traceback en stderr rompería la pantalla curses
+            pass
+        finally:
+            if req_path is not None:
+                req_path.unlink(missing_ok=True)
+            if out_path is not None:
+                out_path.unlink(missing_ok=True)
+            _BOARD_OPEN.release()
+
+    threading.Thread(target=_popup, daemon=True).start()
+    return "🏆 Selector de modelos abierto (teclea para filtrar · p ping · M board · Enter elegir)"
+
+
 def hit_test_button(
     buttons: list[CommandButton],
     panel_x: int,
@@ -285,12 +452,21 @@ def _ram_bar(ratio: float, width: int = 20) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
-def _prompt_curses_text(stdscr, prompt: str, default_val: str = "", max_len: int = 96, secret: bool = False) -> str:
+def _prompt_curses_text(
+    stdscr,
+    prompt: str,
+    default_val: str = "",
+    max_len: int = 96,
+    secret: bool = False,
+    *,
+    allow_empty: bool = False,
+) -> str | None:
     """Pide una línea en el banner inferior; Esc / Ctrl+C / Ctrl+G cancela (Ctrl+G es el cancelar
     de readline/emacs). Esc espera ESC_SEQ_WAIT_MS por si es una secuencia (flechas, F-keys): una
     letra tecleada en ese margen justo tras Esc se descarta con ella. Bloquea el bucle mientras dura
     (el panel no se repinta). `secret` muestra `•` en vez de lo tecleado (claves API: el texto
-    quedaría en el scrollback de tmux)."""
+    quedaría en el scrollback de tmux). Con `allow_empty=True`, cancelar devuelve `None` y Enter
+    vacío devuelve `""`."""
     max_y, max_x = stdscr.getmaxyx()
     stdscr.timeout(-1)
     curses.noecho()
@@ -356,8 +532,10 @@ def _prompt_curses_text(stdscr, prompt: str, default_val: str = "", max_len: int
             pass
         stdscr.timeout(250)
     if cancelled:
-        return ""
+        return None if allow_empty else ""
     val = "".join(buf).strip()
+    if allow_empty:
+        return val
     return val or default_val
 
 
@@ -375,7 +553,7 @@ class Dashboard:
         self.cached_preview_cid = ""
         self.cached_preview_sig = (-1, -1)
         self.cached_turns: list[dict] = []
-        self.last_refresh_clock = time.strftime("%H:%M:%S")
+        self.last_refresh_clock = _paths.format_display_clock(with_tz=True)
         self.scan_us = 0
         self.ksm: dict[str, int] = {"run": 1, "pages_shared": 0, "pages_sharing": 0, "pages_scanned": 0}
         self.sessions: list[_sessions.AgySession] = []
@@ -443,6 +621,10 @@ class Dashboard:
         self.crash_streak = 0
         self.last_crash_sig = ""
         self.io_cache: dict[str, tuple[tuple, Any]] = {}  # clave -> (firma mtime, valor)
+        self.tech_mode: bool = os.environ.get("AGY_DASH_TECH_MODE", "").strip().lower() in ("1", "true", "yes")
+        self.search_query: str = ""
+        self.row_y_to_session_idx: dict[int, int] = {}
+        self.popup_hits: list[tuple[int, int, int, str]] = []  # (y, x0, x1, "cancel"|"confirm")
 
     def _configure_curses(self) -> None:
         try:
@@ -468,7 +650,7 @@ class Dashboard:
             curses.init_pair(7, curses.COLOR_WHITE, curses.COLOR_BLUE)     # Button surface
         self.stdscr.timeout(250)
         self.last_auto_check = time.time()
-        self.last_refresh_clock = time.strftime("%H:%M:%S")
+        self.last_refresh_clock = _paths.format_display_clock(with_tz=True)
 
     def cached_context(self, s: _sessions.AgySession) -> dict:
         """measure_session_context re-parses 64 KB of JSON: only redo it when the transcript changed."""
@@ -677,15 +859,26 @@ class Dashboard:
             return ""
         return self._execute_session_action(action, sel)
 
+    def _visible_sessions(self) -> list[_sessions.AgySession]:
+        """Sesiones mostradas en la lista principal (todas, o las que coinciden con `search_query`)."""
+        q = self.search_query.strip().lower()
+        if not q:
+            return self.sessions
+        return [
+            s for s in self.sessions
+            if q in s.title.lower() or q in s.workspace.lower() or q in s.conversation_id.lower()
+        ]
+
     def current_session(self) -> _sessions.AgySession | None:
         """La sesión seleccionada (en otras vistas, la que lo estaba al salir de sesiones), con el
         índice comprobado: el escáner puede haber encogido la lista desde el último frame."""
+        vis = self._visible_sessions()
         idx = self.cursor if self.mode == "sessions" else self.saved_session_cursor
-        return self.sessions[idx] if 0 <= idx < len(self.sessions) else None
+        return vis[idx] if 0 <= idx < len(vis) else None
 
     def _clamp_cursor(self) -> None:
         n = {
-            "sessions": len(self.sessions),
+            "sessions": len(self._visible_sessions()),
             "accounts": len(self.reg.get("accounts", {})),
             "vault": len(self.vault_entries),
             "memory": len(self.mem_lines),
@@ -697,12 +890,12 @@ class Dashboard:
             self.force_scan = True
             self.cached_preview_sig = (-1, -1)
             _tmuxctl.tmux_cmd("refresh-client", "-S")
-            return f"Actualizado en vivo a las {time.strftime('%H:%M:%S')} (Zig scan + DB + Vista)."
+            return f"Actualizado en vivo a las {_paths.format_display_clock(with_tz=True)} (Zig scan + DB + Vista)."
         if action == "refresh_quota":
             self.trigger_quota_poll(force=True)
             return "Consultando cuotas (/usage) de todas las cuentas en segundo plano..."
         if action == "ranking":
-            return open_model_board()
+            return open_model_picker(self)
         if action in ("memory", "accounts", "vault"):
             return self._toggle_view(action)
         if action == "nvapi_key":
@@ -796,6 +989,12 @@ class Dashboard:
                 if freed
                 else "No hay copias duplicadas inactivas para cerrar."
             )
+        if action == "delete":
+            if not sel:
+                return "No hay ninguna conversación seleccionada para eliminar."
+            return self._ask_delete_session(sel)
+        if action == "multi_select":
+            return self._start_multi_select()
         return ""
 
     def _scanner(self) -> None:
@@ -896,7 +1095,7 @@ class Dashboard:
             # Del mismo escaneo que los datos (lo calcula zig_scan en el hilo del escáner).
             self.scan_failed = bool(box.get("failed", False))
             self.scan_error = str(box.get("reason") or "") if self.scan_failed else ""
-            self.last_refresh_clock = time.strftime("%H:%M:%S")
+            self.last_refresh_clock = _paths.format_display_clock(with_tz=True)
 
     def _prune_caches(self) -> None:
         """Las cachés por conversación solo guardan las que el último escaneo aún lista: un dash
@@ -912,13 +1111,15 @@ class Dashboard:
             busy.pop(cid, None)
 
     def _cid_at(self, idx: int) -> str | None:
-        return self.sessions[idx].conversation_id if 0 <= idx < len(self.sessions) else None
+        vis = self._visible_sessions()
+        return vis[idx].conversation_id if 0 <= idx < len(vis) else None
 
     def _index_of(self, cid: str, fallback: int) -> int:
-        for i, s in enumerate(self.sessions):
+        vis = self._visible_sessions()
+        for i, s in enumerate(vis):
             if s.conversation_id == cid:
                 return i
-        return max(0, min(fallback, len(self.sessions) - 1))
+        return max(0, min(fallback, len(vis) - 1))
 
     def _periodic_idle_check(self, now: float) -> None:
         if now - self.last_auto_check < 10.0:
@@ -1029,7 +1230,7 @@ class Dashboard:
             if CRASH_LOG.is_file() and CRASH_LOG.stat().st_size > CRASH_LOG_MAX_BYTES:
                 CRASH_LOG.replace(CRASH_LOG.with_suffix(".log.1"))  # una rotación basta
             with CRASH_LOG.open("a", encoding="utf-8") as fh:
-                fh.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')}\n{text}\n")
+                fh.write(f"--- {_paths.format_display_clock(fmt='%Y-%m-%d %H:%M:%S', with_tz=True)}\n{text}\n")
         except OSError:
             pass
 
@@ -1064,6 +1265,10 @@ class Dashboard:
                                     lambda self, v: self._set_confirm_payload("bulk_confirm", v))
     pending_dedup = property(lambda self: self._confirm_payload("dedup_confirm") is not None,
                              lambda self, v: self._set_confirm_payload("dedup_confirm", True if v else None))
+    pending_multi_select = property(lambda self: self._confirm_payload("multi_select"),
+                                    lambda self, v: self._set_confirm_payload("multi_select", v))
+    pending_delete_sess = property(lambda self: self._confirm_payload("delete_confirm"),
+                                   lambda self, v: self._set_confirm_payload("delete_confirm", v))
 
     def _clear_pending(self) -> None:
         self.confirm = None
@@ -1164,20 +1369,24 @@ class Dashboard:
     # (login) no tocan ninguna conversación existente. Borrar un perfil y el Baton Pass de la
     # vista de cuentas se bloquean en _k_acct_delete_yes y _k_acct_baton.
     SCAN_BLOCKED_ACTIONS = ("open", "open_full", "open_vault", "reload", "hibernate", "hib_all", "dedup",
-                            "baton")
-    KEY_CODES = {"↵": 10, "Esc": 27, "Tab": 9}  # código que manda un clic en esa tecla del pie
+                            "delete", "multi_select", "baton")
+    KEY_CODES = {"↵": 10, "Esc": 27, "Tab": 9, "Esp": 32, "^D": 4, "←": curses.KEY_LEFT, "→": curses.KEY_RIGHT}  # código que manda un clic en esa tecla del pie
 
     # Pie de teclas por vista. Cada variante va de la más completa a la más corta; se usa la
     # primera que cabe en el ancho. Siempre empieza por la tecla que sale o cierra la vista.
     # Cada segmento es (tecla, etiqueta); las teclas se pueden pulsar con el ratón.
     FOOTER_VARIANTS: dict = {
         "sessions": (
-            (("q", "otra ventana"), ("↵", "abrir"), ("c", "compactar+ir"), ("C", "guardar Baúl"), ("V", "Baúl"),
-             ("t", "renombrar"), ("K", "key NV"), ("B", "baton"), ("u", "cuentas"), ("h", "hibernar"),
-             ("H", "hib. IDLE"), ("x", "dedup"), ("v", "espejo"), ("n", "nueva"), ("R", "recargar"),
-             ("r", "actualizar"), ("m", "memoria"), ("M", "ranking"), ("?", "ayuda")),
-            (("q", "ventana"), ("↵", "abrir"), ("c", "compactar"), ("B", "baton"), ("u", "cuentas"), ("?", "ayuda")),
-            (("q", "ventana"), ("↵", "abrir"), ("u", "cuentas"), ("?", "ayuda")),
+            (("q", "otra ventana"), ("↵", "abrir"), ("n", "nuevo"), ("/", "buscar"), ("d", "eliminar"),
+             ("^D", "varios"), ("T", "técnico"), ("c", "resumir+ir"), ("C", "guardar"), ("V", "resúmenes"),
+             ("t", "renombrar"), ("K", "key NV"), ("B", "otra cuenta"), ("u", "cuentas"), ("h", "pausar"),
+             ("H", "pausar todo"), ("x", "dedup"), ("v", "espejo"), ("R", "recargar"), ("r", "actualizar"),
+             ("m", "memoria"), ("M", "modelos"), ("?", "ayuda")),
+            (("q", "ventana"), ("↵", "abrir"), ("/", "buscar"), ("d", "eliminar"), ("^D", "varios"),
+             ("T", "técnico"), ("u", "cuentas"), ("?", "ayuda")),
+            (("q", "ventana"), ("↵", "abrir"), ("/", "buscar"), ("T", "técnico"),
+             ("u", "cuentas"), ("?", "ayuda")),
+            (("q", "ventana"), ("↵", "abrir"), ("/", "buscar"), ("?", "ayuda")),
         ),
         "modal": (
             (("q", "cancelar"), ("c", "compactar+ir"), ("C", "solo Baúl"), ("b", "abrir Baúl"),
@@ -1204,6 +1413,16 @@ class Dashboard:
         "vault_confirm": ((("S", "confirmar"), ("Esc", "cancelar")),),
         "bulk_confirm": ((("A", "compactar"), ("Esc", "cancelar")),),
         "dedup_confirm": ((("x", "cerrar copias"), ("Esc", "cancelar")),),
+        "multi_select": (
+            (("Esc", "salir"), ("Esp", "marcar"), ("a", "todas"), ("/", "buscar"), ("↵", "eliminar marcadas")),
+            (("Esc", "salir"), ("Esp", "marcar"), ("a", "todas"), ("↵", "eliminar")),
+            (("Esc", "salir"), ("Esp", "marcar"), ("↵", "borrar")),
+        ),
+        "delete_confirm": (
+            (("←→", "elegir"), ("↵", "aceptar"), ("S", "eliminar"), ("Esc", "cancelar")),
+            (("←→", "elegir"), ("↵", "aceptar"), ("Esc", "cancelar")),
+            (("↵", "aceptar"), ("Esc", "cancelar")),
+        ),
         "memory": (
             (("q", "ventana"), ("m", "volver"), ("↑↓", "mover"), ("u", "cuentas")),
             (("q", "ventana"), ("m", "volver")),
@@ -1213,20 +1432,24 @@ class Dashboard:
     # Ayuda (?): la hoja de atajos completa de cada vista, incluidas las acciones sin botón.
     HELP_LINES: dict = {
         "sessions": (
-            ("↵", "abrir (una sesión pesada ofrece compactarla antes)"),
-            ("c / C", "compactar y abrir · compactar solo al Baúl (2º plano)"),
-            ("V", "ver el Baúl de handoffs compactados"),
-            ("h", "hibernar la sesión seleccionada"),
-            ("H / a", "hibernar TODAS las IDLE (sin cerrar copias)"),
+            ("↵", "abrir chat (si es muy largo ofrece resumirlo antes)"),
+            ("n / t", "nuevo chat · renombrar"),
+            ("/", "buscar conversación por título"),
+            ("T", "cambiar entre vista amigable y técnica (PSS, KSM, PID, logs)"),
+            ("c / C", "resumir y abrir · guardar resumen en el Baúl (2º plano)"),
+            ("V", "ver resúmenes guardados (Baúl)"),
+            ("h", "pausar (hibernar) el chat seleccionado y liberar RAM"),
+            ("H / a", "pausar TODOS los chats en espera (sin cerrar copias)"),
             ("x", "cerrar copias duplicadas inactivas (pide x otra vez)"),
+            ("d / D / Supr", "eliminar la conversación seleccionada (abre popup de confirmación)"),
+            ("^D", "seleccionar varias conversaciones para eliminarlas juntas"),
             ("v / R", "espejo vivo · recargar la pestaña"),
-            ("n / t", "nueva sesión · renombrar"),
-            ("B / b", "baton pass: reabrir en otra cuenta (sin cuenta destino abre Cuentas)"),
+            ("B / b", "pasar chat a otra cuenta (sin cuenta destino abre Cuentas)"),
             ("u / U", "cuentas · consultar cuotas"),
             ("K", "clave NVIDIA"),
             ("m / M", "memoria compartida · ranking de modelos"),
             ("r", "actualizar"),
-            ("D", "desconectar el cliente tmux"),
+            ("Q", "desconectar el cliente tmux (las pestañas siguen vivas)"),
             ("↑↓ / j k", "mover (ratón: clic y rueda)"),
             ("q / Esc / Tab", "siguiente ventana tmux"),
         ),
@@ -1261,6 +1484,20 @@ class Dashboard:
         "vault_confirm": (("S / Y", "confirmar"), ("otra tecla", "cancelar")),
         "bulk_confirm": (("A / a", "confirmar"), ("otra tecla", "cancelar")),
         "dedup_confirm": (("x / S / Y", "cerrar las copias duplicadas inactivas"), ("otra tecla", "cancelar")),
+        "multi_select": (
+            ("Esp", "marcar o desmarcar la conversación actual (o clic con ratón)"),
+            ("a / A", "marcar o desmarcar todas las conversaciones elegibles visibles"),
+            ("/", "filtrar conversaciones por título o carpeta"),
+            ("↵ / d / D / Supr / ^D", "abrir popup para eliminar las marcadas"),
+            ("↑↓ / j k", "mover"),
+            ("Esc / q", "salir de selección múltiple sin borrar"),
+        ),
+        "delete_confirm": (
+            ("← / h / → / l / Tab", "elegir entre Cancelar y Eliminar (o clic en el popup)"),
+            ("↵", "ejecutar el botón seleccionado"),
+            ("S / Y", "confirmar borrado directamente"),
+            ("Esc / q / n / N", "cancelar sin borrar"),
+        ),
         "memory": (("↑↓ / j k", "mover"), ("m / Esc", "volver"), ("u", "cuentas"), ("q / Tab", "siguiente ventana tmux")),
     }
 
@@ -1308,17 +1545,33 @@ class Dashboard:
         return text, [h for h in built[-1][1] if h[1] < cols]
 
     def _draw_header(self) -> None:
+        if self.tech_mode:
+            self._put(
+                0, 0,
+                f" ⚡ AGY [TÉCNICO] · Zig {self.scan_us / 1000.0:.1f} ms · sync {self.last_refresh_clock} · "
+                f"{len(self.live)} activas · {len(self.hib)} hibernadas · cuenta [{self.active_slot}] · [T] Amigable",
+                curses.color_pair(1) | curses.A_BOLD, pad=True,
+            )
+            self._put(
+                1, 0,
+                f" RAM {self.total_pss_mb} MB PSS · compartida {self.total_shr_mb} MB + KSM {self.total_ksm_mb} MB "
+                f"({self.ksm.get('pages_sharing', 0)} págs) · ahorrado 💤 {self.hib_saved_mb} MB · "
+                f"modelo {self.model_disp or 'default'}",
+                curses.color_pair(2) | curses.A_BOLD, ellipsis=True,
+            )
+            return
+
+        # Modo amigable: cabecera tranquila sin jerga ni rojo de alarma cuando todo va bien.
+        hib_part = f" · {len(self.hib)} pausadas" if self.hib else ""
         self._put(
             0, 0,
-            f" ⚡ AGY · Zig {self.scan_us / 1000.0:.1f} ms · sync {self.last_refresh_clock} · "
-            f"{len(self.live)} activas · {len(self.hib)} hibernadas · cuenta [{self.active_slot}]",
-            curses.color_pair(1) | curses.A_BOLD, pad=True,
+            f" ⚡ AGY · {len(self.live)} abiertas{hib_part} · Modelo: {self.model_disp or 'por defecto'} · [T] Técnico",
+            curses.color_pair(7) | curses.A_BOLD, pad=True,
         )
+        saved_part = f" · ahorrados {self.hib_saved_mb} MB" if self.hib_saved_mb else ""
         self._put(
             1, 0,
-            f" RAM {self.total_pss_mb} MB PSS · compartida {self.total_shr_mb} MB + KSM {self.total_ksm_mb} MB "
-            f"({self.ksm.get('pages_sharing', 0)} págs) · ahorrado 💤 {self.hib_saved_mb} MB · "
-            f"modelo {self.model_disp or 'default'}",
+            f" Memoria en uso: {self.total_pss_mb} MB{saved_part} · actualizado {self.last_refresh_clock}",
             curses.color_pair(2) | curses.A_BOLD, ellipsis=True,
         )
 
@@ -1328,12 +1581,15 @@ class Dashboard:
         if self.quota_alert:
             pf_badge = ""
             if self.sel_for_alert:
-                pf_badge = " · preflight OK" if self._preflight_ok(time.time()) else " · esperando IDLE"
+                if self.tech_mode:
+                    pf_badge = " · preflight OK" if self._preflight_ok(time.time()) else " · esperando IDLE"
+                else:
+                    pf_badge = " · listo para cambiar" if self._preflight_ok(time.time()) else " · esperando a que termine"
             if self.quota_alert["target_slot"]:
                 tpct = f" ({self.quota_alert['target_pct']:.0f}%)" if self.quota_alert["target_pct"] >= 0 else ""
                 act_hint = f"Pulsa [B] → [{self.quota_alert['target_slot']}]{tpct}{pf_badge}"
             else:
-                act_hint = "Pulsa [u] para añadir una 2ª cuenta Pro"
+                act_hint = "Pulsa [u] para añadir otra cuenta"
             alert_txt = (
                 f" 🚨 CUOTA BAJA [{self.quota_alert['active_slot']} {self.quota_alert['active_email']}]: "
                 f"{self.quota_alert['bucket_name']} al {self.quota_alert['pct']:.0f}% · {act_hint}"
@@ -1342,11 +1598,18 @@ class Dashboard:
         else:
             acct_obj = self.reg.get("accounts", {}).get(self.sel_slot, {})
             fams = acct_obj.get("quota", {}).get("families", {})
-            q_parts = [f"{k}:{v:.0f}%" for k, v in fams.items()]
-            q_summary = " · ".join(q_parts) if q_parts else ("consultando /usage…" if polling_now else "sin datos (pulsa [u])")
             mail = acct_obj.get("email", "")
-            mail_s = f" ({mail})" if mail else ""
-            alert_txt = f" 💳 Cuenta [{self.sel_slot}]{mail_s}: {q_summary}"
+            if self.tech_mode:
+                q_parts = [f"{k}:{v:.0f}%" for k, v in fams.items()]
+                q_summary = " · ".join(q_parts) if q_parts else ("consultando /usage…" if polling_now else "sin datos (pulsa [u])")
+                mail_s = f" ({mail})" if mail else ""
+                alert_txt = f" 💳 Cuenta [{self.sel_slot}]{mail_s}: {q_summary}"
+            else:
+                fam_names = {"gemini": "Gemini", "claude_gpt": "Claude/GPT", "argon": "Argon"}
+                q_parts = [f"{fam_names.get(k, k)} {v:.0f}%" for k, v in fams.items()]
+                q_summary = " · ".join(q_parts) if q_parts else ("revisando disponibilidad…" if polling_now else "pulsa [u] para ver cuentas")
+                who = mail or self.sel_slot
+                alert_txt = f" 👤 Cuenta: {who} · Disponible: {q_summary}"
             alert_attr = curses.color_pair(3) | curses.A_BOLD
         self._put(2, 0, alert_txt, alert_attr, pad=True)
 
@@ -1380,44 +1643,119 @@ class Dashboard:
     def _btn_rows(self) -> int:
         return max((b.row_offset for b in self.cmd_buttons), default=-1) + 1
 
+    def _build_session_display_rows(self, vis: list[_sessions.AgySession]) -> list[tuple[str, Any]]:
+        """Interleave calm section dividers between active/paused and saved chats when both exist."""
+        active_idxs = [i for i, s in enumerate(vis) if s.proc is not None or s.hibernated]
+        saved_idxs = [i for i, s in enumerate(vis) if s.proc is None and not s.hibernated]
+        if active_idxs and saved_idxs and self.list_avail >= 6:
+            rows: list[tuple[str, Any]] = [("header", f"Abiertos ahora ({len(active_idxs)})")]
+            rows.extend(("session", i) for i in active_idxs)
+            rows.append(("header", f"Guardados recientes ({len(saved_idxs)})"))
+            rows.extend(("session", i) for i in saved_idxs)
+            return rows
+        return [("session", i) for i in range(len(vis))]
+
     def _draw_session_list(self) -> None:
-        if self.sessions:
-            self.cursor = max(0, min(self.cursor, len(self.sessions) - 1))
+        vis = self._visible_sessions()
+        if vis:
+            self.cursor = max(0, min(self.cursor, len(vis) - 1))
+        else:
+            self.cursor = 0
         self.preview_height = max(7, min(12, self.max_y // 3)) if self.max_y >= 22 else 0
         self.list_avail = max(3, self.max_y - HEADER_ROWS - FOOTER_ROWS - self.preview_height)
-        # El título es lo que identifica la sesión: en pantallas estrechas se quitan antes las
-        # columnas de RAM, y el título se lleva el ancho que sobre (28..60 columnas).
-        show_ram = self.left_w >= 84
-        fixed = 1 + 11 + 11 + (15 if show_ram else 0) + 5 + 2 + 1 + 12
-        title_w = max(12, min(60, self.left_w - fixed - 1))
-        ram_hdr = f"{'PSS':>6} {'SHR+KSM':>7} " if show_ram else ""
-        col_hdr = f" {'ESTADO':<10} {'UBICACIÓN':<10} {ram_hdr}{'PASOS':>5}  {fit('TÍTULO DE SESIÓN', title_w, True)} WS"
+        self.row_y_to_session_idx = {}
+
+        multi_sel = self.pending_multi_select
+        multi_prefix_w = 4 if multi_sel is not None else 0
+        multi_tag = f"  ☑ {len(multi_sel)} marc." if multi_sel is not None else ""
+        filter_tag = f"  🔍 \"{self.search_query}\" ({len(vis)})" if self.search_query else ""
+        hdr_tag = multi_tag + filter_tag
+        if self.tech_mode:
+            show_ram = self.left_w >= 84
+            fixed = 1 + multi_prefix_w + 11 + 11 + (15 if show_ram else 0) + 5 + 2 + 1 + 12
+            title_w = max(10, min(60, self.left_w - fixed - 1))
+            ram_hdr = f"{'PSS':>6} {'SHR+KSM':>7} " if show_ram else ""
+            sel_hdr = "SEL " if multi_sel is not None else ""
+            col_hdr = (
+                f" {sel_hdr}{'ESTADO':<10} {'UBICACIÓN':<10} {ram_hdr}{'PASOS':>5}  "
+                f"{fit('TÍTULO DE SESIÓN' + hdr_tag, title_w, True)} WS"
+            )
+        else:
+            show_ws = self.left_w >= 64
+            ws_w = 12 if show_ws else 0
+            fixed = 1 + multi_prefix_w + 12 + 1 + 8 + 2 + (ws_w + 1 if show_ws else 0)
+            title_w = max(12, min(64, self.left_w - fixed - 1))
+            ws_hdr = " CARPETA" if show_ws else ""
+            sel_hdr = "SEL " if multi_sel is not None else ""
+            col_hdr = (
+                f" {sel_hdr}{fit('ESTADO', 12, True)} {fit('HACE', 8, True)}  "
+                f"{fit('CONVERSACIÓN' + hdr_tag, title_w, True)}{ws_hdr}"
+            )
         self._put(4, 0, col_hdr, curses.A_BOLD, self.left_w)
         self._rule(5, 0, self.left_w)
-        start_idx = max(0, self.cursor - self.list_avail + 1) if self.cursor >= self.list_avail else 0
-        for idx, s in enumerate(self.sessions[start_idx : start_idx + self.list_avail], start=start_idx):
-            row_y = self.list_start_y + (idx - start_idx)
+
+        if not vis:
+            empty_msg = (
+                f"  Sin chats que coincidan con \"{self.search_query}\" · pulsa [/] y Enter para ver todos"
+                if self.search_query
+                else "  Todavía no hay conversaciones · pulsa [n] para iniciar un chat nuevo"
+            )
+            self._put(self.list_start_y, 0, empty_msg, curses.color_pair(4), self.left_w)
+            return
+
+        display_rows = self._build_session_display_rows(vis)
+        cur_disp = next((ri for ri, (k, v) in enumerate(display_rows) if k == "session" and v == self.cursor), 0)
+        start_disp = max(0, cur_disp - self.list_avail + 1) if cur_disp >= self.list_avail else 0
+        now_ts = self.frame_now or time.time()
+
+        for offset, (kind, payload) in enumerate(display_rows[start_disp : start_disp + self.list_avail]):
+            row_y = self.list_start_y + offset
             if row_y >= self.list_start_y + self.list_avail:
                 break
+            if kind == "header":
+                label = f" ── {payload} "
+                fill = max(0, self.left_w - text_cols(label) - 1)
+                self._put(row_y, 0, label + "─" * fill, curses.color_pair(2) | curses.A_DIM, self.left_w)
+                continue
+
+            idx = int(payload)
+            s = vis[idx]
+            self.row_y_to_session_idx[row_y] = idx
             st = s.state_label
-            if s.proc:
-                pss_s = f"{s.proc.pss_kb // 1024}M"
-                shr_s = f"{(s.proc.shared_clean_kb + s.proc.ksm_kb) // 1024}M"
-            elif s.hibernated:
-                pss_s = "0M"
-                shr_s = f"-{s.hibernated_saved_kb // 1024}M"
+            is_marked = multi_sel is not None and s.conversation_id in multi_sel
+            is_locked = multi_sel is not None and not self._can_delete_session(s)
+            box = ("[✓] " if is_marked else ("[·] " if is_locked else "[ ] ")) if multi_sel is not None else ""
+            if self.tech_mode:
+                if s.proc:
+                    pss_s = f"{s.proc.pss_kb // 1024}M"
+                    shr_s = f"{(s.proc.shared_clean_kb + s.proc.ksm_kb) // 1024}M"
+                elif s.hibernated:
+                    pss_s = "0M"
+                    shr_s = f"-{s.hibernated_saved_kb // 1024}M"
+                else:
+                    pss_s = "0M"
+                    shr_s = "-"
+                ws_name = fit(os.path.basename(s.workspace.rstrip("/")) or s.workspace, 12)
+                ram_s = f"{pss_s:>6} {shr_s:>7} " if show_ram else ""
+                line = (
+                    f" {box}{fit(st, 10, True)} {fit(s.location_label, 10, True)} {ram_s}{s.step_count:>5}  "
+                    f"{fit(ellipsize(s.title, title_w), title_w, True)} {ws_name}"
+                )
             else:
-                pss_s = "0M"
-                shr_s = "-"
-            ws_name = fit(os.path.basename(s.workspace.rstrip("/")) or s.workspace, 12)
-            ram_s = f"{pss_s:>6} {shr_s:>7} " if show_ram else ""
-            line = (
-                f" {fit(st, 10, True)} {fit(s.location_label, 10, True)} {ram_s}{s.step_count:>5}  "
-                f"{fit(ellipsize(s.title, title_w), title_w, True)} {ws_name}"
-            )
+                age_s = format_relative_age(s.last_modified_ts, now_ts)
+                st_disp = friendly_state_label(st)
+                ws_part = f" {fit(friendly_workspace(s.workspace), 12)}" if show_ws else ""
+                line = (
+                    f" {box}{fit(st_disp, 12, True)} {fit(age_s, 8, True)}  "
+                    f"{fit(ellipsize(s.title, title_w), title_w, True)}{ws_part}"
+                )
             attr = curses.A_NORMAL
             if idx == self.cursor:
                 attr = curses.color_pair(6) | curses.A_BOLD
+            elif is_marked:
+                attr = curses.color_pair(4) | curses.A_BOLD
+            elif is_locked:
+                attr = curses.A_DIM
             elif st == "RUNNING":
                 attr = curses.color_pair(3) | curses.A_BOLD
             elif st == "BG-TASK":
@@ -1432,12 +1770,34 @@ class Dashboard:
                 self._put(ry, self.left_w, "│", cols=1)
         self._put(4, self.panel_x, " 🎛️ Acciones (clic o tecla)", curses.color_pair(2) | curses.A_BOLD, self.panel_w)
         self._rule(5, self.panel_x, self.panel_w)
+        sel = self.current_session()
+        multi_sel = self.pending_multi_select
+        can_pause = bool(sel and sel.proc is not None and sel.can_hibernate)
+        can_delete = bool(sel and self._can_delete_session(sel))
         for b in self.cmd_buttons:
             by = self.panel_btn_y + b.row_offset
             bx = self.panel_x + b.col_offset
             if by < HEADER_ROWS + self.list_avail:
-                attr = curses.color_pair(1 if (b.action_id == "baton" and self.quota_alert) else 7) | curses.A_BOLD
-                self._put(by, bx, f" {b.label}", attr, b.width, pad=True)
+                label = b.label
+                if b.action_id == "baton" and self.quota_alert:
+                    attr = curses.color_pair(1) | curses.A_BOLD
+                elif b.action_id == "delete":
+                    if multi_sel is not None:
+                        label = f"[d] 🗑 Borrar ({len(multi_sel)})"
+                        attr = (curses.color_pair(1) | curses.A_BOLD) if multi_sel else curses.A_DIM
+                    else:
+                        attr = curses.A_DIM if (sel is not None and not can_delete) else (curses.color_pair(1) | curses.A_BOLD)
+                elif b.action_id == "multi_select":
+                    if multi_sel is not None:
+                        label = f"[^D] ☑ Listo ({len(multi_sel)})" if multi_sel else "[^D] ☑ Salir"
+                        attr = curses.color_pair(4) | curses.A_REVERSE | curses.A_BOLD
+                    else:
+                        attr = curses.A_DIM if self.scan_failed else (curses.color_pair(7) | curses.A_BOLD)
+                elif b.action_id == "hibernate" and sel is not None and not can_pause:
+                    attr = curses.A_DIM
+                else:
+                    attr = curses.color_pair(7) | curses.A_BOLD
+                self._put(by, bx, f" {label}", attr, b.width, pad=True)
 
     def _draw_inspector(self, now: float) -> None:
         insp_y = self.panel_btn_y + self._btn_rows() + 1
@@ -1447,31 +1807,53 @@ class Dashboard:
         self._rule(insp_y - 1, self.panel_x, self.panel_w)
         t_sig = _sessions.transcript_sig(sel.conversation_id)
         age_s = int(max(0, now - (t_sig[0] / 1e9))) if t_sig[0] else -1
-        age_txt = f"hace {age_s}s" if age_s >= 0 else "sin log"
         kids = ", ".join(sel.proc.active_children) if (sel.proc and sel.proc.active_children) else ""
-        pid_txt = str(sel.proc.pid) if sel.proc else "-"
-        extra_txt = f" +{len(sel.extra_procs)} dup" if sel.extra_procs else ""
         acct_tag = self.conv_accounts.get(sel.conversation_id, self.active_slot)
-        nv_lbl = _compact.mask_api_key(str(self._nv_cfg().get("api_key", "")))
         ctx_m = self.cached_context(sel)
         lvl = str(ctx_m["level"])
-        ctx_attr = curses.color_pair(1 if "URGENT" in lvl else (4 if ("RECOMMEND" in lvl or kids) else 3)) | curses.A_BOLD
-        id_line = f" ID {sel.conversation_id[:8]} · PID {pid_txt}{extra_txt} · cuenta [{acct_tag}] · NV {nv_lbl[:11]}"
-        if kids:
-            id_line += f" · hijos: {kids}"
-        lines = [
-            (f" {sel.state_label} · ctx {ctx_m['pct']:.0f}% ({lvl}, ~{ctx_m['used_tokens'] // 1000}k) · último msg {age_txt}", ctx_attr),
-            (f" 📌 {sel.title}", curses.A_BOLD),
-            (id_line, curses.A_NORMAL),
-            (f" RAM {_ram_bar(min(1.0, self.total_pss_mb / RAM_BAR_FULL_MB), 18)} {self.total_pss_mb}M (KSM {self.total_ksm_mb}M)", curses.color_pair(3)),
-        ]
+
+        if self.tech_mode:
+            age_txt = f"hace {age_s}s" if age_s >= 0 else "sin log"
+            pid_txt = str(sel.proc.pid) if sel.proc else "-"
+            extra_txt = f" +{len(sel.extra_procs)} dup" if sel.extra_procs else ""
+            nv_lbl = _compact.mask_api_key(str(self._nv_cfg().get("api_key", "")))
+            ctx_attr = curses.color_pair(1 if "URGENT" in lvl else (4 if ("RECOMMEND" in lvl or kids) else 3)) | curses.A_BOLD
+            id_line = f" ID {sel.conversation_id[:8]} · PID {pid_txt}{extra_txt} · cuenta [{acct_tag}] · NV {nv_lbl[:11]}"
+            if kids:
+                id_line += f" · hijos: {kids}"
+            lines = [
+                (f" {sel.state_label} · ctx {ctx_m['pct']:.0f}% ({lvl}, ~{ctx_m['used_tokens'] // 1000}k) · último msg {age_txt}", ctx_attr),
+                (f" 📌 {sel.title}", curses.A_BOLD),
+                (id_line, curses.A_NORMAL),
+                (f" RAM {_ram_bar(min(1.0, self.total_pss_mb / RAM_BAR_FULL_MB), 18)} {self.total_pss_mb}M (KSM {self.total_ksm_mb}M)", curses.color_pair(3)),
+            ]
+        else:
+            age_ts = (t_sig[0] / 1e9) if t_sig[0] else sel.last_modified_ts
+            age_txt = format_relative_age(age_ts, now)
+            hint_txt, hint_pair = friendly_context_hint(lvl, float(ctx_m["pct"]), kids, age_txt)
+            ws_lbl = friendly_workspace(sel.workspace)
+            meta_line = f" {friendly_state_label(sel.state_label)} · Cuenta: {acct_tag}" + (f" · Carpeta: {ws_lbl}" if ws_lbl != "-" else "")
+            if sel.proc is not None and sel.can_hibernate:
+                tip_line = " 💡 [↵] abrir pestaña · [h] pausar y liberar RAM"
+            elif sel.proc is not None:
+                tip_line = " 💡 [↵] ver pestaña activa · [/] buscar otro chat"
+            else:
+                tip_line = " 💡 [↵] continuar este chat · [n] nuevo · [/] buscar"
+            lines = [
+                (hint_txt, curses.color_pair(hint_pair) | curses.A_BOLD),
+                (f" 📌 {sel.title}", curses.A_BOLD),
+                (meta_line, curses.A_NORMAL),
+                (f" Memoria {_ram_bar(min(1.0, self.total_pss_mb / RAM_BAR_FULL_MB), 16)} {self.total_pss_mb} MB", curses.color_pair(3)),
+                (tip_line, curses.A_DIM),
+            ]
         for mi, (ml, ma) in enumerate(lines):
             if insp_y + mi < HEADER_ROWS + self.list_avail:
                 self._put(insp_y + mi, self.panel_x, ml, ma, self.panel_w)
 
     def _preview_visible(self) -> bool:
+        vis = self._visible_sessions()
         return (self.mode == "sessions" and not self.show_help and self.preview_height > 0
-                and 0 <= self.cursor < len(self.sessions))
+                and 0 <= self.cursor < len(vis))
 
     def _draw_preview(self, now: float) -> None:
         sel = self.current_session()
@@ -1483,6 +1865,109 @@ class Dashboard:
             self._draw_compaction_modal(self.pending_compact_sess, py, now)
         else:
             self._draw_live_preview(sel, py, now)
+
+    @staticmethod
+    def _format_bytes(sz: int) -> str:
+        if sz >= 1024 * 1024:
+            return f"{sz / (1024 * 1024):.1f} MB"
+        if sz >= 1024:
+            return f"{sz // 1024} KB"
+        return f"{sz} B"
+
+    def _draw_delete_popup(self) -> None:
+        """Centra un popup interactivo (flechas + Enter + clic de ratón) para confirmar borrado."""
+        self.popup_hits = []
+        payload = self.pending_delete_sess
+        if payload is None or self.max_y < 10 or self.max_x < 42:
+            return
+        items: list[dict] = list(payload.get("items") or [])
+        if not items:
+            return
+        n = len(items)
+        focus = int(payload.get("focus", 0))
+        total_bytes = int(payload.get("total_bytes", sum(int(it.get("size_bytes", 0)) for it in items)))
+        sz_txt = self._format_bytes(total_bytes)
+        any_live_or_tab = any(it.get("is_live") or it.get("has_tab") for it in items)
+
+        body: list[tuple[str, int]] = []
+        if n == 1:
+            it = items[0]
+            title = str(it.get("title", ""))
+            cid = str(it.get("conversation_id", ""))
+            ws_lbl = friendly_workspace(str(it.get("workspace", "")))
+            st_lbl = friendly_state_label(str(it.get("state_label", "")))
+            header_title = " 🗑 Confirmar eliminación "
+            body.append((f"¿Eliminar '{title}' ({cid[:8]})?", curses.A_BOLD))
+            body.append((f"{st_lbl} · Carpeta: {ws_lbl} · En disco: {sz_txt}", curses.color_pair(4)))
+        else:
+            header_title = f" 🗑 Confirmar eliminación ({n} chats) "
+            body.append((f"Se eliminarán {n} conversaciones · En disco: {sz_txt}", curses.A_BOLD))
+            for it in items[:3]:
+                ws_lbl = friendly_workspace(str(it.get("workspace", "")))
+                body.append((f"  • {it.get('title', '')} ({ws_lbl})", curses.color_pair(4)))
+            if n > 3:
+                body.append((f"  … y {n - 3} conversaciones más", curses.A_DIM))
+
+        body.append(("Borra historial y archivos locales (el Baúl se conserva).", curses.A_NORMAL))
+        if any_live_or_tab:
+            body.append(("También cerrará pestañas / procesos en espera.", curses.color_pair(2)))
+
+        box_w = min(max(52, self.max_x - 20), 72, self.max_x - 3)
+        inner_w = box_w - 2
+        box_h = len(body) + 5  # top border + blank + body + blank + buttons + bottom border
+        if box_h > self.max_y - 4:
+            body = body[: max(2, self.max_y - 9)]
+            box_h = len(body) + 5
+        y0 = max(2, (self.max_y - 2 - box_h) // 2)
+        x0 = max(1, (self.max_x - 1 - box_w) // 2)
+
+        # Borde superior con barra roja de título
+        title_fit = ellipsize(header_title, max(8, inner_w - 2))
+        t_cols = text_cols(title_fit)
+        left_bar = max(1, (inner_w - t_cols) // 2)
+        right_bar = max(0, inner_w - left_bar - t_cols)
+        self._put(y0, x0, "╭" + "─" * left_bar, curses.color_pair(1) | curses.A_BOLD, box_w)
+        self._put(y0, x0 + 1 + left_bar, title_fit, curses.color_pair(1) | curses.A_BOLD, t_cols + 1)
+        self._put(y0, x0 + 1 + left_bar + t_cols, "─" * right_bar + "╮", curses.color_pair(1) | curses.A_BOLD, right_bar + 2)
+
+        # Fondo limpio de todas las filas interiores
+        for row_i in range(1, box_h - 1):
+            ry = y0 + row_i
+            self._put(ry, x0, "│" + " " * inner_w + "│", curses.A_NORMAL, box_w)
+            self._put(ry, x0, "│", curses.color_pair(1) | curses.A_BOLD, 1)
+            self._put(ry, x0 + box_w - 1, "│", curses.color_pair(1) | curses.A_BOLD, 1)
+
+        # Contenido textual
+        for bi, (line_txt, line_attr) in enumerate(body):
+            ry = y0 + 1 + bi
+            shown = fit(" " + ellipsize(line_txt, inner_w - 2), inner_w, True)
+            self._put(ry, x0 + 1, shown, line_attr, inner_w)
+
+        # Fila de botones interactivos: [  Cancelar  ]   [ 🗑 Eliminar ]
+        btn_y = y0 + box_h - 2
+        cancel_lbl = "  Cancelar  "
+        confirm_lbl = f" 🗑 Eliminar ({n}) " if n > 1 else " 🗑 Eliminar "
+        cancel_txt = f"▸[{cancel_lbl}]" if focus == 0 else f" [{cancel_lbl}]"
+        confirm_txt = f"▸[{confirm_lbl}]" if focus == 1 else f" [{confirm_lbl}]"
+        c_w = text_cols(cancel_txt)
+        d_w = text_cols(confirm_txt)
+        gap = 4
+        total_btn_w = c_w + gap + d_w
+        bx_start = x0 + 1 + max(1, (inner_w - total_btn_w) // 2)
+        cancel_x0 = bx_start
+        confirm_x0 = bx_start + c_w + gap
+
+        cancel_attr = (curses.color_pair(6) | curses.A_BOLD) if focus == 0 else curses.A_NORMAL
+        confirm_attr = (curses.color_pair(1) | curses.A_BOLD) if focus == 1 else (curses.color_pair(1) | curses.A_DIM)
+        self._put(btn_y, cancel_x0, cancel_txt, cancel_attr, c_w + 1)
+        self._put(btn_y, confirm_x0, confirm_txt, confirm_attr, d_w + 1)
+        self.popup_hits = [
+            (btn_y, cancel_x0, cancel_x0 + c_w - 1, "cancel"),
+            (btn_y, confirm_x0, confirm_x0 + d_w - 1, "confirm"),
+        ]
+
+        # Borde inferior
+        self._put(y0 + box_h - 1, x0, "╰" + "─" * inner_w + "╯", curses.color_pair(1) | curses.A_BOLD, box_w)
 
     def _draw_compaction_modal(self, pcs: _sessions.AgySession, py: int, now: float) -> None:
         _, est_tok, log_kb = _compact.should_offer_compaction(pcs)
@@ -1548,31 +2033,52 @@ class Dashboard:
     def _draw_live_preview(self, sel: _sessions.AgySession, py: int, now: float) -> None:
         cur_sig = _sessions.transcript_sig(sel.conversation_id)
         self._refresh_preview(sel.conversation_id, cur_sig, max(1, self.preview_height - 2))
-        age_s = int(max(0, now - (cur_sig[0] / 1e9))) if cur_sig[0] else -1
-        age_lbl = f"hace {age_s}s" if age_s >= 0 else "sin log"
-        phdr = (
-            f" ⚡ EN VIVO ({age_lbl}) · {sel.title[:38]} ({sel.conversation_id[:8]}) · "
-            f"{sel.state_label} · {sel.location_label}"
-        )
+        if self.tech_mode:
+            age_s = int(max(0, now - (cur_sig[0] / 1e9))) if cur_sig[0] else -1
+            age_lbl = f"hace {age_s}s" if age_s >= 0 else "sin log"
+            phdr = (
+                f" ⚡ EN VIVO ({age_lbl}) · {sel.title[:38]} ({sel.conversation_id[:8]}) · "
+                f"{sel.state_label} · {sel.location_label}"
+            )
+            empty_msg = "   (Sin transcript.jsonl local o conversación recién creada)"
+        else:
+            age_ts = (cur_sig[0] / 1e9) if cur_sig[0] else sel.last_modified_ts
+            age_lbl = format_relative_age(age_ts, now)
+            phdr = f" 💬 Vista previa ({age_lbl}) · {sel.title[:44]} · {friendly_state_label(sel.state_label)}"
+            empty_msg = "   (Conversación recién iniciada o sin mensajes guardados todavía)"
         self._put(py + 1, 0, phdr, curses.color_pair(2) | curses.A_BOLD)
         if not self.cached_turns:
-            self._put(py + 2, 0, "   (Sin transcript.jsonl local o conversación recién creada)")
+            self._put(py + 2, 0, empty_msg)
         else:
             for tidx, t in enumerate(self.cached_turns[-(self.preview_height - 2) :]):
                 ry = py + 2 + tidx
                 if ry >= self.max_y - 3:
                     break
-                if t["role"] == "USER":
-                    txt = f"  👤 [{t['ts']} #{t['idx']}] TÚ: {t['content']}"
-                    self._put(ry, 0, txt, curses.color_pair(4))
-                elif t["role"] == "TOOL":
-                    txt = f"  ⏳ [{t['ts']} #{t['idx']}] {t['content']}"
-                    self._put(ry, 0, txt, curses.color_pair(5))
+                if self.tech_mode:
+                    if t["role"] == "USER":
+                        txt = f"  👤 [{t['ts']} #{t['idx']}] TÚ: {t['content']}"
+                        self._put(ry, 0, txt, curses.color_pair(4))
+                    elif t["role"] == "TOOL":
+                        txt = f"  ⏳ [{t['ts']} #{t['idx']}] {t['content']}"
+                        self._put(ry, 0, txt, curses.color_pair(5))
+                    else:
+                        tools_s = f" [🔧 {', '.join(t['tools'])}]" if t["tools"] else ""
+                        body_s = t["content"] or "(ejecutando herramientas…)"
+                        txt = f"  🤖 [{t['ts']} #{t['idx']}] AGY: {body_s}{tools_s}"
+                        self._put(ry, 0, txt, curses.color_pair(3))
                 else:
-                    tools_s = f" [🔧 {', '.join(t['tools'])}]" if t["tools"] else ""
-                    body_s = t["content"] or "(ejecutando herramientas…)"
-                    txt = f"  🤖 [{t['ts']} #{t['idx']}] AGY: {body_s}{tools_s}"
-                    self._put(ry, 0, txt, curses.color_pair(3))
+                    hm = t.get("ts_local") or str(t.get("ts", ""))[:5]
+                    ts_part = f"[{hm}] " if hm else ""
+                    if t["role"] == "USER":
+                        txt = f"  👤 {ts_part}Tú: {t['content']}"
+                        self._put(ry, 0, txt, curses.color_pair(4))
+                    elif t["role"] == "TOOL":
+                        txt = f"  ⏳ {ts_part}Ejecutando una tarea en segundo plano…"
+                        self._put(ry, 0, txt, curses.color_pair(5))
+                    else:
+                        body_s = t["content"] or friendly_tool_activity(t.get("tools") or [])
+                        txt = f"  🤖 {ts_part}AGY: {body_s}"
+                        self._put(ry, 0, txt, curses.color_pair(3))
 
     def _draw_accounts(self) -> None:
         self.acct_list = list(self.reg.get("accounts", {}).items())
@@ -1654,12 +2160,15 @@ class Dashboard:
         det_y = min(self.max_y - 6, 7 + len(self.acct_list))
         if det_y >= self.max_y - 4:
             return
-        self._put(det_y, 0, f" 📊 Detalle [{sname}] · actualizado: {adata.get('updated_at') or 'nunca'}", curses.A_BOLD)
+        upd_str = _paths.format_display_iso(adata.get("updated_at"), empty="nunca")
+        self._put(det_y, 0, f" 📊 Detalle [{sname}] · actualizado: {upd_str}", curses.A_BOLD)
         for bi, b in enumerate(buckets[:4]):
             by = det_y + 1 + bi
             if by >= self.max_y - 3:
                 break
-            b_line = f"    • {b.get('group', '')} — {b.get('name', '')}: {b.get('pct', 0):.0f}% libre (reset {b.get('reset_time', '')})"
+            reset_str = _paths.format_display_iso(b.get("reset_time", ""))
+            reset_part = f" (reset {reset_str})" if reset_str else ""
+            b_line = f"    • {b.get('group', '')} — {b.get('name', '')}: {b.get('pct', 0):.0f}% libre{reset_part}"
             b_attr = curses.color_pair(1) if b.get("pct", 100) <= _paths.QUOTA_CRIT_PCT else (
                 curses.color_pair(4) if b.get("pct", 100) <= _paths.QUOTA_WARN_PCT else curses.color_pair(3)
             )
@@ -1773,6 +2282,7 @@ class Dashboard:
         else:
             self._rule(3, 0, self.max_x - 1)
         self._compute_layout()
+        self.popup_hits = []
         if self.show_help:
             self._draw_help()
         elif self.mode == "sessions":
@@ -1781,6 +2291,8 @@ class Dashboard:
                 self._draw_buttons()
                 self._draw_inspector(now)
             self._draw_preview(now)
+            if self.pending_delete_sess is not None:
+                self._draw_delete_popup()
         elif self.mode == "accounts":
             self._draw_accounts()
         elif self.mode == "vault":
@@ -1798,9 +2310,11 @@ class Dashboard:
             return None
         btn4 = getattr(curses, "BUTTON4_PRESSED", 0)
         btn5 = getattr(curses, "BUTTON5_PRESSED", 0)
-        if self._any_pending() and not (bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED
-                                                  | curses.BUTTON1_DOUBLE_CLICKED)):
-            return None  # la rueda no mueve el cursor bajo una confirmación abierta
+        view_now = self._view_name()
+        if self._any_pending() and view_now != "multi_select" and not (
+            bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED | curses.BUTTON1_DOUBLE_CLICKED)
+        ):
+            return None  # la rueda no mueve el cursor bajo una confirmación abierta (salvo selección múltiple)
         if btn4 and (bstate & btn4):
             self.cursor = max(0, self.cursor - 1)
             return None
@@ -1820,6 +2334,41 @@ class Dashboard:
                 if x0 <= mx <= x1:
                     return code
             return None
+        if view_now == "delete_confirm":
+            for py, px0, px1, hit_act in self.popup_hits:
+                if my == py and px0 <= mx <= px1:
+                    conf = self._active_confirm()
+                    if hit_act == "confirm":
+                        self._k_delete_yes(conf)
+                    else:
+                        self._k_cancel(conf)
+                    curses.flushinp()
+                    return None
+            return None
+        if view_now == "multi_select":
+            if self.show_cmd_panel and mx >= self.panel_x:
+                act = hit_test_button(self.cmd_buttons, self.panel_x, self.panel_btn_y, mx, my,
+                                      max_row=HEADER_ROWS + self.list_avail)
+                conf = self._active_confirm()
+                if act == "delete":
+                    self._k_multi_confirm(conf)
+                    curses.flushinp()
+                elif act == "multi_select":
+                    if conf is not None and conf.payload:
+                        self._k_multi_confirm(conf)
+                    else:
+                        self._k_cancel(conf)
+                    curses.flushinp()
+            elif self.list_start_y <= my < self.list_start_y + self.list_avail and mx < self.left_w:
+                vis = self._visible_sessions()
+                if self.row_y_to_session_idx:
+                    clicked_idx = self.row_y_to_session_idx.get(my, -1)
+                else:
+                    clicked_idx = (max(0, self.cursor - self.list_avail + 1) if self.cursor >= self.list_avail else 0) + (my - self.list_start_y)
+                if 0 <= clicked_idx < len(vis):
+                    self.cursor = clicked_idx
+                    self._toggle_multi_cid(vis[clicked_idx])
+            return None
         if self._any_pending():
             return None  # con una confirmación abierta solo vale el pie (sus teclas)
         if self.show_cmd_panel and mx >= self.panel_x:
@@ -1831,8 +2380,12 @@ class Dashboard:
                     self.status_banner = res
                 curses.flushinp()  # teclas pulsadas durante una acción lenta no se repiten luego
         elif self.mode == "sessions" and self.list_start_y <= my < self.list_start_y + self.list_avail and mx < self.left_w:
-            clicked_idx = (max(0, self.cursor - self.list_avail + 1) if self.cursor >= self.list_avail else 0) + (my - self.list_start_y)
-            if 0 <= clicked_idx < len(self.sessions):
+            vis = self._visible_sessions()
+            if self.row_y_to_session_idx:
+                clicked_idx = self.row_y_to_session_idx.get(my, -1)
+            else:
+                clicked_idx = (max(0, self.cursor - self.list_avail + 1) if self.cursor >= self.list_avail else 0) + (my - self.list_start_y)
+            if 0 <= clicked_idx < len(vis):
                 self.cursor = clicked_idx
                 if is_dbl_click:
                     self.status_banner = self.execute_action("open")
@@ -1923,6 +2476,31 @@ class Dashboard:
             self.confirm = None
             self.status_banner = conf.cancel_msg
 
+    def _k_toggle_tech_mode(self, conf: Confirm | None) -> None:
+        self.tech_mode = not self.tech_mode
+        if self.tech_mode:
+            self.status_banner = "Vista técnica activada (PSS, KSM, PID, logs). Pulsa [T] para vista amigable."
+        else:
+            self.status_banner = "Vista amigable activada. Pulsa [T] para ver detalles técnicos."
+
+    def _k_search(self, conf: Confirm | None) -> None:
+        prompt = (
+            f"Buscar chat (actual: '{self.search_query}'; Enter vacío limpia)"
+            if self.search_query
+            else "Buscar chat por título o carpeta"
+        )
+        entered = _prompt_curses_text(self.stdscr, prompt, "", max_len=64, allow_empty=True)
+        if entered is None:
+            self.status_banner = "Búsqueda cancelada."
+            return
+        self.search_query = entered
+        self.cursor = 0
+        if not self.search_query:
+            self.status_banner = "Filtro de búsqueda limpiado (mostrando todos los chats)."
+        else:
+            n = len(self._visible_sessions())
+            self.status_banner = f"🔍 Filtro '{self.search_query}': {n} {'chat' if n == 1 else 'chats'} (pulsa [/] y Enter para limpiar)."
+
     def _k_ask_dedup(self, conf: Confirm | None) -> None:
         if self.scan_failed:
             self.status_banner = self.SCAN_BLOCKED_MSG
@@ -1932,6 +2510,214 @@ class Dashboard:
             n = sum(len(s.extra_procs) for s in self.sessions)
             self._ask("dedup_confirm", True, f"¿Cerrar {n} copias duplicadas inactivas (mata sus procesos)? "
                                              "[x] sí · otra tecla cancela")
+
+    def _can_delete_session(self, sel: _sessions.AgySession) -> bool:
+        if self.scan_failed:
+            return False
+        with self.compact_lock:
+            job = self.compact_jobs.get(sel.conversation_id)
+            if job and job.get("status") in ("running", "reserved"):
+                return False
+        return _sessions._delete_block_reason(sel) == ""
+
+    def _start_multi_select(self) -> str:
+        vis = self._visible_sessions()
+        if not vis:
+            return "No hay conversaciones para seleccionar."
+        banner = "☑ Selección múltiple (0 marcadas) · [Esp]/clic marcar · [a] todas · [↵/d] eliminar · [Esc] salir"
+        self._ask("multi_select", set(), banner)
+        return banner
+
+    def _toggle_multi_cid(self, sel: _sessions.AgySession) -> None:
+        selected = self.pending_multi_select
+        if selected is None:
+            return
+        cid = sel.conversation_id
+        if cid in selected:
+            selected.remove(cid)
+        else:
+            with self.compact_lock:
+                job = self.compact_jobs.get(cid)
+                compacting = bool(job and job.get("status") in ("running", "reserved"))
+            if compacting:
+                self.status_banner = f"⚠️ '{sel.title[:28]}' se está compactando ahora mismo; no se puede marcar."
+                return
+            reason = _sessions._delete_block_reason(sel)
+            if reason:
+                self.status_banner = f"⚠️ No se marca '{sel.title[:26]}': {reason}"
+                return
+            selected.add(cid)
+        n = len(selected)
+        self.status_banner = (
+            f"☑ {n} {'conversación marcada' if n == 1 else 'conversaciones marcadas'} · "
+            "[Esp]/clic marcar · [a] todas · [↵/d] eliminar · [Esc] salir"
+        )
+
+    def _k_multi_toggle(self, conf: Confirm | None) -> None:
+        sel = self.current_session()
+        if sel is not None:
+            self._toggle_multi_cid(sel)
+
+    def _k_multi_toggle_all(self, conf: Confirm | None) -> None:
+        selected = self.pending_multi_select
+        if selected is None:
+            return
+        eligible = [s.conversation_id for s in self._visible_sessions() if self._can_delete_session(s)]
+        if not eligible:
+            self.status_banner = "No hay conversaciones elegibles para eliminar en esta vista."
+            return
+        if all(cid in selected for cid in eligible):
+            for cid in eligible:
+                selected.discard(cid)
+        else:
+            for cid in eligible:
+                selected.add(cid)
+        n = len(selected)
+        self.status_banner = (
+            f"☑ {n} {'conversación marcada' if n == 1 else 'conversaciones marcadas'} · "
+            "[↵/d] eliminar marcadas · [Esc] salir"
+        )
+
+    def _k_multi_confirm(self, conf: Confirm | None) -> None:
+        selected = set(conf.payload) if (conf is not None and isinstance(conf.payload, set)) else set()
+        if not selected:
+            self.status_banner = "Marca al menos una conversación con [Esp] o clic (o pulsa [a] para marcar todas)."
+            return
+        by_cid = {s.conversation_id: s for s in self.sessions}
+        items: list[dict] = []
+        skipped: list[str] = []
+        for cid in selected:
+            s = by_cid.get(cid)
+            if s is None:
+                continue
+            with self.compact_lock:
+                job = self.compact_jobs.get(cid)
+                compacting = bool(job and job.get("status") in ("running", "reserved"))
+            if compacting:
+                skipped.append(s.title)
+                continue
+            info = _sessions.inspect_session_deletion(s, fresh=False)
+            if info["blocked_reason"]:
+                skipped.append(s.title)
+                continue
+            items.append(info)
+        if not items:
+            self.confirm = None
+            self.status_banner = "⚠️ Ninguna de las conversaciones marcadas se puede eliminar ahora."
+            return
+        total_bytes = sum(int(it.get("size_bytes", 0)) for it in items)
+        payload = {"items": items, "focus": 0, "total_bytes": total_bytes, "skipped": skipped, "from_multi": True}
+        n = len(items)
+        banner = (
+            f"🗑 Popup abierto: ¿eliminar {n} {'conversación' if n == 1 else 'conversaciones'}? "
+            "[←/→] elegir · [↵] aceptar · [Esc] cancelar"
+        )
+        self._ask("delete_confirm", payload, banner)
+
+    def _ask_delete_session(self, sel: _sessions.AgySession) -> str:
+        with self.compact_lock:
+            job = self.compact_jobs.get(sel.conversation_id)
+            compacting = bool(job and job.get("status") in ("running", "reserved"))
+        if compacting:
+            return f"⚠️ '{sel.title[:28]}' se está compactando ahora mismo; espera a que termine antes de eliminarla."
+        info = _sessions.inspect_session_deletion(sel, fresh=False)
+        if info["blocked_reason"]:
+            return f"⚠️ {info['blocked_reason']}"
+        payload = {
+            "items": [info],
+            "focus": 0,
+            "total_bytes": int(info.get("size_bytes", 0)),
+            "skipped": [],
+            "from_multi": False,
+        }
+        banner = (
+            f"🗑 ¿Eliminar '{sel.title[:30]}' ({sel.conversation_id[:8]})? "
+            "[←/→] elegir · [↵] aceptar · [Esc] cancelar"
+        )
+        self._ask("delete_confirm", payload, banner)
+        return banner
+
+    def _k_delete_focus_cancel(self, conf: Confirm | None) -> None:
+        if conf is not None and isinstance(conf.payload, dict):
+            conf.payload["focus"] = 0
+
+    def _k_delete_focus_confirm(self, conf: Confirm | None) -> None:
+        if conf is not None and isinstance(conf.payload, dict):
+            conf.payload["focus"] = 1
+
+    def _k_delete_focus_toggle(self, conf: Confirm | None) -> None:
+        if conf is not None and isinstance(conf.payload, dict):
+            conf.payload["focus"] = 0 if conf.payload.get("focus", 0) else 1
+
+    def _k_delete_popup_activate(self, conf: Confirm | None) -> None:
+        if conf is None or not isinstance(conf.payload, dict):
+            return
+        if conf.payload.get("focus", 0) == 1:
+            self._k_delete_yes(conf)
+        else:
+            self._k_cancel(conf)
+
+    def _k_delete_yes(self, conf: Confirm | None) -> None:
+        self.confirm = None
+        if conf is None:
+            return
+        if self.scan_failed:
+            self.status_banner = self.SCAN_BLOCKED_MSG
+            return
+        raw_payload = conf.payload
+        items = list(raw_payload.get("items") or []) if isinstance(raw_payload, dict) and "items" in raw_payload else [raw_payload]
+        by_cid = {s.conversation_id: s for s in self.sessions}
+        removed_cids: set[str] = set()
+        failed_msgs: list[str] = []
+        last_ok_msg = ""
+        for info in items:
+            cid = str(info["conversation_id"])
+            sess = by_cid.get(cid)
+            if sess is None:
+                sess = _sessions.AgySession(
+                    conversation_id=cid,
+                    title=str(info.get("title", cid[:8])),
+                    preview="",
+                    step_count=0,
+                    last_modified="",
+                    workspace=str(info.get("workspace", "")),
+                    db_status="CASCADE_RUN_STATUS_IDLE",
+                    not_fully_idle=False,
+                    hibernated=bool(info.get("is_hibernated", False)),
+                )
+            ok, msg = _sessions.delete_session(
+                sess,
+                confirmed=True,
+                fresh=True,
+                on_close_tabs=lambda s: _tmuxctl.close_session_tabs_for_deletion(s.conversation_id),
+            )
+            if ok:
+                removed_cids.add(cid)
+                last_ok_msg = msg
+            else:
+                failed_msgs.append(msg)
+
+        if removed_cids:
+            self.sessions = [s for s in self.sessions if s.conversation_id not in removed_cids]
+            for cid in removed_cids:
+                self.ctx_cache.pop(cid, None)
+                if self.cached_preview_cid == cid:
+                    self.cached_preview_cid = ""
+                    self.cached_preview_sig = (-1, -1)
+                    self.cached_turns = []
+                with self.led_lock:
+                    self.forget_tab_names.add(cid)
+                    self.last_tab_names.pop(cid, None)
+            self._invalidate_io("reg")
+            self._clamp_cursor()
+            self.force_scan = True
+
+        if len(items) == 1:
+            self.status_banner = last_ok_msg if removed_cids else (failed_msgs[0] if failed_msgs else "No se eliminó la conversación.")
+        else:
+            ok_n = len(removed_cids)
+            fail_part = f" · {len(failed_msgs)} omitidas" if failed_msgs else ""
+            self.status_banner = f"🗑️ Eliminadas {ok_n} de {len(items)} conversaciones{fail_part}."
 
     def _selected_account(self) -> str | None:
         self.acct_list = list(self.reg.get("accounts", {}).items())

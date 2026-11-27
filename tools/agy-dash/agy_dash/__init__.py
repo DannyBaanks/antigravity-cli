@@ -1,7 +1,7 @@
 """agy_dash — agy-dash split into modules. ``paths`` is imported first: other modules read
 its constants at import time (default args, dataclass fields)."""
 from . import paths  # noqa: F401  (must be first)
-from . import procs, sessions, tmuxctl, accounts, compact, mirror, sandbox, tui, cli  # noqa: F401,E401
+from . import procs, sessions, tmuxctl, accounts, compact, mirror, sandbox, swarm, tui, cli  # noqa: F401,E401
 
 OWNER: dict[str, str] = {
 "ACCOUNTS_DIR": "paths",
@@ -20,6 +20,11 @@ OWNER: dict[str, str] = {
 "DEFAULT_IDLE_HIBERNATE_SEC": "paths",
 "DEFAULT_NVAPI_BASE_URL": "paths",
 "DEFAULT_NVAPI_MODEL": "paths",
+"DEFAULT_TIMEZONE": "paths",
+"display_timezone": "paths",
+"display_tz_label": "paths",
+"format_display_clock": "paths",
+"format_display_iso": "paths",
 "HEARTBEATS_DIR": "paths",
 "HEARTBEAT_INTERVAL_SEC": "paths",
 "HEARTBEAT_RECOMMEND_TOKENS": "paths",
@@ -92,6 +97,7 @@ OWNER: dict[str, str] = {
 "build_compaction_digest": "compact",
 "build_parser": "cli",
 "choose_baton_target": "accounts",
+"close_session_tabs_for_deletion": "tmuxctl",
 "close_stale_dash_duplicates": "sessions",
 "close_tab_safely": "tmuxctl",
 "cmd_account_login": "cli",
@@ -115,12 +121,14 @@ OWNER: dict[str, str] = {
 "cmd_isymcp_tab": "cli",
 "cmd_status": "cli",
 "cmd_statusbar": "cli",
+"cmd_swarm": "cli",
 "cmd_tui": "cli",
 "cmd_wake_stub": "cli",
 "compact_conversation_with_nvapi": "compact",
 "compute_quota_alert": "accounts",
 "continue_prompt": "compact",
 "deduplicate_session_procs": "sessions",
+"delete_session": "sessions",
 "delete_vault_handoff": "compact",
 "detect_caller_conversation_id": "compact",
 "diverged_shared_items": "accounts",
@@ -140,6 +148,7 @@ OWNER: dict[str, str] = {
 "hibernate_all_idle": "sessions",
 "hit_test_button": "tui",
 "inspect_account_removal": "accounts",
+"inspect_session_deletion": "sessions",
 "is_ancestor_pid": "procs",
 "is_transcript_turn_active": "sessions",
 "latest_active_task_log": "mirror",

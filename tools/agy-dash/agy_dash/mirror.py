@@ -70,7 +70,7 @@ def run_live_mirror_curses(stdscr, conv_id: str, cwd: str, title: str) -> str:
     task_name = ""
     task_lines: list[str] = []
     sess: _sessions.AgySession | None = None
-    last_update_str = time.strftime("%H:%M:%S")
+    last_update_str = _paths.format_display_clock(with_tz=True)
     status_msg = "En vivo (auto-refresco 0.4s). [r] Actualizar  [↑/↓] Scroll  [m] Migrar  [o] Abrir AGY  [d] ⚡DASH"
     force_refresh = True
     scroll_offset = 0
@@ -81,13 +81,13 @@ def run_live_mirror_curses(stdscr, conv_id: str, cwd: str, title: str) -> str:
         if force_refresh or sig != last_sig:
             last_sig = sig
             turns = _sessions.zig_tail_transcript(conv_id, max_turns=40, include_tools=True)
-            last_update_str = time.strftime("%H:%M:%S")
+            last_update_str = _paths.format_display_clock(with_tz=True)
         tname, tsig, tlines = latest_active_task_log(conv_id, max_lines=4)
         if force_refresh or tsig != last_task_sig:
             last_task_sig = tsig
             task_name = tname
             task_lines = tlines
-            last_update_str = time.strftime("%H:%M:%S")
+            last_update_str = _paths.format_display_clock(with_tz=True)
         if force_refresh or (now - last_scan) >= 1.5:
             last_scan = now
             _, _, sessions = _sessions.load_sessions(limit=30)
@@ -186,7 +186,7 @@ def run_live_mirror_curses(stdscr, conv_id: str, cwd: str, title: str) -> str:
             force_refresh = True
             scroll_offset = 0
             _tmuxctl.tmux_cmd("refresh-client", "-S")
-            status_msg = f"✅ Actualizado a las {time.strftime('%H:%M:%S')} (transcript + {task_name or 'estado'})."
+            status_msg = f"✅ Actualizado a las {_paths.format_display_clock(with_tz=True)} (transcript + {task_name or 'estado'})."
         elif ch in (curses.KEY_UP, ord("k")):
             scroll_offset += 2
         elif ch in (curses.KEY_DOWN, ord("j")):
