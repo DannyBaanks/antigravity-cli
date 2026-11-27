@@ -251,7 +251,9 @@ def _discover_nvapi_nemotron_model(base_url: str, api_key: str) -> str:
 
 SYSTEM_PROMPT = (
     "Eres un compactador experto de contexto para sesiones de ingeniería de software (Antigravity CLI). "
-    "Resume la conversación en español en un documento Markdown ultra-denso (<1200 palabras) con estas secciones exactas:\n"
+    "La PRIMERA línea de tu respuesta es exactamente `TÍTULO: <2 a 5 palabras en español que digan en qué se está "
+    "trabajando ahora, concreto (p. ej. `TÍTULO: Hook autocompact sin duplicados`), sin comillas ni emojis>`.\n"
+    "Después resume la conversación en español en un documento Markdown ultra-denso (<1200 palabras) con estas secciones exactas:\n"
     "1. OBJETIVO Y PETICIONES DEL USUARIO\n"
     "2. TRABAJO COMPLETADO Y DECISIONES TÉCNICAS\n"
     "3. ARCHIVOS MODIFICADOS / RUTAS Y COMANDOS CLAVE\n"
@@ -261,6 +263,77 @@ SYSTEM_PROMPT = (
     "Si hay sección SHELLS EN 2º PLANO, en 5. SIGUIENTE PASO ordena reenganchar cada job que SIGUE CORRIENDO con "
     "`agy-dash sbx wait <id>` en 2º plano antes de seguir; los que murieron, relanzarlos solo si hacen falta."
 )
+
+
+_TITLE_LINE_RE = re.compile(r"^\W*T[IÍ]TU?LO?\W*:\s*(.+)$", re.IGNORECASE)
+_GENERIC_TITLE_RE = re.compile(
+    r"^(sesi[oó]n( activa)?[- ][0-9a-f]{4,}|session|"
+    r"(retomar|restaurar|cargar|load|resume|continuar|continue)\b.*\b(contexto|context|sesi[oó]n|session|handoff)\b.*)$",
+    re.IGNORECASE,
+)
+_TOPIC_MAX = 48
+
+
+def _clean_topic(text: str) -> str:
+    t = re.sub(r"[`*_#>\[\]\"“”]+", "", text)
+    t = " ".join(t.split()).strip(" .:-")
+    if len(t) > _TOPIC_MAX:
+        t = t[:_TOPIC_MAX].rsplit(" ", 1)[0]
+    return t
+
+
+def split_topic(summary: str) -> tuple[str, str]:
+    """(topic, summary without the TÍTULO line). Without that line, falls back to the first
+    sentence of section 1 (OBJETIVO), cut to a few words."""
+    lines = summary.splitlines()
+    for i, line in enumerate(lines[:6]):
+        m = _TITLE_LINE_RE.match(line.strip())
+        if m and _clean_topic(m.group(1)):
+            rest = "\n".join(lines[:i] + lines[i + 1:]).strip()
+            return _clean_topic(m.group(1)), rest
+    in_goal = False
+    for line in lines:
+        st = line.strip()
+        if re.match(r"^#+\s*1\.", st):
+            in_goal = True
+            continue
+        if in_goal and st and not st.startswith("#"):
+            st = re.sub(r"^[-*]\s+", "", st)  # bullet, not the ** of bold
+            st = re.sub(r"^\*\*[^*]{1,30}\*\*\s*:?\s*", "", st)  # "**Meta principal**:"
+            words = re.split(r"[.;:(]", st, 1)[0].split()
+            return _clean_topic(" ".join(words[:6])), summary
+        if in_goal and st.startswith("#"):
+            break
+    return "", summary
+
+
+def is_generic_title(title: str) -> bool:
+    """Titles that say nothing about the work: `Sesión 46960a2e`, the truncated `🗜Sesión-46960a2e`
+    tab names the compaction used to leave, or agy's own "Retomar Contexto De Sesión"."""
+    t = (title or "").strip()
+    if t.startswith("🗜"):
+        return True
+    t = re.sub(r"^[^\w]+", "", t).replace("-", " ") if t else t
+    return not t or bool(_GENERIC_TITLE_RE.match(t))
+
+
+def topic_from_handoff(handoff_file: Path) -> str:
+    try:
+        head = handoff_file.read_text(encoding="utf-8")[:2000]
+    except OSError:
+        return ""
+    m = re.search(r"^- \*\*Tema:\*\* (.+)$", head, re.MULTILINE)
+    return m.group(1).strip() if m else ""
+
+
+def adopt_topic(session: _sessions.AgySession, topic: str) -> None:
+    """Give a generically named session the compaction's topic (memory + custom_titles.json)."""
+    if not topic or not is_generic_title(session.title):
+        return
+    try:
+        session.title = _sessions.save_custom_title(session.conversation_id, topic) or topic
+    except Exception:
+        session.title = topic
 
 
 def compact_conversation_with_nvapi(
@@ -373,6 +446,7 @@ def compact_conversation_with_nvapi(
         detail = " · ".join(errors) or "respuesta vacía"
         return (False, f"❌ Falló compactación NVAPI ({chosen_model} y respaldos): {detail}", None)
 
+    topic, summary_text = split_topic(summary_text)
     out_dir = handoffs_dir or _paths.COMPACTED_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     handoff_file = out_dir / f"{session.conversation_id[:8]}_handoff.md"
@@ -381,7 +455,8 @@ def compact_conversation_with_nvapi(
     header = (
         f"# 🗜️ Handoff Compactado por NVIDIA NIM (`{used_model}`)\n"
         f"- **Conversación original:** `{session.conversation_id}` ({session.title})\n"
-        f"- **Workspace:** `{session.workspace}`\n"
+        + (f"- **Tema:** {topic}\n" if topic else "")
+        + f"- **Workspace:** `{session.workspace}`\n"
         f"- **Reducción de contexto:** `~{orig_tokens:,} tokens` -> `~{compact_tokens:,} tokens` (**{saved_pct}% ahorrado**)\n\n"
     )
     shells_footer = (
@@ -394,6 +469,7 @@ def compact_conversation_with_nvapi(
         os.chmod(handoff_file, 0o600)
     except OSError:
         pass
+    adopt_topic(session, topic)
     return (
         True,
         f"🗜️ Compactada con `{used_model}`: ~{orig_tokens:,} -> ~{compact_tokens:,} tokens ({saved_pct}% ahorro).",
@@ -442,7 +518,9 @@ def open_compacted_session_in_tab(session: _sessions.AgySession, handoff_file: P
     cwd = session.workspace if Path(session.workspace).is_dir() else str(Path.cwd())
     reg = _accounts.load_accounts_registry()
     slot = reg.get("conv_accounts", {}).get(session.conversation_id) or reg.get("active_slot", "primary")
+    adopt_topic(session, topic_from_handoff(handoff_file))
     tab_name = _tmuxctl._short_tab_title(session.title, prefix="🗜")
+    _tmuxctl.remember_tab_title(tab_name, session.title)
     sbx_clause = _sandbox_clause(session.conversation_id)
     boot_prompt = (
         f"Contexto compactado de la sesión '{session.title}' ({session.conversation_id[:8]}). "
@@ -768,7 +846,9 @@ def respawn_compacted_session_in_place(
     cwd = session.workspace if Path(session.workspace).is_dir() else str(Path.cwd())
     reg = _accounts.load_accounts_registry()
     slot = reg.get("conv_accounts", {}).get(session.conversation_id) or reg.get("active_slot", "primary")
+    adopt_topic(session, topic_from_handoff(handoff_file))
     tab_name = _tmuxctl._short_tab_title(session.title, prefix="🗜")
+    _tmuxctl.remember_tab_title(tab_name, session.title)
 
     cont_clause = (
         f" y continúa inmediatamente con: {resume_prompt.strip()}"
