@@ -621,14 +621,54 @@ def evaluate_context_heartbeat(
     }
 
 
+RELAUNCH_WAIT_S = 8.0  # the respawned pane must still be alive this long after the relaunch
+
+
+def await_pane_alive(target: str, timeout_s: float = RELAUNCH_WAIT_S, poll_s: float = 0.5,
+                     tmux=None, clock=time.time, sleep=time.sleep) -> tuple[bool, str]:
+    """True once the respawned pane has stayed alive ``timeout_s`` (agy crashing at start, a bad
+    account slot or a missing binary leave it dead or close the window). claude-dash parity: never
+    say "continuada" without checking anything ran."""
+    tmux = tmux or _tmuxctl.tmux_cmd
+    deadline = clock() + timeout_s
+    while True:
+        cp = tmux("display-message", "-p", "-t", target, "#{pane_dead} #{pane_dead_status}", capture=True)
+        out = (getattr(cp, "stdout", "") or "").split()
+        if getattr(cp, "returncode", 1) != 0 or not out:
+            return False, "la pestaña se cerró al relanzar"
+        if out[0] == "1":
+            return False, f"agy salió al arrancar (código {out[1] if len(out) > 1 else '?'})"
+        if clock() >= deadline:
+            return True, ""
+        sleep(poll_s)
+
+
+def _queued_clause(conv_id: str) -> str:
+    from . import autocompact as _autocompact
+    queued = _autocompact.drain_queue(conv_id)
+    if not queued:
+        return ""
+    items = " | ".join(q.replace("\n", " ")[:600] for q in queued[-10:])
+    return f" Mensajes de Danny que llegaron mientras se compactaba (atiéndelos en orden): {items}"
+
+
 def respawn_compacted_session_in_place(
     session: _sessions.AgySession,
     handoff_file: Path,
     *,
     resume_prompt: str = "",
     win_idx: str | None = None,
+    verify=None,
 ) -> str:
     """Replace the active session's tmux pane in-place with a lightweight Nemotron-compacted continuation."""
+    target_win = win_idx if win_idx is not None else _tmuxctl._find_tmux_window_by_conv(session.conversation_id)
+    if target_win is None:
+        # Outside the dash: opening a new tab while the original agy is still open elsewhere would
+        # leave two sessions writing on the same work. Hand the user one line instead.
+        cur = _sessions.refresh_session(session.conversation_id)
+        if cur is not None and cur.proc is not None:
+            return (f"🗜 handoff listo en el Baúl; agy sigue abierto fuera del dash. Ciérralo y corre: "
+                    f"agy-dash self-compact {session.conversation_id[:8]} --respawn-only")
     self_path = _paths.SELF_PATH
     cwd = session.workspace if Path(session.workspace).is_dir() else str(Path.cwd())
     reg = _accounts.load_accounts_registry()
@@ -639,7 +679,7 @@ def respawn_compacted_session_in_place(
         f" y continúa inmediatamente con: {resume_prompt.strip()}"
         if resume_prompt.strip()
         else " y confirma que estás listo para continuar."
-    )
+    ) + _queued_clause(session.conversation_id)
     boot_prompt = (
         f"Contexto compactado con NVIDIA Nemotron 550B de tu sesión '{session.title}' ({session.conversation_id[:8]}). "
         f"Ejecuta ÚNICAMENTE una llamada a `agy_handoff_context` (o `isymcp(action='handoff.load', arguments={{'target': '{session.conversation_id[:8]}', 'workspace': '{cwd}'}})` — si aún no está cargada en este hub, lee `{handoff_file}`){cont_clause}"
@@ -650,10 +690,17 @@ def respawn_compacted_session_in_place(
         f"-- -i {_tmuxctl.sh_quote(boot_prompt)}"
     )
 
-    target_win = win_idx if win_idx is not None else _tmuxctl._find_tmux_window_by_conv(session.conversation_id)
     if target_win is not None:
-        _tmuxctl.tmux_cmd("rename-window", "-t", f"{_paths.TMUX_SESSION}:{target_win}", tab_name)
-        _tmuxctl.tmux_cmd("respawn-pane", "-k", "-t", f"{_paths.TMUX_SESSION}:{target_win}", cmd)
+        target = f"{_paths.TMUX_SESSION}:{target_win}"
+        _tmuxctl.tmux_cmd("rename-window", "-t", target, tab_name)
+        rp = _tmuxctl.tmux_cmd("respawn-pane", "-k", "-t", target, cmd)
+        if getattr(rp, "returncode", 0) != 0:
+            return (f"⚠ handoff listo en el Baúl, pero tmux no pudo relanzar la pestaña {target_win}; "
+                    f"corre: agy-dash self-compact {session.conversation_id[:8]} --respawn-only")
+        ok, why = (verify or await_pane_alive)(target)
+        if not ok:
+            return (f"⚠ handoff listo en el Baúl, pero {why}; "
+                    f"corre: agy-dash self-compact {session.conversation_id[:8]} --respawn-only")
         return f"♻️ Sesión '{session.title}' compactada con Nemotron 550B y continuada in-place en pestaña `{tab_name}`."
 
     _tmuxctl.tmux_cmd("new-window", "-t", _paths.TMUX_SESSION, "-n", tab_name, "-c", cwd, cmd)

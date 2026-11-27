@@ -6,6 +6,11 @@ herramienta; el payload trae ``lastUserInput`` (texto del prompt) aunque la doc 
 no lo liste; ``terminationBehavior: "terminate"`` + ``errorMessage`` corta el turno sin
 llamar al modelo (``agy -p`` sale con código 3). Solo se actúa en ``invocationNum == 0``
 para no cortar nunca un turno a medias.
+
+2026-11-27 (paridad con claude-dash): activo por defecto (``AGY_DASH_MACHINE_COMPACT=0`` lo
+apaga); mientras una compactación de la conversación sigue viva, cada prompt se corta antes del
+modelo y se guarda en cola (``compacted/.queued_<id>.jsonl``) para entregarlo al continuar, en vez
+de mandarle al modelo el contexto gigante.
 """
 from __future__ import annotations
 
@@ -55,15 +60,67 @@ def last_user_input(transcript_path: str | Path) -> str:
     return last_content
 
 
-def _spawn_detached(argv: list[str]) -> None:
+def _spawn_detached(argv: list[str]) -> subprocess.Popen:
     """Lanza un worker separado y sin descriptores estándar compartidos."""
-    subprocess.Popen(
+    return subprocess.Popen(
         argv,
         start_new_session=True,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+
+
+def running_file(conv_id: str) -> Path:
+    return _paths.COMPACTED_DIR / f".running_{conv_id}.json"
+
+
+def queue_file(conv_id: str) -> Path:
+    return _paths.COMPACTED_DIR / f".queued_{conv_id}.jsonl"
+
+
+def _pid_runs_compaction(pid: int, conv_id: str, proc_root: Path = Path("/proc")) -> bool:
+    """The worker started for ``conv_id`` is still alive (its argv names the conversation)."""
+    try:
+        argv = (proc_root / str(pid) / "cmdline").read_bytes().split(b"\0")
+    except OSError:
+        return False
+    joined = [a.decode("utf-8", "replace") for a in argv]
+    return "self-compact" in joined and conv_id in joined
+
+
+def compaction_running(conv_id: str, proc_root: Path = Path("/proc")) -> bool:
+    try:
+        pid = int(json.loads(running_file(conv_id).read_text(encoding="utf-8")).get("pid") or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+    return pid > 0 and _pid_runs_compaction(pid, conv_id, proc_root)
+
+
+def enqueue(conv_id: str, text: str, timestamp: float) -> None:
+    f = queue_file(conv_id)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    with f.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"at": timestamp, "text": text}, ensure_ascii=False) + "\n")
+
+
+def drain_queue(conv_id: str) -> list[str]:
+    """Prompts that arrived while compacting, oldest first; the file is consumed."""
+    f = queue_file(conv_id)
+    try:
+        lines = f.read_text(encoding="utf-8").splitlines()
+        f.unlink()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            text = str(json.loads(line).get("text") or "").strip()
+        except (json.JSONDecodeError, AttributeError):
+            continue
+        if text:
+            out.append(text)
+    return out
 
 
 def _recently_compacted(marker: Path, timestamp: float) -> bool:
@@ -82,6 +139,7 @@ def decide(
     measure: Callable | None = None,
     spawn: Callable | None = None,
     now: float | Callable[[], float] | None = None,
+    running: Callable[[str], bool] | None = None,
 ) -> dict:
     """Decide si el hook debe terminar el turno y comenzar una compactación.
 
@@ -92,7 +150,7 @@ def decide(
     """
     try:
         active_env = os.environ if env is None else env
-        if active_env.get("AGY_DASH_MACHINE_COMPACT") != "1":
+        if active_env.get("AGY_DASH_MACHINE_COMPACT", "1") == "0":
             return {}
 
         invocation_num = payload.get("invocationNum", 0)
@@ -113,11 +171,28 @@ def decide(
 
         clock_value = now() if callable(now) else now
         timestamp = time.time() if clock_value is None else float(clock_value)
+
+        # A compaction of this conversation is still running: the model must not read the huge
+        # context now. Cut the turn and keep the prompt for the continuation (claude-dash parity).
+        if (running or compaction_running)(conv_id):
+            text = "" if forced else user_input.strip()
+            if text:
+                enqueue(conv_id, text, timestamp)
+            note = ("tu mensaje queda en cola y se entrega al continuar" if text
+                    else "ya está en curso; no hace falta pedirla otra vez")
+            return {
+                "injectSteps": [{"errorMessage": {"userMessage":
+                                 f"🗜 compactando con NVIDIA: {note}. Esta pestaña se relanza sola."}}],
+                "terminationBehavior": "terminate",
+            }
+
         marker = _paths.HEARTBEATS_DIR / f"{conv_id}.autocompact"
         if _recently_compacted(marker, timestamp):
             return {}
 
         threshold = int(active_env.get("AGY_DASH_AUTO_COMPACT_TOKENS", "250000"))
+        if threshold <= 0 and not forced:
+            return {}
         model_name = str(payload.get("modelName") or "")
         measure_fn = measure or _compact.measure_session_context
         metrics = measure_fn(
@@ -145,7 +220,12 @@ def decide(
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(str(timestamp), encoding="utf-8")
         try:
-            (spawn or _spawn_detached)(argv)
+            proc = (spawn or _spawn_detached)(argv)
+            pid = getattr(proc, "pid", 0)
+            if isinstance(pid, int) and pid > 0:
+                rf = running_file(conv_id)
+                rf.parent.mkdir(parents=True, exist_ok=True)
+                rf.write_text(json.dumps({"pid": pid, "at": timestamp}), encoding="utf-8")
         except Exception:
             try:
                 marker.unlink()

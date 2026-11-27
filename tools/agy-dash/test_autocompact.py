@@ -23,6 +23,10 @@ class AutoCompactTests(unittest.TestCase):
         self.paths_patch = mock.patch.object(ac._paths, "HEARTBEATS_DIR", self.heartbeats)
         self.paths_patch.start()
         self.addCleanup(self.paths_patch.stop)
+        self.compacted = self.root / "compacted"
+        cpatch = mock.patch.object(ac._paths, "COMPACTED_DIR", self.compacted)
+        cpatch.start()
+        self.addCleanup(cpatch.stop)
         self.env = {"AGY_DASH_MACHINE_COMPACT": "1"}
         self.payload = {
             "conversationId": "conv-123",
@@ -48,12 +52,18 @@ class AutoCompactTests(unittest.TestCase):
             **kwargs,
         )
 
-    def test_disabled_by_default(self) -> None:
+    def test_on_by_default_and_off_with_zero(self) -> None:
+        # 2026-11-27: on by default like claude-dash; AGY_DASH_MACHINE_COMPACT=0 is the opt-out
         self.write_transcript({"type": "USER_INPUT", "content": "hola"})
+        self.assertEqual(ac.decide(self.payload, env={}, measure=self.measure, spawn=self.spawn,
+                                   now=1000)["terminationBehavior"], "terminate")
+        self.spawn.reset_mock()
+        self.measure.reset_mock()
+        (self.heartbeats / "conv-123.autocompact").unlink()
         self.assertEqual(
             ac.decide(
                 self.payload,
-                env={},
+                env={"AGY_DASH_MACHINE_COMPACT": "0"},
                 measure=self.measure,
                 spawn=self.spawn,
                 now=1000,
@@ -132,6 +142,41 @@ class AutoCompactTests(unittest.TestCase):
             ],
         )
 
+    def test_prompt_while_compacting_is_cut_and_queued(self) -> None:
+        self.payload["lastUserInput"] = "y luego corre los tests"
+        out = self.decide(used_tokens=10, running=lambda cid: True)
+        self.assertEqual(out["terminationBehavior"], "terminate")
+        self.assertIn("en cola", out["injectSteps"][0]["errorMessage"]["userMessage"])
+        self.spawn.assert_not_called()
+        self.measure.assert_not_called()
+        self.assertEqual(ac.drain_queue("conv-123"), ["y luego corre los tests"])
+        self.assertEqual(ac.drain_queue("conv-123"), [])  # consumed
+
+    def test_repeated_compact_command_while_running_is_not_queued(self) -> None:
+        self.payload["lastUserInput"] = "/compactnvidia"
+        out = self.decide(used_tokens=10, running=lambda cid: True)
+        self.assertIn("ya está en curso", out["injectSteps"][0]["errorMessage"]["userMessage"])
+        self.assertEqual(ac.drain_queue("conv-123"), [])
+
+    def test_worker_pid_is_recorded_and_liveness_checks_argv(self) -> None:
+        self.write_transcript({"type": "USER_INPUT", "content": "sigue"})
+        self.spawn.return_value = mock.Mock(pid=4242)
+        self.decide(used_tokens=300000)
+        self.assertEqual(json.loads(ac.running_file("conv-123").read_text())["pid"], 4242)
+        proc = self.root / "proc"
+        (proc / "4242").mkdir(parents=True)
+        (proc / "4242" / "cmdline").write_bytes(b"python3\0agy_dashboard.py\0self-compact\0conv-123\0")
+        self.assertTrue(ac.compaction_running("conv-123", proc_root=proc))
+        (proc / "4242" / "cmdline").write_bytes(b"bash\0")  # pid recycled by something else
+        self.assertFalse(ac.compaction_running("conv-123", proc_root=proc))
+
+    def test_threshold_zero_disables_auto_but_not_the_command(self) -> None:
+        self.env["AGY_DASH_AUTO_COMPACT_TOKENS"] = "0"
+        self.payload["lastUserInput"] = "sigue"
+        self.assertEqual(self.decide(used_tokens=900000), {})
+        self.payload["lastUserInput"] = "/compactnvidia"
+        self.assertEqual(self.decide(used_tokens=900000)["terminationBehavior"], "terminate")
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -180,3 +225,75 @@ class LastUserInputPayloadTests(unittest.TestCase):
             self.assertEqual(out.get("terminationBehavior"), "terminate")
             self.assertEqual(spawned[0][-1], "sigue con X")
             self.assertIn("/compactnvidia", out["injectSteps"][0]["errorMessage"]["userMessage"])
+
+
+class InPlaceRelaunchTests(unittest.TestCase):
+    """compact.respawn_compacted_session_in_place: queue delivered, no duplicate, relaunch verified."""
+
+    def setUp(self) -> None:
+        from agy_dash import compact as cp
+        from agy_dash import sessions as ss
+        self.cp = cp
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.root = Path(td.name)
+        for name, val in (("COMPACTED_DIR", self.root / "compacted"), ("SELF_PATH", self.root / "agy_dashboard.py")):
+            pt = mock.patch.object(cp._paths, name, val)
+            pt.start()
+            self.addCleanup(pt.stop)
+        pt = mock.patch.object(cp._accounts, "load_accounts_registry", return_value={})
+        pt.start()
+        self.addCleanup(pt.stop)
+        self.sess = ss.AgySession(conversation_id="abcdef12-0000", title="T", preview="", step_count=0,
+                                  last_modified="", workspace=str(self.root), db_status="", not_fully_idle=False)
+        self.calls: list[tuple] = []
+
+    def _tmux(self, rc_respawn: int = 0):
+        import subprocess
+
+        def tmux(*args, **k):
+            self.calls.append(args)
+            return subprocess.CompletedProcess(args, rc_respawn if args[0] == "respawn-pane" else 0, "", "")
+        return mock.patch.object(self.cp._tmuxctl, "tmux_cmd", side_effect=tmux)
+
+    def test_queued_prompts_go_into_the_boot_prompt_and_relaunch_is_verified(self) -> None:
+        ac.enqueue("abcdef12-0000", "corre los tests", 1.0)
+        verify = mock.Mock(return_value=(True, ""))
+        with self._tmux():
+            msg = self.cp.respawn_compacted_session_in_place(self.sess, self.root / "h.md", resume_prompt="sigue",
+                                                            win_idx="3", verify=verify)
+        self.assertIn("continuada in-place", msg)
+        verify.assert_called_once_with("agy:3")
+        cmd = [c for c in self.calls if c[0] == "respawn-pane"][0][-1]
+        self.assertIn("corre los tests", cmd)
+        self.assertEqual(ac.drain_queue("abcdef12-0000"), [])
+
+    def test_dead_pane_after_relaunch_is_reported_not_called_continued(self) -> None:
+        with self._tmux():
+            msg = self.cp.respawn_compacted_session_in_place(
+                self.sess, self.root / "h.md", win_idx="3", verify=lambda t: (False, "agy salió al arrancar (código 1)"))
+        self.assertIn("agy salió al arrancar", msg)
+        self.assertIn("--respawn-only", msg)
+        with self._tmux(rc_respawn=1):
+            msg = self.cp.respawn_compacted_session_in_place(self.sess, self.root / "h.md", win_idx="3",
+                                                            verify=lambda t: (True, ""))
+        self.assertIn("tmux no pudo relanzar", msg)
+
+    def test_outside_dash_with_agy_alive_does_not_open_a_duplicate(self) -> None:
+        live = mock.Mock(proc=object())
+        with self._tmux(), mock.patch.object(self.cp._tmuxctl, "_find_tmux_window_by_conv", return_value=None), \
+             mock.patch.object(self.cp._sessions, "refresh_session", return_value=live):
+            msg = self.cp.respawn_compacted_session_in_place(self.sess, self.root / "h.md")
+        self.assertIn("fuera del dash", msg)
+        self.assertFalse([c for c in self.calls if c[0] in ("new-window", "respawn-pane")])
+
+    def test_await_pane_alive(self) -> None:
+        import subprocess
+        t = iter([0.0, 0.0, 9.0])
+        alive = lambda *a, **k: subprocess.CompletedProcess(a, 0, "0 0\n", "")
+        self.assertEqual(self.cp.await_pane_alive("agy:1", 8.0, tmux=alive, clock=lambda: next(t),
+                                                  sleep=lambda s: None), (True, ""))
+        dead = lambda *a, **k: subprocess.CompletedProcess(a, 0, "1 2\n", "")
+        self.assertEqual(self.cp.await_pane_alive("agy:1", tmux=dead)[0], False)
+        gone = lambda *a, **k: subprocess.CompletedProcess(a, 1, "", "can't find window")
+        self.assertIn("se cerró", self.cp.await_pane_alive("agy:1", tmux=gone)[1])
