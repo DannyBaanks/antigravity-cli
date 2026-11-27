@@ -24,11 +24,19 @@ jobs:
         with:
           python-version: "3.12"
 
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
       - name: Install test dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq tmux
           python -m pip install --upgrade pip pytest
+
+      - name: Run Zig core tests
+        working-directory: tools/agy-dash/zig_core
+        run: zig build test
 
       - name: Run agy-dash test suite
         working-directory: tools/agy-dash
