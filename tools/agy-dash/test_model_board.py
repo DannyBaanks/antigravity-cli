@@ -40,10 +40,26 @@ class ModelBoardTests(unittest.TestCase):
 
     def test_key_M_in_dashboard(self) -> None:
         dash = tui.Dashboard(mock.Mock())
-        with mock.patch.object(tui, "open_model_board", return_value="ok-board") as ob:
+        with mock.patch.object(tui, "open_model_picker", return_value="ok-picker") as op:
             dash.handle_key(ord("M"))
-        ob.assert_called_once_with()
-        self.assertEqual(dash.status_banner, "ok-board")
+        op.assert_called_once_with(dash)
+        self.assertEqual(dash.status_banner, "ok-picker")
+
+    def test_open_picker_runs_display_popup_and_updates_model(self) -> None:
+        dash = tui.Dashboard(mock.Mock())
+        dash.model_disp = "Gemini 4 Hydrogen (Medium)"
+        with mock.patch.object(tui._swarm, "catalog", return_value=([{"provider": "agy", "spec": "agy:gemini-4-neon-medium", "label": "[AGY] Gemini 4 Neon (Medium)"}], "")), \
+             mock.patch.object(tui._swarm, "_swarm_ext", return_value="/x/swarm-ext"), \
+             mock.patch.object(tui._tmuxctl, "tmux_cmd") as tmux_cmd, \
+             mock.patch.object(tui._swarm, "set_active_model", return_value=(True, "Gemini 4 Neon (Medium)")):
+            msg = tui.open_model_picker(dash)
+            for t in list(tui.threading.enumerate()):
+                if t is not tui.threading.current_thread() and t.daemon:
+                    t.join(timeout=2)
+        self.assertIn("Selector de modelos", msg)
+        args = tmux_cmd.call_args.args
+        self.assertEqual(args[0], "display-popup")
+        self.assertIn("swarm pick-ui", args[-1])
 
 
 if __name__ == "__main__":

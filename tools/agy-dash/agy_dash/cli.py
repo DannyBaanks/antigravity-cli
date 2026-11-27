@@ -50,11 +50,13 @@ KEYS_SHEET = [
         ("u  /  U", "cuentas / refrescar cuota"),
         ("K", "key de NVIDIA"),
         ("m", "memoria"),
-        ("M", "ranking de modelos (ping/bench, swarm-ext board)"),
+        ("M", "selector de modelos (filtro, ping, M=board)"),
         ("r  /  R", "refrescar / recargar"),
+        ("d / D / Supr", "eliminar conversación (popup con flechas/mouse)"),
+        ("Ctrl+D", "selección múltiple para eliminar varias"),
         ("x", "limpiar duplicados"),
         ("q / Esc / Tab", "volver a la pestaña siguiente"),
-        ("D", "desconectar (las sesiones siguen vivas)"),
+        ("Q", "desconectar (las sesiones siguen vivas)"),
     ]),
     ("AGY (dentro de una sesión)", [
         ("Alt+S  /  Alt+X", "board del swarm / ocultar aviso del swarm"),
@@ -811,6 +813,9 @@ def cmd_self_compact(args: argparse.Namespace) -> int:
         return 0
 
     _compact._write_compact_status(sel.conversation_id, "running", "Llamando a NVIDIA NIM (Nemotron 550B)...")
+    hook_cut = bool(getattr(args, "hook_cut", False))
+    if hook_cut:
+        _compact.interrupt_cut_turn(sel.conversation_id, win_idx)
     if getattr(args, "model", ""):
         _compact.save_nvapi_config(model=str(args.model))
 
@@ -835,6 +840,8 @@ def cmd_self_compact(args: argparse.Namespace) -> int:
             print(f"{msg} · Handoff: {hfile}")
         return 0
 
+    if hook_cut:  # the loop may have restarted while NVIDIA answered; still the old session here
+        _compact.interrupt_cut_turn(sel.conversation_id, win_idx, settle_s=0.0)
     # Respawning kills the pane: wait until the turn is really over (never cut a reply mid-way).
     wait_s = float(getattr(args, "wait", 900.0) or 900.0)
     deadline = time.time() + wait_s
@@ -844,7 +851,7 @@ def cmd_self_compact(args: argparse.Namespace) -> int:
         busy = cur is not None and cur.proc is not None and (
             cur.db_status == "CASCADE_RUN_STATUS_RUNNING"
             or _sessions.is_transcript_turn_active(sel.conversation_id, max_recent_sec=3.0)
-            or bool(cur.proc.active_children)
+            or _procs.has_blocking_children(cur.proc)
         )
         if not busy:
             quiet_since = quiet_since or time.time()
@@ -879,6 +886,126 @@ def cmd_self_compact(args: argparse.Namespace) -> int:
 def cmd_tui(_args: argparse.Namespace) -> int:
     curses.wrapper(_tui.run_curses_tui)
     return 0
+
+
+def cmd_sbx_hook(_args: argparse.Namespace) -> int:
+    """AGY PreToolUse(run_command) hook: wrap background commands and swarm-ext workers in the sandbox."""
+    from . import sandbox as _sandbox
+    from . import swarm as _swarm
+    payload: dict = {}
+    try:
+        raw = "" if sys.stdin.isatty() else sys.stdin.read()
+        if raw.strip():
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                payload = parsed
+        out = _sandbox.hook_rewrite(payload) if payload else None
+    except Exception as exc:
+        print(f"agy-dash sbx-hook: {type(exc).__name__}: {exc}", file=sys.stderr)
+        out = None
+    if out:
+        print(json.dumps(out, ensure_ascii=False))
+    elif "toolCall" in payload or "hookEventName" in payload or not payload:
+        # AGY PreToolUse requires {"decision": "ask"} as the neutral response ({} denies the tool call)
+        print(json.dumps({"decision": "ask"}))
+    return 0
+
+
+def cmd_sbx(args: argparse.Namespace) -> int:
+    """Manage detached shell sandbox jobs (`run`, `list`, `wait`, `tail`, `kill`)."""
+    from . import sandbox as _sandbox
+    from . import swarm as _swarm
+    scmd = getattr(args, "sbx_cmd", "list") or "list"
+    if scmd == "run":
+        raw_cmd = list(getattr(args, "command", []) or [])
+        if raw_cmd and raw_cmd[0] == "--":
+            raw_cmd = raw_cmd[1:]
+        cmd = " ".join(raw_cmd).strip()
+        if not cmd:
+            print("uso: agy-dash sbx run [--sid ID] -- '<comando>'", file=sys.stderr)
+            return 2
+        sid = (getattr(args, "sid", "") or os.environ.get("AGY_CONVERSATION_ID", "")).strip()
+        job = _sandbox.launch(sid, cmd, os.getcwd())
+        print(
+            f"[sandbox {job['id']}] corre fuera de AGY (sobrevive a compactar) · log {job['log']}",
+            flush=True,
+        )
+        return _sandbox.follow(job["id"])
+    if scmd == "_exec":
+        return _sandbox.run_job(args.jid)
+    if scmd == "wait":
+        job = _sandbox.load_job(args.jid)
+        if not job:
+            print(f"no existe el job {args.jid} (agy-dash sbx list)", file=sys.stderr)
+            return 2
+        print(
+            f"[sandbox {args.jid}] reenganchado: `{' '.join(str(job.get('cmd', '')).split())[:200]}`",
+            flush=True,
+        )
+        rc = _sandbox.follow(args.jid, from_start=bool(getattr(args, "from_start", False)))
+        print(f"[sandbox {args.jid}] terminó rc={rc}", flush=True)
+        return rc
+    if scmd == "tail":
+        lf = _sandbox.log_file(args.jid)
+        if not lf.exists():
+            print(f"sin log para {args.jid}", file=sys.stderr)
+            return 1
+        data = lf.read_bytes()
+        nlines = int(getattr(args, "lines", 40) or 40)
+        sys.stdout.write(b"\n".join(data.splitlines()[-nlines:]).decode("utf-8", "replace") + "\n")
+        return 0
+    if scmd == "kill":
+        ok, msg = _sandbox.kill(args.jid)
+        print(msg, file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 1
+
+    js = _sandbox.jobs(
+        getattr(args, "sid", "") or "",
+        include_done_s=float(getattr(args, "done_hours", 1.0) or 1.0) * 3600.0,
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(js, ensure_ascii=False, indent=2))
+        return 0
+    if not js:
+        print("sin jobs en el sandbox")
+        return 0
+    now = time.time()
+    for j in js:
+        age = _sandbox.fmt_dur(now - float(j.get("started") or j.get("created") or now))
+        rc = f" rc={j['rc']}" if "rc" in j else ""
+        print(
+            f"{j['id']}  {j.get('status', ''):8}{rc:7} {age:>7}  "
+            f"{str(j.get('sid', ''))[:8]:8}  {' '.join(str(j.get('cmd', '')).split())[:110]}"
+        )
+    return 0
+
+
+def cmd_swarm(args: argparse.Namespace) -> int:
+    from . import swarm as _swarm
+
+    sw_cmd = getattr(args, "sw_cmd", "")
+    if sw_cmd == "catalog":
+        rows, note = _swarm.catalog(args.xkiro, args.all, rank=args.rank)
+        if note:
+            print(note, file=sys.stderr)
+        print(json.dumps(rows, ensure_ascii=False, indent=1) if args.json else _swarm.numbered(rows))
+        return 0
+    if sw_cmd == "pick":
+        try:
+            workers = _swarm.parse_workers(args.worker or [])
+        except ValueError as e:
+            print(str(e), file=sys.stderr)
+            return 1
+        if not workers:
+            print("falta al menos un --worker NOMBRE=descripción", file=sys.stderr)
+            return 1
+        code, text = _swarm.pick(workers, args.xkiro, args.all, popup=not args.no_popup, wait=args.wait)
+        print(text)
+        return code
+    if sw_cmd == "pick-ui":
+        return _swarm.pick_ui(Path(args.req), Path(args.out))
+    print("uso: agy-dash swarm catalog|pick", file=sys.stderr)
+    return 1
 
 
 def cmd_dashboard(args: argparse.Namespace) -> int:
@@ -1029,9 +1156,72 @@ def build_parser() -> argparse.ArgumentParser:
     p_sc.add_argument("--no-respawn", action="store_true", help="Compact and write handoff/status without respawning tmux tab")
     p_sc.add_argument("--respawn-only", action="store_true", help="Skip NVAPI call and respawn tmux tab from existing vault handoff")
     p_sc.add_argument("--wait", type=float, default=900.0, help="Max seconds waiting for the turn to end before respawn")
+    p_sc.add_argument("--hook-cut", action="store_true",
+                      help="Started by the PreInvocation hook: press Esc on the cut turn so AGY stops re-firing")
     p_sc.add_argument("--bg", action="store_true", help="Run detached in background")
     p_sc.add_argument("--_bg-worker", dest="bg_worker", action="store_true", help=argparse.SUPPRESS)
     p_sc.set_defaults(fn=cmd_self_compact, in_place=True)
+
+    p_sh = sub.add_parser("sbx-hook", help="AGY PreToolUse(run_command) hook: wrap background commands in the sandbox")
+    p_sh.set_defaults(fn=cmd_sbx_hook)
+
+    p_sx = sub.add_parser("sbx", help="Shell sandbox: background jobs & swarm workers that survive compaction")
+    sx_sub = p_sx.add_subparsers(dest="sbx_cmd")
+    p_sx.add_argument("--sid", default="", help="Filter by conversation ID")
+    p_sx.add_argument("--done-hours", type=float, default=1.0, help="Include finished jobs from the last N hours")
+    p_sx.add_argument("--json", action="store_true", help="Emit JSON output")
+    p_sx.set_defaults(fn=cmd_sbx, sbx_cmd="list")
+
+    p_sxl = sx_sub.add_parser("list", help="List running and recently finished sandbox jobs")
+    p_sxl.add_argument("--sid", default="", help="Filter by conversation ID")
+    p_sxl.add_argument("--done-hours", type=float, default=1.0, help="Include finished jobs from the last N hours")
+    p_sxl.add_argument("--json", action="store_true", help="Emit JSON output")
+    p_sxl.set_defaults(fn=cmd_sbx, sbx_cmd="list")
+
+    p_sxr = sx_sub.add_parser("run", help="Launch a detached command in the sandbox and follow its output")
+    p_sxr.add_argument("--sid", default="", help="Conversation ID owning this job")
+    p_sxr.add_argument("command", nargs=argparse.REMAINDER, help="Command to run (after --)")
+    p_sxr.set_defaults(fn=cmd_sbx, sbx_cmd="run")
+
+    p_sxe = sx_sub.add_parser("_exec", help=argparse.SUPPRESS)
+    p_sxe.add_argument("jid")
+    p_sxe.set_defaults(fn=cmd_sbx, sbx_cmd="_exec")
+
+    p_sxw = sx_sub.add_parser("wait", help="Re-attach to a running sandbox job until it finishes")
+    p_sxw.add_argument("jid", help="Sandbox job ID")
+    p_sxw.add_argument("--from-start", action="store_true", help="Replay the entire log from the beginning")
+    p_sxw.set_defaults(fn=cmd_sbx, sbx_cmd="wait")
+
+    p_sxt = sx_sub.add_parser("tail", help="Print the last N lines of a sandbox job log")
+    p_sxt.add_argument("jid", help="Sandbox job ID")
+    p_sxt.add_argument("-n", "--lines", type=int, default=40, help="Number of lines to show")
+    p_sxt.set_defaults(fn=cmd_sbx, sbx_cmd="tail")
+
+    p_sxk = sx_sub.add_parser("kill", help="Send SIGTERM to a running sandbox job's process group")
+    p_sxk.add_argument("jid", help="Sandbox job ID")
+    p_sxk.set_defaults(fn=cmd_sbx, sbx_cmd="kill")
+
+    p_sw = sub.add_parser("swarm", help="/swarm: interactive model picker per worker (AGY, Codex, Claude, NVAPI, OpenCode)")
+    sw_sub = p_sw.add_subparsers(dest="sw_cmd")
+    p_swc = sw_sub.add_parser("catalog", help="List available swarm models")
+    p_swc.add_argument("--xkiro", action="store_true", help="Include xkiro provider")
+    p_swc.add_argument("--all", action="store_true", help="Include embed/rerank/paid models")
+    p_swc.add_argument("--rank", metavar="TAREA", help="Sort by swarm-ext ranking for this task")
+    p_swc.add_argument("--json", action="store_true", help="Emit JSON output")
+    p_swc.set_defaults(fn=cmd_swarm, sw_cmd="catalog")
+
+    p_swk = sw_sub.add_parser("pick", help="Interactive curses model picker popup per worker")
+    p_swk.add_argument("--worker", action="append", metavar="NOMBRE=DESC", help="Worker name and task description")
+    p_swk.add_argument("--xkiro", action="store_true", help="Include xkiro provider")
+    p_swk.add_argument("--all", action="store_true", help="Include embed/rerank/paid models")
+    p_swk.add_argument("--no-popup", action="store_true", help="Print numbered list without opening tmux popup")
+    p_swk.add_argument("--wait", type=float, default=900.0, help="Max seconds to wait for popup")
+    p_swk.set_defaults(fn=cmd_swarm, sw_cmd="pick")
+
+    p_swu = sw_sub.add_parser("pick-ui", help=argparse.SUPPRESS)
+    p_swu.add_argument("req")
+    p_swu.add_argument("out")
+    p_swu.set_defaults(fn=cmd_swarm, sw_cmd="pick-ui")
 
     return ap
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy as _copy
+import json
 import re
 import shutil
 import subprocess
@@ -271,6 +272,18 @@ def _find_tmux_window_by_conv(conv_id: str) -> str | None:
     return info[0] if info else None
 
 
+def close_session_tabs_for_deletion(conv_id: str) -> None:
+    """Close any tmux window (dash or background) bound to `conv_id`, never closing 0:⚡DASH."""
+    dash_info = _get_dash_window_map().get(conv_id)
+    if dash_info is not None:
+        win_idx, win_name = dash_info
+        if "DASH" not in win_name:
+            tmux_cmd("kill-window", "-t", f"{_paths.TMUX_SESSION}:{win_idx}")
+    bg_info = _get_bg_window_map().get(conv_id)
+    if bg_info is not None:
+        tmux_cmd("kill-window", "-t", f"{_paths.TMUX_BG_SESSION}:{bg_info[0]}")
+
+
 def _replace_tmux_pane_with_wake_stub(session: _sessions.AgySession) -> None:
     win_idx = _find_tmux_window_by_conv(session.conversation_id)
     if not win_idx:
@@ -528,6 +541,46 @@ def format_led_tab_title(
     return f"{prefix}{body}"
 
 
+def _tab_titles_file() -> Path:
+    return _paths.COMPACTED_DIR / ".tab_titles.json"
+
+
+def remember_tab_title(tab_name: str, title: str) -> None:
+    """The compaction renames a tab to a short `🗜Tema-trunc`; the LED thread sees that as a
+    hand rename and would save the truncated name as the title. Leave the full title for it."""
+    f = _tab_titles_file()
+    try:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        with _paths.file_lock(f):
+            try:
+                cur = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                cur = {}
+            if not isinstance(cur, dict):
+                cur = {}
+            cur[tab_name] = title
+            _paths.atomic_write_text(f, json.dumps(cur, ensure_ascii=False, indent=2))
+    except OSError:
+        pass
+
+
+def take_tab_title(tab_name: str) -> str:
+    """Full title the compaction left for ``tab_name`` (consumed), or ""."""
+    f = _tab_titles_file()
+    if not f.is_file():
+        return ""
+    try:
+        with _paths.file_lock(f):
+            cur = json.loads(f.read_text(encoding="utf-8"))
+            if not isinstance(cur, dict) or tab_name not in cur:
+                return ""
+            title = str(cur.pop(tab_name) or "")
+            _paths.atomic_write_text(f, json.dumps(cur, ensure_ascii=False, indent=2))
+            return title
+    except (OSError, ValueError):
+        return ""
+
+
 def _is_led_generated_name(name: str) -> bool:
     if not name:
         return True
@@ -560,7 +613,7 @@ def sync_led_tmux_tabs(
             and s.dash_win_name != prev
             and not _is_led_generated_name(s.dash_win_name)
         ):
-            title = s.dash_win_name.strip()
+            title = take_tab_title(s.dash_win_name) or s.dash_win_name.strip()
             renames.append((s.conversation_id, title))
             view = _copy.copy(s)  # this tick's label already shows the new title
             view.title = title

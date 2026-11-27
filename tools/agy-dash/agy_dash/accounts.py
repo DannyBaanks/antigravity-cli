@@ -26,6 +26,7 @@ _SHARED_AGY_DATA_ITEMS = (
     "conversation_summaries.db",
     "conversation_summaries.db-shm",
     "conversation_summaries.db-wal",
+    "jetbox_summaries_proto.pb",
     "settings.json",
     "mcp",
     "builtin",
@@ -927,7 +928,7 @@ def rescue_diverged_shared(slot: str, *, accounts_dir: Path | None = None) -> Pa
         return None
     acct_root = accounts_dir or _paths.ACCOUNTS_DIR
     slot_home = acct_root / validate_slot_name(slot) / "home"
-    dest = acct_root / ".rescued" / f"{validate_slot_name(slot)}-{time.strftime('%Y%m%d-%H%M%S')}"
+    dest = acct_root / ".rescued" / f"{validate_slot_name(slot)}-{_paths.format_display_clock(fmt='%Y%m%d-%H%M%S')}"
     for fp in items:
         target = dest / fp.relative_to(slot_home)
         target.parent.mkdir(parents=True, exist_ok=True)

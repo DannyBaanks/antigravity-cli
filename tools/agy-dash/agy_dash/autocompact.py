@@ -6,6 +6,11 @@ herramienta; el payload trae ``lastUserInput`` (texto del prompt) aunque la doc 
 no lo liste; ``terminationBehavior: "terminate"`` + ``errorMessage`` corta el turno sin
 llamar al modelo (``agy -p`` sale con código 3). Solo se actúa en ``invocationNum == 0``
 para no cortar nunca un turno a medias.
+
+2026-11-27 (paridad con claude-dash): activo por defecto (``AGY_DASH_MACHINE_COMPACT=0`` lo
+apaga); mientras una compactación de la conversación sigue viva, cada prompt se corta antes del
+modelo y se guarda en cola (``compacted/.queued_<id>.jsonl``) para entregarlo al continuar, en vez
+de mandarle al modelo el contexto gigante.
 """
 from __future__ import annotations
 
@@ -55,15 +60,130 @@ def last_user_input(transcript_path: str | Path) -> str:
     return last_content
 
 
-def _spawn_detached(argv: list[str]) -> None:
-    """Lanza un worker separado y sin descriptores estándar compartidos."""
-    subprocess.Popen(
-        argv,
-        start_new_session=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+def _spawn_detached(argv: list[str]) -> subprocess.Popen:
+    """Lanza un worker separado con salida en `.last_self_compact.log` (respaldo DEVNULL)."""
+    log_fh = None
+    try:
+        _paths.COMPACTED_DIR.mkdir(parents=True, exist_ok=True)
+        log_fh = (_paths.COMPACTED_DIR / ".last_self_compact.log").open("ab")
+    except OSError:
+        log_fh = None
+    try:
+        return subprocess.Popen(
+            argv,
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=log_fh if log_fh is not None else subprocess.DEVNULL,
+            stderr=log_fh if log_fh is not None else subprocess.DEVNULL,
+        )
+    finally:
+        if log_fh is not None:
+            log_fh.close()
+
+
+def running_file(conv_id: str) -> Path:
+    return _paths.COMPACTED_DIR / f".running_{conv_id}.json"
+
+
+def queue_file(conv_id: str) -> Path:
+    return _paths.COMPACTED_DIR / f".queued_{conv_id}.jsonl"
+
+
+def _pid_runs_compaction(pid: int, conv_id: str, proc_root: Path = Path("/proc")) -> bool:
+    """The worker started for ``conv_id`` is still alive (its argv names the conversation)."""
+    try:
+        argv = (proc_root / str(pid) / "cmdline").read_bytes().split(b"\0")
+    except OSError:
+        return False
+    joined = [a.decode("utf-8", "replace") for a in argv]
+    return "self-compact" in joined and conv_id in joined
+
+
+def compaction_running(conv_id: str, proc_root: Path = Path("/proc")) -> bool:
+    try:
+        pid = int(json.loads(running_file(conv_id).read_text(encoding="utf-8")).get("pid") or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+    return pid > 0 and _pid_runs_compaction(pid, conv_id, proc_root)
+
+
+def _norm(text: str) -> str:
+    return " ".join(str(text or "").split())
+
+
+def _known_prompts(conv_id: str) -> set[str]:
+    """Prompts this compaction already carries: its ``resume_prompt`` plus everything queued."""
+    known: set[str] = set()
+    try:
+        info = json.loads(running_file(conv_id).read_text(encoding="utf-8"))
+        if isinstance(info, dict) and info.get("resume_prompt"):
+            known.add(_norm(info["resume_prompt"]))
+    except (OSError, ValueError, TypeError):
+        pass
+    try:
+        for line in queue_file(conv_id).read_text(encoding="utf-8").splitlines():
+            try:
+                known.add(_norm(json.loads(line).get("text") or ""))
+            except (json.JSONDecodeError, AttributeError):
+                continue
+    except OSError:
+        pass
+    known.discard("")
+    return known
+
+
+def enqueue(conv_id: str, text: str, timestamp: float) -> bool:
+    """Queue ``text`` unless this compaction already carries it. Returns True if it was added.
+
+    AGY re-fires PreInvocation every ~140 ms with the same ``lastUserInput`` after a terminate
+    (2026-11-27: 56 copies of one prompt in 8 s), so the same text must never be queued twice.
+    """
+    if _norm(text) in _known_prompts(conv_id):
+        return False
+    f = queue_file(conv_id)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    with f.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"at": timestamp, "text": text}, ensure_ascii=False) + "\n")
+    return True
+
+
+def drain_queue(conv_id: str) -> list[str]:
+    """Prompts that arrived while compacting, oldest first; the file is consumed."""
+    f = queue_file(conv_id)
+    try:
+        lines = f.read_text(encoding="utf-8").splitlines()
+        f.unlink()
+    except OSError:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        try:
+            text = str(json.loads(line).get("text") or "").strip()
+        except (json.JSONDecodeError, AttributeError):
+            continue
+        key = _norm(text)
+        if key and key not in seen:  # queues written before the dedupe fix hold repeats
+            seen.add(key)
+            out.append(text)
+    return out
+
+
+_SILENT_REPEATS = 25
+
+
+def _bump_repeats(conv_id: str) -> int:
+    f = _paths.COMPACTED_DIR / f".repeats_{conv_id}"
+    try:
+        n = int(f.read_text(encoding="utf-8").strip() or 0) + 1
+    except (OSError, ValueError):
+        n = 1
+    try:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(str(n), encoding="utf-8")
+    except OSError:
+        pass
+    return n
 
 
 def _recently_compacted(marker: Path, timestamp: float) -> bool:
@@ -82,6 +202,7 @@ def decide(
     measure: Callable | None = None,
     spawn: Callable | None = None,
     now: float | Callable[[], float] | None = None,
+    running: Callable[[str], bool] | None = None,
 ) -> dict:
     """Decide si el hook debe terminar el turno y comenzar una compactación.
 
@@ -92,7 +213,7 @@ def decide(
     """
     try:
         active_env = os.environ if env is None else env
-        if active_env.get("AGY_DASH_MACHINE_COMPACT") != "1":
+        if active_env.get("AGY_DASH_MACHINE_COMPACT", "1") == "0":
             return {}
 
         invocation_num = payload.get("invocationNum", 0)
@@ -113,11 +234,33 @@ def decide(
 
         clock_value = now() if callable(now) else now
         timestamp = time.time() if clock_value is None else float(clock_value)
+
+        # A compaction of this conversation is still running: the model must not read the huge
+        # context now. Cut the turn and keep the prompt for the continuation (claude-dash parity).
+        if (running or compaction_running)(conv_id):
+            text = "" if forced else user_input.strip()
+            if text and not enqueue(conv_id, text, timestamp):
+                # Same prompt again: AGY re-firing the hook, not Danny typing. Cut silently, so the
+                # tab is not flooded with one warning line per retry; the worker presses Esc to end
+                # the loop. If it could not (tab outside the dash), AGY only gives up after visible
+                # errors (2026-11-27: ~56 in 8 s), so past _SILENT_REPEATS show the message again.
+                if _bump_repeats(conv_id) <= _SILENT_REPEATS:
+                    return {"terminationBehavior": "terminate"}
+            note = ("tu mensaje queda en cola y se entrega al continuar" if text
+                    else "ya está en curso; no hace falta pedirla otra vez")
+            return {
+                "injectSteps": [{"errorMessage": {"userMessage":
+                                 f"🗜 compactando con NVIDIA: {note}. Esta pestaña se relanza sola."}}],
+                "terminationBehavior": "terminate",
+            }
+
         marker = _paths.HEARTBEATS_DIR / f"{conv_id}.autocompact"
         if _recently_compacted(marker, timestamp):
             return {}
 
         threshold = int(active_env.get("AGY_DASH_AUTO_COMPACT_TOKENS", "250000"))
+        if threshold <= 0 and not forced:
+            return {}
         model_name = str(payload.get("modelName") or "")
         measure_fn = measure or _compact.measure_session_context
         metrics = measure_fn(
@@ -133,19 +276,37 @@ def decide(
             resume_prompt = command_input[len(_COMPACT_COMMAND) :].strip() or "continúa"
         else:
             resume_prompt = user_input.strip() or "continúa"
+        cwd = str(payload.get("cwd") or "").strip()
+        if not cwd:
+            ws_list = payload.get("workspacePaths")
+            if isinstance(ws_list, list) and ws_list:
+                cwd = str(ws_list[0] or "").strip()
         argv = [
             sys.executable,
             str(_paths.SELF_PATH),
             "self-compact",
             conv_id,
+            "--hook-cut",
             "--resume-prompt",
             resume_prompt,
         ]
+        if cwd:
+            argv.extend(["--cwd", cwd])
 
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(str(timestamp), encoding="utf-8")
         try:
-            (spawn or _spawn_detached)(argv)
+            (_paths.COMPACTED_DIR / f".repeats_{conv_id}").unlink()
+        except OSError:
+            pass
+        try:
+            proc = (spawn or _spawn_detached)(argv)
+            pid = getattr(proc, "pid", 0)
+            if isinstance(pid, int) and pid > 0:
+                rf = running_file(conv_id)
+                rf.parent.mkdir(parents=True, exist_ok=True)
+                rf.write_text(json.dumps({"pid": pid, "at": timestamp, "resume_prompt": resume_prompt},
+                                         ensure_ascii=False), encoding="utf-8")
         except Exception:
             try:
                 marker.unlink()

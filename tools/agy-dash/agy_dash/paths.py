@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import fcntl
 import os
+import re
 import tempfile
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 @contextlib.contextmanager
@@ -52,12 +55,14 @@ ZIG_CORE_BIN = SCRIPT_DIR / "agy-fast-core"
 AGY_DATA_DIR = HOME / ".gemini" / "antigravity-cli"
 SUMMARIES_DB = AGY_DATA_DIR / "conversation_summaries.db"
 BRAIN_DIR = AGY_DATA_DIR / "brain"
+CONVERSATIONS_DIR = AGY_DATA_DIR / "conversations"
 PRESENCE_DIR = AGY_DATA_DIR / "presence"
 HIBERNATED_FILE = AGY_DATA_DIR / "dashboard_hibernated.json"
 CUSTOM_TITLES_FILE = AGY_DATA_DIR / "custom_titles.json"
 NVAPI_CONFIG_FILE = AGY_DATA_DIR / "nvapi_config.json"
 COMPACTED_DIR = AGY_DATA_DIR / "compacted"
 HEARTBEATS_DIR = AGY_DATA_DIR / "heartbeats"
+SANDBOX_DIR = Path(os.environ.get("AGY_DASH_SANDBOX_DIR") or (AGY_DATA_DIR / "sandbox"))
 ACCOUNTS_DIR = AGY_DATA_DIR / "accounts"
 ACCOUNTS_REGISTRY = ACCOUNTS_DIR / "registry.json"
 TMUX_CONF = AGY_DATA_DIR / "agy-dash.tmux.conf"
@@ -104,5 +109,83 @@ MODEL_DISPLAY_TO_SLUG: dict[str, str] = {
 }
 
 PR_SET_MEMORY_MERGE = 67
+
+DEFAULT_TIMEZONE = os.environ.get("AGY_TZ") or "America/Mexico_City"
+_CDMX_TZ_NAME = "America/Mexico_City"
+_CDMX_FALLBACK_TZ = dt.timezone(dt.timedelta(hours=-6), "CDMX")
+_ISO_FRAC_RE = re.compile(r"(\.\d{6})\d+")
+
+
+def _configured_tz_name() -> str:
+    return (os.environ.get("AGY_TZ") or DEFAULT_TIMEZONE).strip() or _CDMX_TZ_NAME
+
+
+def display_timezone() -> dt.tzinfo:
+    """Return the configured display timezone (default: CDMX / America/Mexico_City)."""
+    tz_name = _configured_tz_name()
+    try:
+        return ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError, KeyError):
+        return _CDMX_FALLBACK_TZ
+
+
+def display_tz_label(moment: dt.datetime | None = None) -> str:
+    """Short human-friendly label for the display timezone ('CDMX' for America/Mexico_City)."""
+    tz_name = _configured_tz_name()
+    if tz_name.lower() in (_CDMX_TZ_NAME.lower(), "cdmx"):
+        return "CDMX"
+    tz = display_timezone()
+    ref = moment.astimezone(tz) if moment is not None else dt.datetime.now(tz)
+    return ref.tzname() or tz_name
+
+
+def parse_iso_utc(raw: str | None) -> dt.datetime | None:
+    """Parse an ISO-8601 timestamp (including Go nanosecond SQLite strings) into UTC datetime."""
+    s = str(raw or "").strip()
+    if not s or s.startswith("0001-"):
+        return None
+    s = _ISO_FRAC_RE.sub(r"\1", s.replace(" ", "T", 1))
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def format_display_clock(
+    ts: float | None = None,
+    fmt: str = "%H:%M:%S",
+    *,
+    with_tz: bool = False,
+) -> str:
+    """Format an epoch timestamp (or now) in the configured display timezone."""
+    tz = display_timezone()
+    moment = dt.datetime.now(tz) if ts is None else dt.datetime.fromtimestamp(ts, tz=tz)
+    out = moment.strftime(fmt)
+    return f"{out} {display_tz_label(moment)}" if with_tz else out
+
+
+def format_display_iso(
+    raw: str | None,
+    *,
+    fmt: str = "%Y-%m-%d %H:%M:%S",
+    with_tz: bool = True,
+    empty: str = "",
+) -> str:
+    """Convert an ISO UTC timestamp string into the configured display timezone (default CDMX)."""
+    s = str(raw or "").strip()
+    if not s:
+        return empty
+    parsed = parse_iso_utc(s)
+    if parsed is None:
+        return s
+    moment = parsed.astimezone(display_timezone())
+    out = moment.strftime(fmt)
+    return f"{out} {display_tz_label(moment)}" if with_tz else out
+
 
 SELF_PATH = SCRIPT_DIR / "agy_dashboard.py"  # the shim; tabs/hooks re-exec this file

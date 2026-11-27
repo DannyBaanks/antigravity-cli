@@ -22,13 +22,19 @@ from . import tmuxctl as _tmuxctl
 # External Context Compactor via NVIDIA NIM API (`nvapi` / Nemotron Ultra)
 # ============================================================================
 
+# Checked against NVIDIA's /v1/models on 2026-11-27: the old fallbacks (nemotron-3-ultra-550b,
+# llama-3_1-nemotron-ultra-253b-v1, llama-3.3-nemotron-super-49b-v1, llama-3.1-nemotron-70b-instruct)
+# are gone (HTTP 404/410 "end of life"), so a slow 550B left the compaction with no fallback at all.
 _NEMOTRON_CANDIDATE_MODELS = (
     "nvidia/nemotron-3-ultra-550b-a55b",
-    "nvidia/nemotron-3-ultra-550b",
-    "nvidia/llama-3_1-nemotron-ultra-253b-v1",
-    "nvidia/llama-3.3-nemotron-super-49b-v1",
-    "nvidia/llama-3.1-nemotron-70b-instruct",
+    "nvidia/nemotron-3.5-super-vl-120b-a12b",
+    "nvidia/nemotron-3.5-lightning-30b-a3b",
 )
+# Nemotron 3.5 writes its reasoning into `content` unless thinking is off (verified 2026-11-27).
+_NO_THINKING_MODELS = frozenset({
+    "nvidia/nemotron-3.5-super-vl-120b-a12b",
+    "nvidia/nemotron-3.5-lightning-30b-a3b",
+})
 
 
 def mask_api_key(key: str) -> str:
@@ -134,16 +140,43 @@ def should_offer_compaction(session: _sessions.AgySession) -> tuple[bool, int, i
     return (is_heavy, est_tok, size_b)
 
 
-def build_compaction_digest(conv_id: str, title: str, workspace: str, max_chars: int = 44000) -> tuple[str, int]:
+def _shells_now(conv_id: str, session: _sessions.AgySession | None = None) -> str:
+    """Sandbox jobs of `conv_id` + non-sandbox child shells running right now (those die on respawn)."""
+    try:
+        from . import sandbox as _sandbox
+        cur = session or _sessions.refresh_session(conv_id)
+        doomed: list[str] = []
+        if cur is not None and cur.proc is not None:
+            doomed = [
+                x.command
+                for x in _procs.shells_of(cur.proc.pid, cur.proc.active_children)
+                if _sandbox.blocks_close(x.command)
+            ]
+        return _sandbox.describe_for_digest(conv_id, doomed).replace(
+            "MURIÓ al compactar", "MORIRÁ al compactar"
+        )
+    except Exception:
+        return ""
+
+
+def build_compaction_digest(
+    conv_id: str,
+    title: str,
+    workspace: str,
+    max_chars: int = 44000,
+    *,
+    shells: str = "",
+) -> tuple[str, int]:
     """Extract high-signal user requests, tool actions, and recent turns from transcript.jsonl."""
     tpath = _sessions.transcript_path_for(conv_id)
+    shells_section = f"## SHELLS EN 2º PLANO\n{shells}\n\n" if shells.strip() else ""
     if not tpath.is_file():
-        return (f"Título: {title}\nWorkspace: {workspace}\n(Sin transcript.jsonl local)", 0)
+        return (f"Título: {title}\nWorkspace: {workspace}\n{shells_section}(Sin transcript.jsonl local)", 0)
 
     try:
         raw_bytes = tpath.read_bytes()
     except OSError:
-        return (f"Título: {title}\nWorkspace: {workspace}", 0)
+        return (f"Título: {title}\nWorkspace: {workspace}\n{shells_section}", 0)
 
     lines = [l for l in raw_bytes.decode("utf-8", errors="replace").splitlines() if l.strip().startswith("{")]
     user_prompts: list[str] = []
@@ -187,6 +220,7 @@ def build_compaction_digest(conv_id: str, title: str, workspace: str, max_chars:
         f"# Conversación a Compactar: {title} ({conv_id})\n"
         f"- Workspace: {workspace}\n"
         f"- Tamaño original: {len(raw_bytes) // 1024} KB (~{len(raw_bytes) // 4} tokens)\n\n"
+        f"{shells_section}"
         f"## Peticiones iniciales del usuario\n{head_users}\n\n"
         f"## Peticiones recientes del usuario\n{tail_users}\n\n"
         f"## Herramientas y archivos tocados recientemente\n{tools_sample}\n\n"
@@ -215,6 +249,93 @@ def _discover_nvapi_nemotron_model(base_url: str, api_key: str) -> str:
     return _paths.DEFAULT_NVAPI_MODEL
 
 
+SYSTEM_PROMPT = (
+    "Eres un compactador experto de contexto para sesiones de ingeniería de software (Antigravity CLI). "
+    "La PRIMERA línea de tu respuesta es exactamente `TÍTULO: <2 a 5 palabras en español que digan en qué se está "
+    "trabajando ahora, concreto (p. ej. `TÍTULO: Hook autocompact sin duplicados`), sin comillas ni emojis>`.\n"
+    "Después resume la conversación en español en un documento Markdown ultra-denso (<1200 palabras) con estas secciones exactas:\n"
+    "1. OBJETIVO Y PETICIONES DEL USUARIO\n"
+    "2. TRABAJO COMPLETADO Y DECISIONES TÉCNICAS\n"
+    "3. ARCHIVOS MODIFICADOS / RUTAS Y COMANDOS CLAVE\n"
+    "4. ESTADO ACTUAL EXACTO\n"
+    "5. SIGUIENTE PASO ACCIONABLE INMEDIATO\n"
+    "Conserva rutas exactas, hashes de commits, nombres de funciones y errores pendientes sin inventar nada. "
+    "Si hay sección SHELLS EN 2º PLANO, en 5. SIGUIENTE PASO ordena reenganchar cada job que SIGUE CORRIENDO con "
+    "`agy-dash sbx wait <id>` en 2º plano antes de seguir; los que murieron, relanzarlos solo si hacen falta."
+)
+
+
+_TITLE_LINE_RE = re.compile(r"^\W*T[IÍ]TU?LO?\W*:\s*(.+)$", re.IGNORECASE)
+_GENERIC_TITLE_RE = re.compile(
+    r"^(sesi[oó]n( activa)?[- ][0-9a-f]{4,}|session|"
+    r"(retomar|restaurar|cargar|load|resume|continuar|continue)\b.*\b(contexto|context|sesi[oó]n|session|handoff)\b.*)$",
+    re.IGNORECASE,
+)
+_TOPIC_MAX = 48
+
+
+def _clean_topic(text: str) -> str:
+    t = re.sub(r"[`*_#>\[\]\"“”]+", "", text)
+    t = " ".join(t.split()).strip(" .:-")
+    if len(t) > _TOPIC_MAX:
+        t = t[:_TOPIC_MAX].rsplit(" ", 1)[0]
+    return t
+
+
+def split_topic(summary: str) -> tuple[str, str]:
+    """(topic, summary without the TÍTULO line). Without that line, falls back to the first
+    sentence of section 1 (OBJETIVO), cut to a few words."""
+    lines = summary.splitlines()
+    for i, line in enumerate(lines[:6]):
+        m = _TITLE_LINE_RE.match(line.strip())
+        if m and _clean_topic(m.group(1)):
+            rest = "\n".join(lines[:i] + lines[i + 1:]).strip()
+            return _clean_topic(m.group(1)), rest
+    in_goal = False
+    for line in lines:
+        st = line.strip()
+        if re.match(r"^#+\s*1\.", st):
+            in_goal = True
+            continue
+        if in_goal and st and not st.startswith("#"):
+            st = re.sub(r"^[-*]\s+", "", st)  # bullet, not the ** of bold
+            st = re.sub(r"^\*\*[^*]{1,30}\*\*\s*:?\s*", "", st)  # "**Meta principal**:"
+            words = re.split(r"[.;:(]", st, 1)[0].split()
+            return _clean_topic(" ".join(words[:6])), summary
+        if in_goal and st.startswith("#"):
+            break
+    return "", summary
+
+
+def is_generic_title(title: str) -> bool:
+    """Titles that say nothing about the work: `Sesión 46960a2e`, the truncated `🗜Sesión-46960a2e`
+    tab names the compaction used to leave, or agy's own "Retomar Contexto De Sesión"."""
+    t = (title or "").strip()
+    if t.startswith("🗜"):
+        return True
+    t = re.sub(r"^[^\w]+", "", t).replace("-", " ") if t else t
+    return not t or bool(_GENERIC_TITLE_RE.match(t))
+
+
+def topic_from_handoff(handoff_file: Path) -> str:
+    try:
+        head = handoff_file.read_text(encoding="utf-8")[:2000]
+    except OSError:
+        return ""
+    m = re.search(r"^- \*\*Tema:\*\* (.+)$", head, re.MULTILINE)
+    return m.group(1).strip() if m else ""
+
+
+def adopt_topic(session: _sessions.AgySession, topic: str) -> None:
+    """Give a generically named session the compaction's topic (memory + custom_titles.json)."""
+    if not topic or not is_generic_title(session.title):
+        return
+    try:
+        session.title = _sessions.save_custom_title(session.conversation_id, topic) or topic
+    except Exception:
+        session.title = topic
+
+
 def compact_conversation_with_nvapi(
     session: _sessions.AgySession,
     *,
@@ -233,7 +354,10 @@ def compact_conversation_with_nvapi(
             None,
         )
 
-    digest, orig_bytes = build_compaction_digest(session.conversation_id, session.title, session.workspace)
+    shells_block = _shells_now(session.conversation_id, session)
+    digest, orig_bytes = build_compaction_digest(
+        session.conversation_id, session.title, session.workspace, shells=shells_block
+    )
     orig_tokens = max(session.step_count * 140, orig_bytes // 4)
     base_url = cfg["base_url"]
     if not _nvapi_url_ok(base_url):
@@ -247,25 +371,22 @@ def compact_conversation_with_nvapi(
     if chosen_model.lower() == "auto":
         chosen_model = _discover_nvapi_nemotron_model(base_url, api_key)
 
-    sys_prompt = (
-        "Eres un compactador experto de contexto para sesiones de ingeniería de software (Antigravity CLI). "
-        "Resume la conversación en español en un documento Markdown ultra-denso (<1200 palabras) con estas secciones exactas:\n"
-        "1. OBJETIVO Y PETICIONES DEL USUARIO\n"
-        "2. TRABAJO COMPLETADO Y DECISIONES TÉCNICAS\n"
-        "3. ARCHIVOS MODIFICADOS / RUTAS Y COMANDOS CLAVE\n"
-        "4. ESTADO ACTUAL EXACTO\n"
-        "5. SIGUIENTE PASO ACCIONABLE INMEDIATO\n"
-        "Conserva rutas exactas, hashes de commits, nombres de funciones y errores pendientes sin inventar nada."
-    )
+    sys_prompt = SYSTEM_PROMPT
 
     candidates = [chosen_model] + [m for m in _NEMOTRON_CANDIDATE_MODELS if m != chosen_model]
     url_open = opener or _NO_REDIRECT_OPENER.open
     summary_text = ""
     used_model = chosen_model
     last_err = ""
+    cand_prev = chosen_model
+    errors: list[str] = []  # one per failed candidate: the last error alone hid the real cause
 
     for cand in candidates:
-        payload = json.dumps({
+        if last_err:
+            errors.append(f"{cand_prev}: {last_err}")
+            last_err = ""
+        cand_prev = cand
+        req_body = {
             "model": cand,
             "messages": [
                 {"role": "system", "content": sys_prompt},
@@ -273,7 +394,10 @@ def compact_conversation_with_nvapi(
             ],
             "temperature": 0.2,
             "max_tokens": 2048,
-        }).encode("utf-8")
+        }
+        if cand in _NO_THINKING_MODELS:
+            req_body["chat_template_kwargs"] = {"enable_thinking": False}
+        payload = json.dumps(req_body).encode("utf-8")
         req = urllib.request.Request(
             f"{base_url}/chat/completions",
             data=payload,
@@ -317,8 +441,12 @@ def compact_conversation_with_nvapi(
             break
 
     if not summary_text:
-        return (False, f"❌ Falló compactación NVAPI ({used_model}): {last_err or 'respuesta vacía'}", None)
+        if last_err:
+            errors.append(f"{cand_prev}: {last_err}")
+        detail = " · ".join(errors) or "respuesta vacía"
+        return (False, f"❌ Falló compactación NVAPI ({chosen_model} y respaldos): {detail}", None)
 
+    topic, summary_text = split_topic(summary_text)
     out_dir = handoffs_dir or _paths.COMPACTED_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     handoff_file = out_dir / f"{session.conversation_id[:8]}_handoff.md"
@@ -327,18 +455,60 @@ def compact_conversation_with_nvapi(
     header = (
         f"# 🗜️ Handoff Compactado por NVIDIA NIM (`{used_model}`)\n"
         f"- **Conversación original:** `{session.conversation_id}` ({session.title})\n"
-        f"- **Workspace:** `{session.workspace}`\n"
+        + (f"- **Tema:** {topic}\n" if topic else "")
+        + f"- **Workspace:** `{session.workspace}`\n"
         f"- **Reducción de contexto:** `~{orig_tokens:,} tokens` -> `~{compact_tokens:,} tokens` (**{saved_pct}% ahorrado**)\n\n"
     )
-    handoff_file.write_text(header + summary_text + "\n", encoding="utf-8")
+    shells_footer = (
+        f"\n\n## SHELLS EN 2º PLANO al compactar\n{shells_block}\n"
+        if shells_block.strip()
+        else ""
+    )
+    handoff_file.write_text(header + summary_text + shells_footer + "\n", encoding="utf-8")
     try:
         os.chmod(handoff_file, 0o600)
     except OSError:
         pass
+    adopt_topic(session, topic)
     return (
         True,
         f"🗜️ Compactada con `{used_model}`: ~{orig_tokens:,} -> ~{compact_tokens:,} tokens ({saved_pct}% ahorro).",
         handoff_file,
+    )
+
+
+def _sandbox_clause(conv_id: str) -> str:
+    try:
+        from . import sandbox as _sandbox
+        block = _sandbox.describe_for_digest(conv_id)
+    except Exception:
+        block = ""
+    if not block.strip():
+        return ""
+    return (
+        " Antes de seguir, reengancha en 2º plano (`run_command` con `WaitMsBeforeAsync=500`) "
+        f"los shells del sandbox que siguen vivos:\n{block}"
+    )
+
+
+def continue_prompt(info: dict, resume_prompt: str = "") -> str:
+    nxt = resume_prompt.strip() or "continúa exactamente donde quedaste."
+    shells = ""
+    if info.get("shells_block"):
+        shells = (
+            " Antes de seguir, reengancha en 2º plano (`run_command` con `WaitMsBeforeAsync=500`) "
+            f"los shells que siguen vivos:\n{info['shells_block']}\n"
+        )
+    queued = ""
+    if info.get("queued"):
+        queued = (
+            " Mientras se compactaba llegaron estos mensajes (no los viste; atiéndelos):\n"
+            + "\n---\n".join(info["queued"])
+            + "\n"
+        )
+    return (
+        f"[agy-dash] {info.get('message', 'Contexto compactado con NVIDIA')}."
+        f"{shells}{queued} Sigue trabajando: {nxt}"
     )
 
 
@@ -348,11 +518,14 @@ def open_compacted_session_in_tab(session: _sessions.AgySession, handoff_file: P
     cwd = session.workspace if Path(session.workspace).is_dir() else str(Path.cwd())
     reg = _accounts.load_accounts_registry()
     slot = reg.get("conv_accounts", {}).get(session.conversation_id) or reg.get("active_slot", "primary")
+    adopt_topic(session, topic_from_handoff(handoff_file))
     tab_name = _tmuxctl._short_tab_title(session.title, prefix="🗜")
+    _tmuxctl.remember_tab_title(tab_name, session.title)
+    sbx_clause = _sandbox_clause(session.conversation_id)
     boot_prompt = (
         f"Contexto compactado de la sesión '{session.title}' ({session.conversation_id[:8]}). "
         f"Ejecuta primero la tool de ISyMCP `isymcp(action='handoff.load', arguments={{'target': '{session.conversation_id[:8]}', 'workspace': '{cwd}'}})` "
-        f"(o lee `{handoff_file}` si no está disponible) para obtener el handoff y contexto ziggrep en un solo paso y confirma que estás listo."
+        f"(o lee `{handoff_file}` si no está disponible) para obtener el handoff y contexto ziggrep en un solo paso y confirma que estás listo.{sbx_clause}"
     )
     cmd = (
         f"exec python3 {_tmuxctl.sh_quote(str(self_path))} run "
@@ -621,25 +794,95 @@ def evaluate_context_heartbeat(
     }
 
 
+RELAUNCH_WAIT_S = 8.0  # the respawned pane must still be alive this long after the relaunch
+
+
+def await_pane_alive(target: str, timeout_s: float = RELAUNCH_WAIT_S, poll_s: float = 0.5,
+                     tmux=None, clock=time.time, sleep=time.sleep) -> tuple[bool, str]:
+    """True once the respawned pane has stayed alive ``timeout_s`` (agy crashing at start, a bad
+    account slot or a missing binary leave it dead or close the window). claude-dash parity: never
+    say "continuada" without checking anything ran."""
+    tmux = tmux or _tmuxctl.tmux_cmd
+    deadline = clock() + timeout_s
+    while True:
+        cp = tmux("display-message", "-p", "-t", target, "#{pane_dead} #{pane_dead_status}", capture=True)
+        out = (getattr(cp, "stdout", "") or "").split()
+        if getattr(cp, "returncode", 1) != 0 or not out:
+            return False, "la pestaña se cerró al relanzar"
+        if out[0] == "1":
+            return False, f"agy salió al arrancar (código {out[1] if len(out) > 1 else '?'})"
+        if clock() >= deadline:
+            return True, ""
+        sleep(poll_s)
+
+
+def interrupt_cut_turn(conv_id: str, win_idx: str, *, settle_s: float = 1.0, tmux=None, sleep=time.sleep,
+                       is_active=None) -> bool:
+    """Press Esc in the tab whose turn the PreInvocation hook just cut.
+
+    2026-11-27: after a hook terminate AGY keeps re-firing PreInvocation ~5×/s ("Generating…",
+    terminal bell on every cut) and never goes idle, so the worker waited forever to relaunch.
+    Esc ends that loop (verified live on tab ad905bc6: 21 hook calls/4 s -> 1). Only called by the
+    hook-started worker BEFORE the relaunch, and only on the tab still bound to ``conv_id``."""
+    if not win_idx:
+        return False
+    run = tmux or _tmuxctl.tmux_cmd
+    target = f"{_paths.TMUX_SESSION}:{win_idx}"
+    sleep(settle_s)
+    cp = run("display-message", "-p", "-t", target, "#{@agy_conv_id}", capture=True)
+    bound = (getattr(cp, "stdout", "") or "").strip()
+    if getattr(cp, "returncode", 1) != 0 or (bound and bound != conv_id):
+        return False
+    def _busy(cid: str) -> bool:  # same signals the worker's wait loop treats as "turn not over"
+        cur = _sessions.refresh_session(cid)
+        return (cur is not None and cur.db_status == "CASCADE_RUN_STATUS_RUNNING") or \
+            _sessions.is_transcript_turn_active(cid, max_recent_sec=5.0)
+    active = is_active or _busy
+    if not active(conv_id):
+        return False
+    run("send-keys", "-t", target, "Escape")
+    return True
+
+
+def _queued_clause(conv_id: str) -> str:
+    from . import autocompact as _autocompact
+    queued = _autocompact.drain_queue(conv_id)
+    if not queued:
+        return ""
+    items = " | ".join(q.replace("\n", " ")[:600] for q in queued[-10:])
+    return f" Mensajes de Danny que llegaron mientras se compactaba (atiéndelos en orden): {items}"
+
+
 def respawn_compacted_session_in_place(
     session: _sessions.AgySession,
     handoff_file: Path,
     *,
     resume_prompt: str = "",
     win_idx: str | None = None,
+    verify=None,
 ) -> str:
     """Replace the active session's tmux pane in-place with a lightweight Nemotron-compacted continuation."""
+    target_win = win_idx if win_idx is not None else _tmuxctl._find_tmux_window_by_conv(session.conversation_id)
+    if target_win is None:
+        # Outside the dash: opening a new tab while the original agy is still open elsewhere would
+        # leave two sessions writing on the same work. Hand the user one line instead.
+        cur = _sessions.refresh_session(session.conversation_id)
+        if cur is not None and cur.proc is not None:
+            return (f"🗜 handoff listo en el Baúl; agy sigue abierto fuera del dash. Ciérralo y corre: "
+                    f"agy-dash self-compact {session.conversation_id[:8]} --respawn-only")
     self_path = _paths.SELF_PATH
     cwd = session.workspace if Path(session.workspace).is_dir() else str(Path.cwd())
     reg = _accounts.load_accounts_registry()
     slot = reg.get("conv_accounts", {}).get(session.conversation_id) or reg.get("active_slot", "primary")
+    adopt_topic(session, topic_from_handoff(handoff_file))
     tab_name = _tmuxctl._short_tab_title(session.title, prefix="🗜")
+    _tmuxctl.remember_tab_title(tab_name, session.title)
 
     cont_clause = (
         f" y continúa inmediatamente con: {resume_prompt.strip()}"
         if resume_prompt.strip()
         else " y confirma que estás listo para continuar."
-    )
+    ) + _queued_clause(session.conversation_id) + _sandbox_clause(session.conversation_id)
     boot_prompt = (
         f"Contexto compactado con NVIDIA Nemotron 550B de tu sesión '{session.title}' ({session.conversation_id[:8]}). "
         f"Ejecuta ÚNICAMENTE una llamada a `agy_handoff_context` (o `isymcp(action='handoff.load', arguments={{'target': '{session.conversation_id[:8]}', 'workspace': '{cwd}'}})` — si aún no está cargada en este hub, lee `{handoff_file}`){cont_clause}"
@@ -650,10 +893,17 @@ def respawn_compacted_session_in_place(
         f"-- -i {_tmuxctl.sh_quote(boot_prompt)}"
     )
 
-    target_win = win_idx if win_idx is not None else _tmuxctl._find_tmux_window_by_conv(session.conversation_id)
     if target_win is not None:
-        _tmuxctl.tmux_cmd("rename-window", "-t", f"{_paths.TMUX_SESSION}:{target_win}", tab_name)
-        _tmuxctl.tmux_cmd("respawn-pane", "-k", "-t", f"{_paths.TMUX_SESSION}:{target_win}", cmd)
+        target = f"{_paths.TMUX_SESSION}:{target_win}"
+        _tmuxctl.tmux_cmd("rename-window", "-t", target, tab_name)
+        rp = _tmuxctl.tmux_cmd("respawn-pane", "-k", "-t", target, cmd)
+        if getattr(rp, "returncode", 0) != 0:
+            return (f"⚠ handoff listo en el Baúl, pero tmux no pudo relanzar la pestaña {target_win}; "
+                    f"corre: agy-dash self-compact {session.conversation_id[:8]} --respawn-only")
+        ok, why = (verify or await_pane_alive)(target)
+        if not ok:
+            return (f"⚠ handoff listo en el Baúl, pero {why}; "
+                    f"corre: agy-dash self-compact {session.conversation_id[:8]} --respawn-only")
         return f"♻️ Sesión '{session.title}' compactada con Nemotron 550B y continuada in-place en pestaña `{tab_name}`."
 
     _tmuxctl.tmux_cmd("new-window", "-t", _paths.TMUX_SESSION, "-n", tab_name, "-c", cwd, cmd)

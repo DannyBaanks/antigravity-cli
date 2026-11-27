@@ -123,12 +123,13 @@ class FooterAndButtonTests(unittest.TestCase):
 
     def test_buttons_are_a_short_grid_and_labels_fit(self) -> None:
         btns = tui.build_command_buttons(44)
-        self.assertLessEqual(len(btns), 10)
+        self.assertLessEqual(len(btns), 12)
         self.assertTrue(all(b.row_offset <= 8 for b in btns))
         self.assertEqual(len({(b.row_offset, b.col_offset) for b in btns}), len(btns))
+        allowed_actions = set(ORIGINAL_ACTIONS) | {"delete", "multi_select"}
         for b in btns:
             with self.subTest(action=b.action_id):
-                self.assertIn(b.action_id, ORIGINAL_ACTIONS)
+                self.assertIn(b.action_id, allowed_actions)
                 self.assertLessEqual(tt.text_cols(f" {b.label}"), b.width)
                 self.assertEqual(tui.hit_test_button(btns, 0, 6, b.col_offset, 6 + b.row_offset), b.action_id)
 
@@ -219,7 +220,7 @@ class RenderTests(unittest.TestCase):
         insp = [t for t in texts if "ctx 12%" in t]
         self.assertTrue(insp, "el inspector muestra contexto al principio")
         row = next(y for y, _, t in win.writes if "ctx 12%" in t)
-        self.assertEqual(row, 12)  # rejilla de botones en 6..10, regla en 11, inspector desde 12
+        self.assertEqual(row, 13)  # rejilla de botones en 6..11, regla en 12, inspector desde 13
 
     def test_compaction_modal_has_no_key_list_and_footer_has_keys(self) -> None:
         session = _sessions.AgySession(
@@ -252,7 +253,7 @@ class RenderTests(unittest.TestCase):
         dash.draw(now=1.0)
         row3 = [t for y, _, t in win.writes if y == 3]
         self.assertTrue(any("escaneo de procesos falló" in t for t in row3))
-        for action in ("open", "hibernate", "hib_all", "dedup", "open_full"):
+        for action in ("open", "hibernate", "hib_all", "dedup", "delete", "multi_select", "open_full"):
             with self.subTest(action=action):
                 self.assertIn("bloqueados", dash.execute_action(action))
 
