@@ -61,14 +61,24 @@ def last_user_input(transcript_path: str | Path) -> str:
 
 
 def _spawn_detached(argv: list[str]) -> subprocess.Popen:
-    """Lanza un worker separado y sin descriptores estándar compartidos."""
-    return subprocess.Popen(
-        argv,
-        start_new_session=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    """Lanza un worker separado con salida en `.last_self_compact.log` (respaldo DEVNULL)."""
+    log_fh = None
+    try:
+        _paths.COMPACTED_DIR.mkdir(parents=True, exist_ok=True)
+        log_fh = (_paths.COMPACTED_DIR / ".last_self_compact.log").open("ab")
+    except OSError:
+        log_fh = None
+    try:
+        return subprocess.Popen(
+            argv,
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=log_fh if log_fh is not None else subprocess.DEVNULL,
+            stderr=log_fh if log_fh is not None else subprocess.DEVNULL,
+        )
+    finally:
+        if log_fh is not None:
+            log_fh.close()
 
 
 def running_file(conv_id: str) -> Path:
@@ -208,6 +218,11 @@ def decide(
             resume_prompt = command_input[len(_COMPACT_COMMAND) :].strip() or "continúa"
         else:
             resume_prompt = user_input.strip() or "continúa"
+        cwd = str(payload.get("cwd") or "").strip()
+        if not cwd:
+            ws_list = payload.get("workspacePaths")
+            if isinstance(ws_list, list) and ws_list:
+                cwd = str(ws_list[0] or "").strip()
         argv = [
             sys.executable,
             str(_paths.SELF_PATH),
@@ -216,6 +231,8 @@ def decide(
             "--resume-prompt",
             resume_prompt,
         ]
+        if cwd:
+            argv.extend(["--cwd", cwd])
 
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(str(timestamp), encoding="utf-8")

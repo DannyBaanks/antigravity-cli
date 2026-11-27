@@ -153,6 +153,10 @@ def is_transcript_turn_active(conv_id: str, max_recent_sec: float = 45.0, *, now
             if status != "DONE":
                 busy = True
                 break
+            if stype == "ERROR_MESSAGE":
+                # Hook termination (e.g. autocompact) or SDK error ended the turn without a planner reply
+                busy = False
+                break
             if stype in ("USER_INPUT", "GENERIC"):
                 # Only treat recent (<600s) unfinished tool/user turns as active
                 busy = age_s <= 600.0

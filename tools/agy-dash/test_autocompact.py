@@ -297,3 +297,71 @@ class InPlaceRelaunchTests(unittest.TestCase):
         self.assertEqual(self.cp.await_pane_alive("agy:1", tmux=dead)[0], False)
         gone = lambda *a, **k: subprocess.CompletedProcess(a, 1, "", "can't find window")
         self.assertIn("se cerró", self.cp.await_pane_alive("agy:1", tmux=gone)[1])
+
+
+class HookTerminationIdleTests(unittest.TestCase):
+    """After a hook terminates a turn (USER_INPUT + ERROR_MESSAGE DONE), the session is idle."""
+
+    def test_error_message_done_ends_turn_instead_of_600s_user_input_wait(self) -> None:
+        from agy_dash import sessions as ss
+
+        with tempfile.TemporaryDirectory() as td:
+            tpath = Path(td) / "transcript.jsonl"
+            tpath.write_text(
+                "\n".join([
+                    json.dumps({"step_index": 0, "type": "USER_INPUT", "status": "DONE", "content": "/compactnvidia"}),
+                    json.dumps({"step_index": 1, "type": "ERROR_MESSAGE", "status": "DONE", "error": "compactando"}),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            mtime = tpath.stat().st_mtime
+            ss._TRANSCRIPT_BUSY_CACHE.pop("conv-err-done", None)
+            with mock.patch.object(ss, "transcript_path_for", return_value=tpath):
+                # Within max_recent_sec (3s) -> still settling
+                self.assertTrue(ss.is_transcript_turn_active("conv-err-done", max_recent_sec=3.0, now=mtime + 1.0))
+                # Past max_recent_sec (e.g. 5s, NOT 600s!) -> idle immediately
+                self.assertFalse(ss.is_transcript_turn_active("conv-err-done", max_recent_sec=3.0, now=mtime + 5.0))
+
+    def test_user_input_without_error_message_stays_active(self) -> None:
+        from agy_dash import sessions as ss
+
+        with tempfile.TemporaryDirectory() as td:
+            tpath = Path(td) / "transcript.jsonl"
+            tpath.write_text(
+                json.dumps({"step_index": 0, "type": "USER_INPUT", "status": "DONE", "content": "trabaja"}) + "\n",
+                encoding="utf-8",
+            )
+            mtime = tpath.stat().st_mtime
+            ss._TRANSCRIPT_BUSY_CACHE.pop("conv-user-only", None)
+            with mock.patch.object(ss, "transcript_path_for", return_value=tpath):
+                self.assertTrue(ss.is_transcript_turn_active("conv-user-only", max_recent_sec=3.0, now=mtime + 10.0))
+
+    def test_spawn_detached_writes_worker_output_to_log(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cdir = Path(td) / "compacted"
+            with mock.patch.object(ac._paths, "COMPACTED_DIR", cdir):
+                proc = ac._spawn_detached([sys.executable, "-c", "print('worker-ok')"])
+                proc.wait(timeout=5)
+            self.assertIn("worker-ok", (cdir / ".last_self_compact.log").read_text(encoding="utf-8"))
+
+    def test_decide_forwards_workspace_cwd_to_self_compact(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            hb = Path(td) / "hb"
+            spawned = []
+            with mock.patch.object(ac._paths, "HEARTBEATS_DIR", hb), \
+                 mock.patch.object(ac._paths, "COMPACTED_DIR", Path(td) / "compacted"):
+                out = ac.decide(
+                    {
+                        "conversationId": "c-ws",
+                        "invocationNum": 0,
+                        "lastUserInput": "/compactnvidia sigue",
+                        "workspacePaths": ["/home/danny/Development/ISyCo"],
+                    },
+                    env={"AGY_DASH_MACHINE_COMPACT": "1"},
+                    measure=lambda *a, **k: {"used_tokens": 10},
+                    spawn=spawned.append,
+                    now=1000.0,
+                )
+            self.assertEqual(out.get("terminationBehavior"), "terminate")
+            self.assertIn("--cwd", spawned[0])
+            self.assertEqual(spawned[0][spawned[0].index("--cwd") + 1], "/home/danny/Development/ISyCo")
