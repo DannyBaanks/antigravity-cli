@@ -22,13 +22,19 @@ from . import tmuxctl as _tmuxctl
 # External Context Compactor via NVIDIA NIM API (`nvapi` / Nemotron Ultra)
 # ============================================================================
 
+# Checked against NVIDIA's /v1/models on 2026-11-27: the old fallbacks (nemotron-3-ultra-550b,
+# llama-3_1-nemotron-ultra-253b-v1, llama-3.3-nemotron-super-49b-v1, llama-3.1-nemotron-70b-instruct)
+# are gone (HTTP 404/410 "end of life"), so a slow 550B left the compaction with no fallback at all.
 _NEMOTRON_CANDIDATE_MODELS = (
     "nvidia/nemotron-3-ultra-550b-a55b",
-    "nvidia/nemotron-3-ultra-550b",
-    "nvidia/llama-3_1-nemotron-ultra-253b-v1",
-    "nvidia/llama-3.3-nemotron-super-49b-v1",
-    "nvidia/llama-3.1-nemotron-70b-instruct",
+    "nvidia/nemotron-3.5-super-vl-120b-a12b",
+    "nvidia/nemotron-3.5-lightning-30b-a3b",
 )
+# Nemotron 3.5 writes its reasoning into `content` unless thinking is off (verified 2026-11-27).
+_NO_THINKING_MODELS = frozenset({
+    "nvidia/nemotron-3.5-super-vl-120b-a12b",
+    "nvidia/nemotron-3.5-lightning-30b-a3b",
+})
 
 
 def mask_api_key(key: str) -> str:
@@ -299,9 +305,15 @@ def compact_conversation_with_nvapi(
     summary_text = ""
     used_model = chosen_model
     last_err = ""
+    cand_prev = chosen_model
+    errors: list[str] = []  # one per failed candidate: the last error alone hid the real cause
 
     for cand in candidates:
-        payload = json.dumps({
+        if last_err:
+            errors.append(f"{cand_prev}: {last_err}")
+            last_err = ""
+        cand_prev = cand
+        req_body = {
             "model": cand,
             "messages": [
                 {"role": "system", "content": sys_prompt},
@@ -309,7 +321,10 @@ def compact_conversation_with_nvapi(
             ],
             "temperature": 0.2,
             "max_tokens": 2048,
-        }).encode("utf-8")
+        }
+        if cand in _NO_THINKING_MODELS:
+            req_body["chat_template_kwargs"] = {"enable_thinking": False}
+        payload = json.dumps(req_body).encode("utf-8")
         req = urllib.request.Request(
             f"{base_url}/chat/completions",
             data=payload,
@@ -353,7 +368,10 @@ def compact_conversation_with_nvapi(
             break
 
     if not summary_text:
-        return (False, f"❌ Falló compactación NVAPI ({used_model}): {last_err or 'respuesta vacía'}", None)
+        if last_err:
+            errors.append(f"{cand_prev}: {last_err}")
+        detail = " · ".join(errors) or "respuesta vacía"
+        return (False, f"❌ Falló compactación NVAPI ({chosen_model} y respaldos): {detail}", None)
 
     out_dir = handoffs_dir or _paths.COMPACTED_DIR
     out_dir.mkdir(parents=True, exist_ok=True)

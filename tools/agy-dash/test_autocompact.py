@@ -158,6 +158,34 @@ class AutoCompactTests(unittest.TestCase):
         self.assertIn("ya está en curso", out["injectSteps"][0]["errorMessage"]["userMessage"])
         self.assertEqual(ac.drain_queue("conv-123"), [])
 
+    def test_hook_refire_storm_after_trigger_queues_nothing_and_stays_silent(self) -> None:
+        # 2026-11-27: after the terminate, AGY re-fired PreInvocation every ~140 ms with the same
+        # lastUserInput; each call queued the prompt again and printed one warning line (56 in 8 s).
+        self.payload["lastUserInput"] = "si pulamoslo"
+        self.spawn.return_value = mock.Mock(pid=4242)
+        first = self.decide(used_tokens=300000)
+        self.assertIn("compactando con NVIDIA", first["injectSteps"][0]["errorMessage"]["userMessage"])
+        for _ in range(56):
+            out = self.decide(used_tokens=300000, running=lambda cid: True)
+            self.assertEqual(out, {"terminationBehavior": "terminate"})
+        self.spawn.assert_called_once()
+        self.assertEqual(ac.drain_queue("conv-123"), [])  # already travels as --resume-prompt
+
+    def test_new_prompt_while_compacting_is_queued_once_then_silent(self) -> None:
+        self.payload["lastUserInput"] = "y luego corre los tests"
+        first = self.decide(used_tokens=10, running=lambda cid: True)
+        self.assertIn("en cola", first["injectSteps"][0]["errorMessage"]["userMessage"])
+        again = self.decide(used_tokens=10, running=lambda cid: True)
+        self.assertEqual(again, {"terminationBehavior": "terminate"})
+        self.assertEqual(ac.drain_queue("conv-123"), ["y luego corre los tests"])
+
+    def test_drain_dedupes_legacy_queue_with_repeats(self) -> None:
+        f = ac.queue_file("conv-123")
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("".join(json.dumps({"at": i, "text": t}) + "\n"
+                             for i, t in enumerate(["a", "a", "b", " a ", "b"])), encoding="utf-8")
+        self.assertEqual(ac.drain_queue("conv-123"), ["a", "b"])
+
     def test_worker_pid_is_recorded_and_liveness_checks_argv(self) -> None:
         self.write_transcript({"type": "USER_INPUT", "content": "sigue"})
         self.spawn.return_value = mock.Mock(pid=4242)
@@ -225,6 +253,56 @@ class LastUserInputPayloadTests(unittest.TestCase):
             self.assertEqual(out.get("terminationBehavior"), "terminate")
             self.assertEqual(spawned[0][-1], "sigue con X")
             self.assertIn("/compactnvidia", out["injectSteps"][0]["errorMessage"]["userMessage"])
+
+
+class NvapiFallbackTests(unittest.TestCase):
+    """2026-11-27: 550B timed out and every fallback was end-of-life (HTTP 410); the error blamed
+    the 550B with the 70B's 410 and the Nemotron 3.5 fallbacks need thinking off."""
+
+    def _run(self, opener):
+        from agy_dash import compact as cp
+        sess = mock.Mock(conversation_id="c1", title="T", workspace="/tmp", step_count=1)
+        cfg = {"api_key": "k", "base_url": "https://x.invalid/v1", "model": "nvidia/nemotron-3-ultra-550b-a55b"}
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        with mock.patch.object(cp, "load_nvapi_config", return_value=cfg), \
+             mock.patch.object(cp, "_shells_now", return_value=""), \
+             mock.patch.object(cp, "build_compaction_digest", return_value=("digest", 400)):
+            return cp.compact_conversation_with_nvapi(sess, handoffs_dir=Path(td.name), opener=opener)
+
+    def test_every_candidate_failure_is_named(self) -> None:
+        import urllib.error
+        seen = []
+
+        def opener(req, timeout=0):
+            seen.append(json.loads(req.data)["model"])
+            if len(seen) == 1:
+                raise urllib.error.URLError(TimeoutError("timed out"))
+            raise urllib.error.HTTPError(req.full_url, 410, "Gone", {}, None)
+        ok, msg, _ = self._run(opener)
+        self.assertFalse(ok)
+        self.assertEqual(len(seen), 3)
+        self.assertNotIn("nemotron-70b", " ".join(seen))
+        self.assertIn("nemotron-3-ultra-550b-a55b: timed out", msg)
+        self.assertIn("lightning-30b-a3b: HTTP 410", msg)
+
+    def test_fallback_answers_with_thinking_off(self) -> None:
+        import io
+        import urllib.error
+        bodies = []
+
+        def opener(req, timeout=0):
+            body = json.loads(req.data)
+            bodies.append(body)
+            if len(bodies) == 1:
+                raise urllib.error.URLError(TimeoutError("timed out"))
+            resp = mock.MagicMock()
+            resp.__enter__.return_value = io.BytesIO(b'{"choices":[{"message":{"content":"## 1. OBJ"}}]}')
+            return resp
+        ok, msg, hfile = self._run(opener)
+        self.assertTrue(ok, msg)
+        self.assertNotIn("chat_template_kwargs", bodies[0])
+        self.assertEqual(bodies[1]["chat_template_kwargs"], {"enable_thinking": False})
 
 
 class InPlaceRelaunchTests(unittest.TestCase):

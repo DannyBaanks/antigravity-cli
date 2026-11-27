@@ -107,11 +107,44 @@ def compaction_running(conv_id: str, proc_root: Path = Path("/proc")) -> bool:
     return pid > 0 and _pid_runs_compaction(pid, conv_id, proc_root)
 
 
-def enqueue(conv_id: str, text: str, timestamp: float) -> None:
+def _norm(text: str) -> str:
+    return " ".join(str(text or "").split())
+
+
+def _known_prompts(conv_id: str) -> set[str]:
+    """Prompts this compaction already carries: its ``resume_prompt`` plus everything queued."""
+    known: set[str] = set()
+    try:
+        info = json.loads(running_file(conv_id).read_text(encoding="utf-8"))
+        if isinstance(info, dict) and info.get("resume_prompt"):
+            known.add(_norm(info["resume_prompt"]))
+    except (OSError, ValueError, TypeError):
+        pass
+    try:
+        for line in queue_file(conv_id).read_text(encoding="utf-8").splitlines():
+            try:
+                known.add(_norm(json.loads(line).get("text") or ""))
+            except (json.JSONDecodeError, AttributeError):
+                continue
+    except OSError:
+        pass
+    known.discard("")
+    return known
+
+
+def enqueue(conv_id: str, text: str, timestamp: float) -> bool:
+    """Queue ``text`` unless this compaction already carries it. Returns True if it was added.
+
+    AGY re-fires PreInvocation every ~140 ms with the same ``lastUserInput`` after a terminate
+    (2026-11-27: 56 copies of one prompt in 8 s), so the same text must never be queued twice.
+    """
+    if _norm(text) in _known_prompts(conv_id):
+        return False
     f = queue_file(conv_id)
     f.parent.mkdir(parents=True, exist_ok=True)
     with f.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps({"at": timestamp, "text": text}, ensure_ascii=False) + "\n")
+    return True
 
 
 def drain_queue(conv_id: str) -> list[str]:
@@ -122,13 +155,16 @@ def drain_queue(conv_id: str) -> list[str]:
         f.unlink()
     except OSError:
         return []
-    out = []
+    out: list[str] = []
+    seen: set[str] = set()
     for line in lines:
         try:
             text = str(json.loads(line).get("text") or "").strip()
         except (json.JSONDecodeError, AttributeError):
             continue
-        if text:
+        key = _norm(text)
+        if key and key not in seen:  # queues written before the dedupe fix hold repeats
+            seen.add(key)
             out.append(text)
     return out
 
@@ -186,8 +222,10 @@ def decide(
         # context now. Cut the turn and keep the prompt for the continuation (claude-dash parity).
         if (running or compaction_running)(conv_id):
             text = "" if forced else user_input.strip()
-            if text:
-                enqueue(conv_id, text, timestamp)
+            if text and not enqueue(conv_id, text, timestamp):
+                # Same prompt again: AGY re-firing the hook, not Danny typing. Cut silently, so the
+                # tab is not flooded with one warning line per retry.
+                return {"terminationBehavior": "terminate"}
             note = ("tu mensaje queda en cola y se entrega al continuar" if text
                     else "ya está en curso; no hace falta pedirla otra vez")
             return {
@@ -242,7 +280,8 @@ def decide(
             if isinstance(pid, int) and pid > 0:
                 rf = running_file(conv_id)
                 rf.parent.mkdir(parents=True, exist_ok=True)
-                rf.write_text(json.dumps({"pid": pid, "at": timestamp}), encoding="utf-8")
+                rf.write_text(json.dumps({"pid": pid, "at": timestamp, "resume_prompt": resume_prompt},
+                                         ensure_ascii=False), encoding="utf-8")
         except Exception:
             try:
                 marker.unlink()
