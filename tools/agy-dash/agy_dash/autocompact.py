@@ -169,6 +169,23 @@ def drain_queue(conv_id: str) -> list[str]:
     return out
 
 
+_SILENT_REPEATS = 25
+
+
+def _bump_repeats(conv_id: str) -> int:
+    f = _paths.COMPACTED_DIR / f".repeats_{conv_id}"
+    try:
+        n = int(f.read_text(encoding="utf-8").strip() or 0) + 1
+    except (OSError, ValueError):
+        n = 1
+    try:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(str(n), encoding="utf-8")
+    except OSError:
+        pass
+    return n
+
+
 def _recently_compacted(marker: Path, timestamp: float) -> bool:
     try:
         previous = float(marker.read_text(encoding="utf-8").strip())
@@ -224,8 +241,11 @@ def decide(
             text = "" if forced else user_input.strip()
             if text and not enqueue(conv_id, text, timestamp):
                 # Same prompt again: AGY re-firing the hook, not Danny typing. Cut silently, so the
-                # tab is not flooded with one warning line per retry.
-                return {"terminationBehavior": "terminate"}
+                # tab is not flooded with one warning line per retry; the worker presses Esc to end
+                # the loop. If it could not (tab outside the dash), AGY only gives up after visible
+                # errors (2026-11-27: ~56 in 8 s), so past _SILENT_REPEATS show the message again.
+                if _bump_repeats(conv_id) <= _SILENT_REPEATS:
+                    return {"terminationBehavior": "terminate"}
             note = ("tu mensaje queda en cola y se entrega al continuar" if text
                     else "ya está en curso; no hace falta pedirla otra vez")
             return {
@@ -266,6 +286,7 @@ def decide(
             str(_paths.SELF_PATH),
             "self-compact",
             conv_id,
+            "--hook-cut",
             "--resume-prompt",
             resume_prompt,
         ]
@@ -274,6 +295,10 @@ def decide(
 
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(str(timestamp), encoding="utf-8")
+        try:
+            (_paths.COMPACTED_DIR / f".repeats_{conv_id}").unlink()
+        except OSError:
+            pass
         try:
             proc = (spawn or _spawn_detached)(argv)
             pid = getattr(proc, "pid", 0)

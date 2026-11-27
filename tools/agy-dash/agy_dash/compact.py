@@ -816,6 +816,34 @@ def await_pane_alive(target: str, timeout_s: float = RELAUNCH_WAIT_S, poll_s: fl
         sleep(poll_s)
 
 
+def interrupt_cut_turn(conv_id: str, win_idx: str, *, settle_s: float = 1.0, tmux=None, sleep=time.sleep,
+                       is_active=None) -> bool:
+    """Press Esc in the tab whose turn the PreInvocation hook just cut.
+
+    2026-11-27: after a hook terminate AGY keeps re-firing PreInvocation ~5×/s ("Generating…",
+    terminal bell on every cut) and never goes idle, so the worker waited forever to relaunch.
+    Esc ends that loop (verified live on tab ad905bc6: 21 hook calls/4 s -> 1). Only called by the
+    hook-started worker BEFORE the relaunch, and only on the tab still bound to ``conv_id``."""
+    if not win_idx:
+        return False
+    run = tmux or _tmuxctl.tmux_cmd
+    target = f"{_paths.TMUX_SESSION}:{win_idx}"
+    sleep(settle_s)
+    cp = run("display-message", "-p", "-t", target, "#{@agy_conv_id}", capture=True)
+    bound = (getattr(cp, "stdout", "") or "").strip()
+    if getattr(cp, "returncode", 1) != 0 or (bound and bound != conv_id):
+        return False
+    def _busy(cid: str) -> bool:  # same signals the worker's wait loop treats as "turn not over"
+        cur = _sessions.refresh_session(cid)
+        return (cur is not None and cur.db_status == "CASCADE_RUN_STATUS_RUNNING") or \
+            _sessions.is_transcript_turn_active(cid, max_recent_sec=5.0)
+    active = is_active or _busy
+    if not active(conv_id):
+        return False
+    run("send-keys", "-t", target, "Escape")
+    return True
+
+
 def _queued_clause(conv_id: str) -> str:
     from . import autocompact as _autocompact
     queued = _autocompact.drain_queue(conv_id)

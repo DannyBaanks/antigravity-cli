@@ -67,3 +67,24 @@ def test_led_rename_of_compacted_tab_saves_full_title(tmp_path: Path) -> None:
         renames = tc.sync_led_tmux_tabs([s], 0, {"2": "old"}, {})
         assert renames == [("46960a2e-dd00", "Nombres de sesiones compactadas")]
         assert tc.take_tab_title(tab) == ""  # consumed
+
+
+def _cp(rc: int = 0, out: str = ""):
+    import subprocess
+    return subprocess.CompletedProcess([], rc, out, "")
+
+
+def test_interrupt_cut_turn_presses_esc_only_on_the_bound_busy_tab() -> None:
+    calls = []
+
+    def tmux(*a, **k):
+        calls.append(a)
+        return _cp(0, "46960a2e-dd00\n") if a[0] == "display-message" else _cp()
+    kw = dict(settle_s=0, tmux=tmux, sleep=lambda s: None)
+    assert cp.interrupt_cut_turn("46960a2e-dd00", "1", is_active=lambda c: True, **kw)
+    assert calls[-1] == ("send-keys", "-t", f"{cp._paths.TMUX_SESSION}:1", "Escape")
+    calls.clear()
+    assert not cp.interrupt_cut_turn("46960a2e-dd00", "1", is_active=lambda c: False, **kw)  # idle
+    assert not cp.interrupt_cut_turn("otra-conv", "1", is_active=lambda c: True, **kw)  # tab rebound
+    assert not cp.interrupt_cut_turn("46960a2e-dd00", "", is_active=lambda c: True, **kw)  # no tab
+    assert not [c for c in calls if c[0] == "send-keys"]

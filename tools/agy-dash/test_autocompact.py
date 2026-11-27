@@ -137,6 +137,7 @@ class AutoCompactTests(unittest.TestCase):
                 str(self.root / "agy_dashboard.py"),
                 "self-compact",
                 "conv-123",
+                "--hook-cut",
                 "--resume-prompt",
                 "mensaje de seguimiento",
             ],
@@ -165,9 +166,12 @@ class AutoCompactTests(unittest.TestCase):
         self.spawn.return_value = mock.Mock(pid=4242)
         first = self.decide(used_tokens=300000)
         self.assertIn("compactando con NVIDIA", first["injectSteps"][0]["errorMessage"]["userMessage"])
-        for _ in range(56):
+        for _ in range(ac._SILENT_REPEATS):
             out = self.decide(used_tokens=300000, running=lambda cid: True)
             self.assertEqual(out, {"terminationBehavior": "terminate"})
+        # Esc never arrived (tab outside the dash): fall back to the visible error AGY gives up on
+        late = self.decide(used_tokens=300000, running=lambda cid: True)
+        self.assertIn("en cola", late["injectSteps"][0]["errorMessage"]["userMessage"])
         self.spawn.assert_called_once()
         self.assertEqual(ac.drain_queue("conv-123"), [])  # already travels as --resume-prompt
 

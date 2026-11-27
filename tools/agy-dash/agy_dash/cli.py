@@ -813,6 +813,9 @@ def cmd_self_compact(args: argparse.Namespace) -> int:
         return 0
 
     _compact._write_compact_status(sel.conversation_id, "running", "Llamando a NVIDIA NIM (Nemotron 550B)...")
+    hook_cut = bool(getattr(args, "hook_cut", False))
+    if hook_cut:
+        _compact.interrupt_cut_turn(sel.conversation_id, win_idx)
     if getattr(args, "model", ""):
         _compact.save_nvapi_config(model=str(args.model))
 
@@ -837,6 +840,8 @@ def cmd_self_compact(args: argparse.Namespace) -> int:
             print(f"{msg} · Handoff: {hfile}")
         return 0
 
+    if hook_cut:  # the loop may have restarted while NVIDIA answered; still the old session here
+        _compact.interrupt_cut_turn(sel.conversation_id, win_idx, settle_s=0.0)
     # Respawning kills the pane: wait until the turn is really over (never cut a reply mid-way).
     wait_s = float(getattr(args, "wait", 900.0) or 900.0)
     deadline = time.time() + wait_s
@@ -1151,6 +1156,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_sc.add_argument("--no-respawn", action="store_true", help="Compact and write handoff/status without respawning tmux tab")
     p_sc.add_argument("--respawn-only", action="store_true", help="Skip NVAPI call and respawn tmux tab from existing vault handoff")
     p_sc.add_argument("--wait", type=float, default=900.0, help="Max seconds waiting for the turn to end before respawn")
+    p_sc.add_argument("--hook-cut", action="store_true",
+                      help="Started by the PreInvocation hook: press Esc on the cut turn so AGY stops re-firing")
     p_sc.add_argument("--bg", action="store_true", help="Run detached in background")
     p_sc.add_argument("--_bg-worker", dest="bg_worker", action="store_true", help=argparse.SUPPRESS)
     p_sc.set_defaults(fn=cmd_self_compact, in_place=True)
